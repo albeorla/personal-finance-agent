@@ -172,6 +172,26 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_statement_cycles_target
             ON statement_cycles(target_obligation_id, cycle_close_date);
 
+        -- Card-spend paste-import runs (design #4). One row per real (non-dry-run)
+        -- import of a pasted Apple Card CSV / statement. The latest row per
+        -- account drives the Apple-Card paste-freshness signal (measured against
+        -- the statement cycle, not the SimpleFIN sync clock). total_spend is the
+        -- signed (negative) cycle spend; statement_close_date is the cycle the
+        -- paste covered; error records a failed import without losing the trail.
+        CREATE TABLE IF NOT EXISTS card_import_runs (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            statement_close_date TEXT,
+            txn_count INTEGER NOT NULL DEFAULT 0,
+            total_spend REAL NOT NULL DEFAULT 0,
+            source_format TEXT,
+            error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_card_import_runs_account
+            ON card_import_runs(account_id, imported_at);
+
         CREATE TABLE IF NOT EXISTS transaction_obligation_matches (
             obligation_instance_id TEXT PRIMARY KEY,
             transaction_id TEXT NOT NULL,
