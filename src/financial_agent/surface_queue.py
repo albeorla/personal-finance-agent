@@ -35,8 +35,10 @@ from .follow_ups import list_due_followups
 from .goals import list_goals
 from .guardrails import evaluate_guardrails
 from .obligations import list_obligation_review_candidates
+from .onboarding import list_charge_onboarding_queue
 from .reconciliation import list_reconciliation_review_items
 from .schema import ensure_app_schema
+from .todoist_outbox import request_emission_retire
 
 # A balance-only account whose latest snapshot is older than this is treated as
 # stale and surfaced for a manual refresh. No account carries a refresh-cadence
@@ -84,6 +86,13 @@ _TYPE_RANK: dict[str, int] = {
 
 # Goal statuses that warrant surfacing.
 _GOAL_SURFACE_STATUSES: frozenset[str] = frozenset({"behind", "due_soon"})
+
+# Singleton surface key for the onboarding digest. One row in the emissions
+# ledger, updated in place as the candidate count changes; never fans out.
+_ONBOARDING_DIGEST_KEY = "onboarding-digest"
+
+# Max candidate names listed in the digest body (highest priority_score first).
+_ONBOARDING_DIGEST_NAMES = 5
 
 # Guardrail rule types that read current balances / transactions and so are
 # untrustworthy when the day's sync failed (balances are stale). When the caller
@@ -205,7 +214,54 @@ def build_surface_items(
     items += _manual_obligation_due_surface_items(conn, as_of)
     items += _estimate_review_surface_items(conn, as_of)
     items += _snapshot_due_surface_items(conn, as_of)
+    items += _onboarding_digest_surface_item(conn, as_of)
     return items
+
+
+def _onboarding_digest_surface_item(
+    conn: sqlite3.Connection, as_of: date
+) -> list[dict[str, Any]]:
+    """ONE digest item for the active charge-onboarding queue, never one-per-candidate.
+
+    Counts candidates still awaiting a human decision (status in
+    ``ACTIVE_STATUSES``). When the queue is empty we emit nothing AND request a
+    retire on the singleton ``onboarding-digest`` key, so a stale digest task left
+    over from a prior non-empty run is removed on the next live surface drain (and
+    recreated, not permanently suppressed, when candidates reappear). When the
+    queue is non-empty we emit a single item whose stable ``surface_key`` keeps the
+    emissions ledger updating one task in place as the count changes.
+
+    ``as_of`` is unused (the queue is not date-filtered) but kept for a uniform
+    builder signature.
+    """
+
+    try:
+        candidates = list_charge_onboarding_queue(conn)
+    except sqlite3.OperationalError:
+        return []
+
+    count = len(candidates)
+    if count == 0:
+        # No active candidates: retire any open digest task next live run.
+        request_emission_retire(conn, _ONBOARDING_DIGEST_KEY)
+        return []
+
+    # Queue is already ordered by priority_score DESC, so the head is highest.
+    names = [c["display_name"] for c in candidates[:_ONBOARDING_DIGEST_NAMES] if c["display_name"]]
+    top = "; ".join(names)
+    extra = count - len(names)
+    more = f" (+{extra} more)" if extra > 0 else ""
+    description = (
+        f"{count} charge(s) awaiting review. Top: {top}{more}. "
+        "Run the charge-onboarding review to decide each."
+    )
+    return [
+        {
+            "surface_key": _ONBOARDING_DIGEST_KEY,
+            "content": f"{count} charges to review",
+            "description": description,
+        }
+    ]
 
 
 def _manual_obligation_due_surface_items(
