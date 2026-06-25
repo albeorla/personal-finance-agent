@@ -8,6 +8,62 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ---
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 62 tools"]
+
+    SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
+    Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
+
+    Server <-->|"read/write source rows"| SQLite[("SQLite finance DB<br/>balances, transactions, obligations, instances")]
+    Server <-->|"decisions, corrections, facts"| Memory[("finance_memory")]
+
+    Server -->|"surface_due_items_to_todoist<br/>deduped by emissions ledger"| Todoist["Todoist Finance project"]
+    Todoist -->|"completion read-back"| Server
+
+    classDef client fill:#e7eff7,stroke:#1f4e79,color:#17202a
+    classDef server fill:#e8f2ec,stroke:#3d7b65,color:#17202a
+    classDef source fill:#f5ecdd,stroke:#b87922,color:#17202a
+    classDef output fill:#f4e6ea,stroke:#aa4a5d,color:#17202a
+    classDef store fill:#edf0f2,stroke:#2f3b47,color:#17202a
+    class Claude client
+    class Server server
+    class SimpleFIN,Portals source
+    class Todoist output
+    class SQLite,Memory store
+```
+
+```mermaid
+flowchart LR
+    subgraph Ingest["1. INGEST"]
+        Sync["sync_simplefin<br/>pull balances + transactions"]
+        Manual["set_manual_balance<br/>correct stale balance-only feeds"]
+        ReadBack["reconcile_todoist_completions<br/>absorb task completions"]
+    end
+
+    subgraph Model["2. MODEL"]
+        Candidates["scan_charge_onboarding_candidates<br/>discover recurring charges"]
+        Reconcile["reconcile_obligation_instances<br/>match expected to observed"]
+        Projection["get_finance_status / get_daily_digest<br/>project cash flow from obligation_instances"]
+        Guardrails["evaluate_guardrails<br/>cash floor, drift, debt order"]
+    end
+
+    subgraph Surface["3. SURFACE"]
+        Queue["get_surface_queue<br/>prioritize what needs attention"]
+        Digest["get_daily_digest<br/>status, working cash, upcoming obligations"]
+        TodoistPush["surface_due_items_to_todoist<br/>write-gated, deduped output"]
+    end
+
+    Ingest --> Model --> Surface
+    Surface -. "next daily run" .-> Ingest
+```
+
+More durable Mermaid diagrams live in [docs/diagrams.md](docs/diagrams.md).
+
+---
+
 ## What it does: INGEST -> MODEL -> SURFACE
 
 The server implements a single loop. Each stage is deterministic and idempotent, and none of it mutates the original source database.
