@@ -61,7 +61,8 @@ flowchart LR
     Surface -. "next daily run" .-> Ingest
 ```
 
-More durable Mermaid diagrams live in [docs/diagrams.md](docs/diagrams.md).
+The post-facto design record lives in [docs/design-doc.md](docs/design-doc.md),
+and more durable Mermaid diagrams live in [docs/diagrams.md](docs/diagrams.md).
 
 ---
 
