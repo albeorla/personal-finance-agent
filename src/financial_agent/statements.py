@@ -1,0 +1,371 @@
+"""Statement-cycle aggregation for card-statement-input charges.
+
+Card charges do not reduce checking directly; they roll into a monthly card
+statement that is then paid from checking. This module groups
+``card_statement_input`` obligation instances into the statement cycle that will
+pay them, so a future statement-payment estimate can be built from real modeled
+card spend instead of a blind guess.
+
+Safety: this never overrides a portal/confirmed statement amount. A portal
+balance is the best evidence we have, so ``recompute_statement_estimates`` only
+fills in statement instances whose amount is an unconfirmed projection, and even
+then it records full provenance. Aggregation is deterministic and idempotent.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from typing import Any
+
+from .schema import ensure_app_schema
+
+
+CARD_STATEMENT_INPUT = "card_statement_input"
+
+# Amount sources that represent real, observed statement evidence. A rollup
+# estimate must never overwrite these.
+PROTECTED_AMOUNT_SOURCES: frozenset[str] = frozenset(
+    {
+        "portal_current_balance_estimate",
+        "portal_statement_amount",
+        "statement_known",
+        "statement_amount",
+        "actual",
+        "observed",
+    }
+)
+
+PROJECTABLE_INPUT_STATUSES: tuple[str, ...] = ("expected", "needs_review", "partially_paid")
+
+_CONFIDENCE_RANK: dict[str | None, int] = {"high": 3, "medium": 2, "low": 1, "very_low": 0, None: 0}
+_RANK_CONFIDENCE: dict[int, str] = {3: "high", 2: "medium", 1: "low", 0: "low"}
+
+ROLLUP_AMOUNT_SOURCE = "statement_input_rollup"
+
+
+def aggregate_statement_inputs(
+    conn: sqlite3.Connection,
+    *,
+    target_obligation_id: str,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Group card-statement-input instances into the statement cycle that pays them.
+
+    Cycles are defined by the target obligation's statement instances that carry
+    a ``statement_close_date``. Each card input is assigned to the first cycle
+    whose close date is on or after the input's due date (and after the previous
+    close). Inputs past the last known close are reported as ``unrolled``.
+    """
+
+    ensure_app_schema(conn)
+    now = _now()
+
+    cycles = _build_cycles(conn, target_obligation_id)
+    inputs = conn.execute(
+        f"""
+        SELECT id, due_date, amount, confidence
+        FROM obligation_instances
+        WHERE cash_flow_treatment = ?
+          AND statement_target_obligation_id = ?
+          AND status IN ({",".join("?" for _ in PROJECTABLE_INPUT_STATUSES)})
+        ORDER BY due_date, id
+        """,
+        (CARD_STATEMENT_INPUT, target_obligation_id, *PROJECTABLE_INPUT_STATUSES),
+    ).fetchall()
+
+    assignments: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    unrolled: list[sqlite3.Row] = []
+    for inp in inputs:
+        due = date.fromisoformat(inp["due_date"])
+        cycle = _assign_cycle(due, cycles)
+        if cycle is None:
+            unrolled.append(inp)
+        else:
+            assignments[cycle["id"]].append(inp)
+
+    live_cycle_ids: set[str] = set()
+    for cycle in cycles:
+        items = assignments.get(cycle["id"], [])
+        input_sum = round(sum(abs(float(i["amount"])) for i in items), 2)
+        confidence = _min_confidence([i["confidence"] for i in items]) if items else None
+        _upsert_cycle(conn, cycle, target_obligation_id, len(items), input_sum, confidence, now)
+        conn.execute(
+            "DELETE FROM statement_cycle_inputs WHERE statement_cycle_id = ?", (cycle["id"],)
+        )
+        for item in items:
+            conn.execute(
+                """
+                INSERT INTO statement_cycle_inputs (
+                    statement_cycle_id, obligation_instance_id, input_amount,
+                    input_confidence, due_date, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (cycle["id"], item["id"], round(abs(float(item["amount"])), 2), item["confidence"], item["due_date"], now),
+            )
+        live_cycle_ids.add(cycle["id"])
+
+    # Drop cycles (and their inputs) that no longer correspond to a statement instance.
+    for row in conn.execute(
+        "SELECT id FROM statement_cycles WHERE target_obligation_id = ?", (target_obligation_id,)
+    ).fetchall():
+        if row["id"] not in live_cycle_ids:
+            conn.execute("DELETE FROM statement_cycle_inputs WHERE statement_cycle_id = ?", (row["id"],))
+            conn.execute("DELETE FROM statement_cycles WHERE id = ?", (row["id"],))
+
+    return {
+        "target_obligation_id": target_obligation_id,
+        "cycles": len(cycles),
+        "inputs_total": len(inputs),
+        "inputs_assigned": sum(len(v) for v in assignments.values()),
+        "unrolled_inputs": len(unrolled),
+        "unrolled_instance_ids": [i["id"] for i in unrolled],
+    }
+
+
+def list_statement_cycles(
+    conn: sqlite3.Connection,
+    *,
+    target_obligation_id: str,
+) -> list[dict[str, Any]]:
+    """List statement cycles with their aggregated card-input evidence."""
+
+    ensure_app_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT id, target_obligation_id, statement_instance_id, cycle_open_date,
+               cycle_close_date, due_date, input_count, input_sum, confidence
+        FROM statement_cycles
+        WHERE target_obligation_id = ?
+        ORDER BY cycle_close_date
+        """,
+        (target_obligation_id,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        inputs = conn.execute(
+            """
+            SELECT obligation_instance_id, input_amount, input_confidence, due_date
+            FROM statement_cycle_inputs
+            WHERE statement_cycle_id = ?
+            ORDER BY due_date, obligation_instance_id
+            """,
+            (row["id"],),
+        ).fetchall()
+        result.append(
+            {
+                "id": row["id"],
+                "target_obligation_id": row["target_obligation_id"],
+                "statement_instance_id": row["statement_instance_id"],
+                "cycle_open_date": row["cycle_open_date"],
+                "cycle_close_date": row["cycle_close_date"],
+                "due_date": row["due_date"],
+                "input_count": row["input_count"],
+                "input_sum": round(float(row["input_sum"]), 2),
+                "confidence": row["confidence"],
+                "inputs": [
+                    {
+                        "obligation_instance_id": i["obligation_instance_id"],
+                        "input_amount": round(float(i["input_amount"]), 2),
+                        "input_confidence": i["input_confidence"],
+                        "due_date": i["due_date"],
+                    }
+                    for i in inputs
+                ],
+            }
+        )
+    return result
+
+
+def recompute_statement_estimates(
+    conn: sqlite3.Connection,
+    *,
+    target_obligation_id: str,
+    baseline: float = 0.0,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fill unconfirmed statement estimates from the card-input rollup.
+
+    Guarded on purpose: only statement instances whose ``amount_status`` is
+    ``estimated`` and whose ``amount_source`` is not a protected portal/observed
+    source are recomputed, as ``baseline`` (the caller's expected non-modeled
+    card spend) plus the rolled-up modeled card inputs for that cycle. Portal and
+    confirmed amounts are left untouched. Idempotent.
+    """
+
+    ensure_app_schema(conn)
+    aggregate_statement_inputs(conn, target_obligation_id=target_obligation_id)
+    now = _now()
+    baseline = round(float(baseline), 2)
+
+    cycles_by_instance = {
+        row["statement_instance_id"]: row
+        for row in conn.execute(
+            "SELECT statement_instance_id, input_sum, input_count, confidence, cycle_close_date "
+            "FROM statement_cycles WHERE target_obligation_id = ? AND statement_instance_id IS NOT NULL",
+            (target_obligation_id,),
+        ).fetchall()
+    }
+
+    statement_instances = conn.execute(
+        """
+        SELECT id, amount, amount_status, amount_source
+        FROM obligation_instances
+        WHERE obligation_id = ?
+          AND statement_close_date IS NOT NULL
+        ORDER BY due_date
+        """,
+        (target_obligation_id,),
+    ).fetchall()
+
+    updated = 0
+    skipped_protected = 0
+    skipped_no_cycle = 0
+    details: list[dict[str, Any]] = []
+    for inst in statement_instances:
+        if inst["amount_status"] != "estimated":
+            continue
+        if (inst["amount_source"] or "") in PROTECTED_AMOUNT_SOURCES:
+            skipped_protected += 1
+            continue
+        cycle = cycles_by_instance.get(inst["id"])
+        if cycle is None:
+            skipped_no_cycle += 1
+            continue
+        new_amount = round(baseline + float(cycle["input_sum"]), 2)
+        estimation_inputs = {
+            "baseline": baseline,
+            "card_input_sum": round(float(cycle["input_sum"]), 2),
+            "input_count": cycle["input_count"],
+            "cycle_close_date": cycle["cycle_close_date"],
+        }
+        confidence = cycle["confidence"] or "low"
+        conn.execute(
+            """
+            UPDATE obligation_instances
+            SET amount = ?,
+                amount_status = 'estimated',
+                amount_source = ?,
+                estimation_method = ?,
+                estimation_inputs_json = ?,
+                confidence = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (new_amount, ROLLUP_AMOUNT_SOURCE, ROLLUP_AMOUNT_SOURCE, json.dumps(estimation_inputs, sort_keys=True), confidence, now, inst["id"]),
+        )
+        updated += 1
+        details.append({"instance_id": inst["id"], "amount": new_amount, "card_input_sum": estimation_inputs["card_input_sum"]})
+
+    warnings: list[str] = []
+    if baseline == 0.0 and updated:
+        warnings.append(
+            "baseline is 0, so recomputed estimates reflect only modeled card inputs and likely "
+            "underestimate the full statement; pass a baseline for normal non-modeled card spend"
+        )
+    return {
+        "target_obligation_id": target_obligation_id,
+        "baseline": baseline,
+        "updated": updated,
+        "skipped_protected": skipped_protected,
+        "skipped_no_cycle": skipped_no_cycle,
+        "details": details,
+        "warnings": warnings,
+    }
+
+
+# --- helpers ---------------------------------------------------------------
+
+
+def _build_cycles(conn: sqlite3.Connection, target_obligation_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, due_date, statement_close_date
+        FROM obligation_instances
+        WHERE obligation_id = ?
+          AND statement_close_date IS NOT NULL
+        ORDER BY statement_close_date, due_date, id
+        """,
+        (target_obligation_id,),
+    ).fetchall()
+    cycles: list[dict[str, Any]] = []
+    prev_close: date | None = None
+    for row in rows:
+        close = date.fromisoformat(row["statement_close_date"])
+        open_date = (prev_close + timedelta(days=1)) if prev_close else None
+        cycles.append(
+            {
+                "id": f"cycle:{target_obligation_id}:{close.isoformat()}",
+                "close": close,
+                "open": open_date,
+                "due_date": row["due_date"],
+                "statement_instance_id": row["id"],
+            }
+        )
+        prev_close = close
+    return cycles
+
+
+def _assign_cycle(due: date, cycles: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for cycle in cycles:
+        if due <= cycle["close"] and (cycle["open"] is None or due >= cycle["open"]):
+            return cycle
+    return None
+
+
+def _upsert_cycle(
+    conn: sqlite3.Connection,
+    cycle: dict[str, Any],
+    target_obligation_id: str,
+    input_count: int,
+    input_sum: float,
+    confidence: str | None,
+    now: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO statement_cycles (
+            id, target_obligation_id, statement_instance_id, cycle_open_date,
+            cycle_close_date, due_date, input_count, input_sum, confidence,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            target_obligation_id = excluded.target_obligation_id,
+            statement_instance_id = excluded.statement_instance_id,
+            cycle_open_date = excluded.cycle_open_date,
+            cycle_close_date = excluded.cycle_close_date,
+            due_date = excluded.due_date,
+            input_count = excluded.input_count,
+            input_sum = excluded.input_sum,
+            confidence = excluded.confidence,
+            updated_at = excluded.updated_at
+        """,
+        (
+            cycle["id"],
+            target_obligation_id,
+            cycle["statement_instance_id"],
+            cycle["open"].isoformat() if cycle["open"] else None,
+            cycle["close"].isoformat(),
+            cycle["due_date"],
+            input_count,
+            input_sum,
+            confidence,
+            now,
+            now,
+        ),
+    )
+
+
+def _min_confidence(confidences: list[str | None]) -> str | None:
+    # Absent confidence (all None) stays None; do not invent a "low" reading.
+    known = [c for c in confidences if c is not None]
+    if not known:
+        return None
+    rank = min(_CONFIDENCE_RANK.get(c, 1) for c in known)
+    return _RANK_CONFIDENCE[rank]
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat()
