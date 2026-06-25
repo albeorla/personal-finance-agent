@@ -250,7 +250,12 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         -- 'followup:<id>', 'goal:<name>:behind'). The ledger is the single
         -- source of truth that prevents re-creating a task on re-run, across
         -- days, or when the user already made the task manually.
-        -- status values: 'open', 'completed', 'deleted_by_user'.
+        -- status values: 'open', 'completed', 'deleted_by_user', 'retired'.
+        -- 'retired' = the surfaced task was auto-removed (project reconcile /
+        -- retire drain) but the underlying need may recur; unlike 'completed' and
+        -- 'deleted_by_user', a 'retired' row does NOT suppress recreation, so a
+        -- recurring surface_key resurfaces normally when it next becomes due.
+        -- No DB-level CHECK on status so adding a value stays a code-only change.
         CREATE TABLE IF NOT EXISTS todoist_emissions (
             surface_key TEXT PRIMARY KEY,
             todoist_task_id TEXT UNIQUE NOT NULL,
@@ -473,6 +478,10 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "action_outbox", "external_task_id", "TEXT")
     _ensure_column(conn, "action_outbox", "last_pushed_hash", "TEXT")
     _ensure_column(conn, "action_outbox", "last_observed_state", "TEXT")
+    # Tombstone: set when a candidate/obligation decision marks a surfaced task
+    # for removal; drained by surface_to_todoist (delete + flip status to
+    # 'retired'). Nullable, defaults NULL (no retire pending).
+    _ensure_column(conn, "todoist_emissions", "retire_requested_at", "TEXT")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_obligation_instances_income_source
