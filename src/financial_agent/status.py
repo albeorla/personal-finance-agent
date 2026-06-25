@@ -139,9 +139,62 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+# Canonical balance-resolution precedence. Pick the newest calendar day, then
+# within that day prefer a manual correction over a feed (simplefin) snapshot
+# regardless of recorded_at/id. A manual balance for an "Updated Monthly"
+# account (e.g. Apple Card) is authoritative for its day, so a same-day
+# simplefin sync recorded later cannot shadow it. Only feed rows on the same day
+# fall back to recency. Every consumer that needs "the current balance for an
+# account" (status, the debts layer, etc.) MUST order by this so they agree.
+_BALANCE_PRECEDENCE_ORDER_BY = """
+    ORDER BY
+        date({alias}.recorded_at) DESC,
+        CASE WHEN {alias}.source = 'manual' THEN 0 ELSE 1 END,
+        {alias}.recorded_at DESC,
+        {alias}.id DESC
+"""
+
+
+def resolve_account_balance(
+    conn: sqlite3.Connection,
+    account_id: str,
+    *,
+    as_of: date | None = None,
+) -> float | None:
+    """Return one account's signed current balance using canonical precedence.
+
+    This is the single source of truth for "what is this account's balance".
+    It applies the same ``_BALANCE_PRECEDENCE_ORDER_BY`` that
+    ``_latest_balances`` (and thus ``get_finance_status``) uses: newest calendar
+    day, then a manual correction wins over a same-day feed snapshot regardless
+    of recorded_at. When ``as_of`` is given, snapshots recorded after that date
+    are ignored (end-of-day inclusive), so callers can resolve a balance "as of"
+    a projection date. Returns None when no snapshot qualifies.
+    """
+
+    params: list[Any] = [account_id]
+    where = "WHERE account_id = ?"
+    if as_of is not None:
+        where += " AND recorded_at <= ?"
+        params.append(f"{as_of.isoformat()}T23:59:59.999999")
+    row = conn.execute(
+        f"""
+        SELECT balance
+        FROM balance_snapshots
+        {where}
+        {_BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if row is None or row["balance"] is None:
+        return None
+    return round(float(row["balance"]), 2)
+
+
 def _latest_balances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """
+        f"""
         SELECT
             a.id AS account_id,
             a.name AS account_name,
@@ -158,17 +211,7 @@ def _latest_balances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             SELECT inner_bs.id
             FROM balance_snapshots inner_bs
             WHERE inner_bs.account_id = bs.account_id
-            -- Pick the newest calendar day, then within that day prefer a
-            -- manual correction over a feed (simplefin) snapshot regardless of
-            -- recorded_at/id. A manual balance for an "Updated Monthly" account
-            -- (e.g. Apple Card) is authoritative for its day, so a same-day
-            -- simplefin sync recorded later cannot shadow it. Only feed rows on
-            -- the same day fall back to recency.
-            ORDER BY
-                date(inner_bs.recorded_at) DESC,
-                CASE WHEN inner_bs.source = 'manual' THEN 0 ELSE 1 END,
-                inner_bs.recorded_at DESC,
-                inner_bs.id DESC
+            {_BALANCE_PRECEDENCE_ORDER_BY.format(alias="inner_bs")}
             LIMIT 1
         )
         ORDER BY a.name COLLATE NOCASE

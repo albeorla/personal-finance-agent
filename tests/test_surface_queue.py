@@ -65,9 +65,15 @@ def _checking(conn, *, available=9000.0, recorded_at="2026-06-23T00:00:00+00:00"
 
 def _fresh_sync(conn):
     # A recent sync keeps the window-age guardrail quiet so it does not add noise.
+    # The window-age guardrail measures real elapsed hours against the wall clock,
+    # so finished_at must be anchored to "now" (a few minutes ago), not a fixed
+    # calendar date -- otherwise the seed silently ages past the 24h freshness bar
+    # as the suite runs on a later day and trips a spurious guardrail item.
+    fresh = _recent_iso()
     conn.execute(
         "INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) "
-        "VALUES ('2026-06-24T09:00:00+00:00','2026-06-24T09:05:00+00:00','i',1,0,0,NULL)"
+        "VALUES (?,?,'i',1,0,0,NULL)",
+        (fresh, fresh),
     )
     # A recent successful daily background run is the job-health heartbeat: a freshly
     # synced system has, by definition, just run the daily job, so the stale-job

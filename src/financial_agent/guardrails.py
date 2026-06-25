@@ -22,6 +22,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from .cashflow import build_cash_flow_projections
+from .debts import list_debts
 from .schema import ensure_app_schema
 
 
@@ -87,7 +88,7 @@ def evaluate_guardrails(
     findings += _check_cash_floor(conn, as_of, accounts, windows)
     findings += _check_drift_threshold(conn, as_of, drift_findings)
     findings += _check_window_age(conn, observed)
-    findings += _check_debt_avalanche(conn)
+    findings += _check_debt_avalanche(conn, as_of)
     findings.sort(key=lambda f: (-_severity_rank(f["severity"]), f["rule_type"], f["id"]))
 
     if persist:
@@ -189,8 +190,45 @@ def _check_window_age(conn, observed) -> list[dict[str, Any]]:
                      {"age_hours": age_hours, "max_hours": WINDOW_AGE_MAX_HOURS, "latest_sync": finished.isoformat()})]
 
 
-def _check_debt_avalanche(conn) -> list[dict[str, Any]]:
-    # Advisory: only surface when interest-bearing debt obligations exist.
+def _check_debt_avalanche(conn, as_of) -> list[dict[str, Any]]:
+    """Advisory payoff order, ranked from the live debts table (highest APR first).
+
+    The order is computed at evaluation time from the ``debts`` table: only
+    debts that are revolving (a real paydown target) AND carry a nonzero balance
+    qualify, ranked by APR descending and reported with each debt's live balance
+    and modeled monthly interest. Paid-in-full / non-revolving cards are excluded
+    even when their APR is high, so a card you clear every month never becomes the
+    avalanche target. When the debts table is empty the legacy policy constant is
+    used as a fallback so nothing breaks.
+    """
+
+    target = _avalanche_targets_from_debts(conn, as_of)
+    if target is not None:
+        if not target:
+            # The debts table exists but no revolving carried-balance debt
+            # remains a paydown target -- nothing to advise.
+            return []
+        order_line = " > ".join(
+            f"{d['name']} ({d['apr']}%, ${abs(d['current_balance']):,.2f})" for d in target
+        )
+        return [_finding(
+            "debt_avalanche", "guardrail:debt_avalanche_order", "low",
+            "Debt-payoff order (highest APR first; live balances, revolving debts only): " + order_line,
+            {"apr_order": [
+                {
+                    "id": d["id"],
+                    "name": d["name"],
+                    "apr": d["apr"],
+                    "current_balance": d["current_balance"],
+                    "monthly_interest": d["monthly_interest"],
+                }
+                for d in target
+            ]},
+            advisory=True,
+        )]
+
+    # Fallback: no debts modeled yet. Only surface when interest-bearing debt
+    # obligations exist, using the legacy policy constant.
     placeholders = ",".join("?" for _ in _DEBT_KINDS)
     has_debt = conn.execute(
         f"SELECT 1 FROM obligations WHERE status='active' AND kind IN ({placeholders}) LIMIT 1", _DEBT_KINDS
@@ -201,6 +239,26 @@ def _check_debt_avalanche(conn) -> list[dict[str, Any]]:
                      "Configured debt-payoff order (highest APR first; from policy, not live balances): "
                      + " > ".join(f"{d['key']} ({d['apr']}%)" for d in DEBT_AVALANCHE_APR_ORDER),
                      {"apr_order": DEBT_AVALANCHE_APR_ORDER}, advisory=True)]
+
+
+def _avalanche_targets_from_debts(conn, as_of) -> list[dict[str, Any]] | None:
+    """Return revolving carried-balance debts ranked by APR descending.
+
+    Returns None when the debts table holds no rows (caller falls back to the
+    legacy constant); returns an empty list when debts exist but none qualify as
+    a paydown target (revolving with a nonzero balance). ``list_debts`` already
+    sorts by APR descending, so the filtered order is the avalanche order.
+    """
+
+    if not _has_table(conn, "debts"):
+        return None
+    result = list_debts(conn, as_of)
+    if result["count"] == 0:
+        return None
+    return [
+        d for d in result["debts"]
+        if d["is_revolving"] and d["current_balance"] not in (None, 0, 0.0)
+    ]
 
 
 # --- helpers ---------------------------------------------------------------

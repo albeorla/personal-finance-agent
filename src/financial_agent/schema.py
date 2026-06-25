@@ -365,6 +365,41 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_goals_deadline
             ON goals(deadline);
 
+        -- Structured, queryable debts layer. This replaces the hard-coded
+        -- DEBT_AVALANCHE_APR_ORDER constant: the avalanche guardrail and the
+        -- interest math read each debt's APR and live balance from here.
+        --   account_id      links to a synced accounts.id for a live balance
+        --                   (NULL for debts with no synced account, e.g. a
+        --                   federal student loan tracked only in a portal).
+        --   balance_source  'account' = use the linked account's latest
+        --                   balance_snapshot; 'manual' = use balance_override.
+        --   balance_override signed manual balance (negative = owed) for debts
+        --                   with no synced account.
+        --   is_revolving    1 = accrues interest / is a paydown target;
+        --                   0 = paid in full each month, excluded from the
+        --                   avalanche target order even if its APR is high.
+        CREATE TABLE IF NOT EXISTS debts (
+            id TEXT PRIMARY KEY,
+            account_id TEXT,
+            name TEXT NOT NULL,
+            apr REAL NOT NULL,
+            balance_source TEXT NOT NULL DEFAULT 'account'
+                CHECK (balance_source IN ('account', 'manual')),
+            balance_override REAL,
+            min_payment REAL,
+            is_revolving INTEGER NOT NULL DEFAULT 1,
+            autopay INTEGER NOT NULL DEFAULT 0,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_debts_account
+            ON debts(account_id);
+
+        CREATE INDEX IF NOT EXISTS idx_debts_revolving
+            ON debts(is_revolving);
+
         CREATE TABLE IF NOT EXISTS follow_ups (
             id TEXT PRIMARY KEY,
             text TEXT NOT NULL,
