@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
+from .config import get_finance_config
 from .follow_ups import list_due_followups
 from .goals import list_goals
 from .guardrails import evaluate_guardrails
@@ -251,15 +253,22 @@ def _onboarding_digest_surface_item(
     top = "; ".join(names)
     extra = count - len(names)
     more = f" (+{extra} more)" if extra > 0 else ""
-    description = (
-        f"{count} charge(s) awaiting review. Top: {top}{more}. "
-        "Run the charge-onboarding review to decide each."
+    by = (as_of + timedelta(days=_ONBOARDING_TRIAGE_LEAD_DAYS)).isoformat()
+    action = render_next_action(
+        NextAction(
+            verb="Triage",
+            by=by,
+            account="the charge-onboarding review",
+            preposition="in",
+        )
     )
+    description = f"{count} charge(s) awaiting review. Top: {top}{more}. {action}"
     return [
         {
             "surface_key": _ONBOARDING_DIGEST_KEY,
             "content": f"{count} charges to review",
             "description": description,
+            "due_date": by,
         }
     ]
 
@@ -268,17 +277,34 @@ def _manual_obligation_due_surface_items(
     conn: sqlite3.Connection, as_of: date
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    account = _operating_account_name(conn)
     for it in _manual_obligation_due_items(conn, as_of):
         ev = it["evidence"]
+        by = it["suggested_todoist_due"]
+        if ev["amount_discretionary"]:
+            # The user decides the amount each time; the modeled figure is a floor.
+            action = NextAction(
+                verb="Decide amount + pay",
+                by=by,
+                amount=ev["amount"],
+                direction=ev["direction"],
+                account=account,
+                modeled_min=True,
+            )
+        else:
+            action = NextAction(
+                verb="Pay",
+                by=by,
+                amount=ev["amount"],
+                direction=ev["direction"],
+                account=account,
+            )
         items.append(
             {
                 "surface_key": it["id"],  # obligation-due:<obligation_id>:<due_date>
                 "content": it["message"],
-                "description": (
-                    f"Manual bill (no autopay) - take the action by {ev['due_date']}. "
-                    f"${_money(ev['amount'])} {ev['direction']}."
-                ),
-                "due_date": it["suggested_todoist_due"],
+                "description": f"Manual bill (no autopay). {render_next_action(action)}",
+                "due_date": by,
             }
         )
     return items
@@ -291,12 +317,16 @@ def _followup_surface_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
         return []
     items: list[dict[str, Any]] = []
     for r in rows:
+        by = r["surface_when"]
+        # The follow-up text IS the action verb/instruction; render it on the
+        # standard dated line so the deadline is explicit.
+        action = render_next_action(NextAction(verb=r["text"], by=by))
         items.append(
             {
                 "surface_key": f"followup:{r['id']}",
                 "content": r["text"],
-                "description": f"Follow-up due {r['surface_when']}.",
-                "due_date": r["surface_when"],
+                "description": action,
+                "due_date": by,
             }
         )
     return items
@@ -311,15 +341,30 @@ def _goal_behind_surface_items(conn: sqlite3.Connection, as_of: date) -> list[di
     for g in goals:
         if g["status"] != "behind":
             continue
+        # Deadline may be open-ended; fall back to as_of so the action line and
+        # due_date are never empty.
+        by = g["deadline"] or as_of.isoformat()
+        # The amount to move is the catch-up monthly rate; fall back to the full
+        # remaining amount when no rate is computed.
+        move_amount = g.get("required_monthly_rate") or g.get("remaining_amount")
+        action = render_next_action(
+            NextAction(
+                verb="Move",
+                by=by,
+                amount=move_amount,
+                direction="inflow",
+                account=f'"{g["name"]}"',
+            )
+        )
         items.append(
             {
                 "surface_key": f"goal:{g['name']}:behind",
                 "content": f"Goal behind: {g['name']}",
                 "description": (
-                    f"${_money(g['current_progress'])} of ${_money(g['target_amount'])} - "
-                    f"behind the pace needed to hit target."
+                    f"${_money(g['current_progress'])} of ${_money(g['target_amount'])}. "
+                    f"{action}"
                 ),
-                "due_date": g["deadline"],
+                "due_date": by,
             }
         )
     return items
@@ -336,14 +381,26 @@ def _estimate_review_surface_items(conn: sqlite3.Connection, as_of: date) -> lis
         # instance id when no close date is carried, which still yields a stable
         # per-instance key.
         cycle = r.get("statement_close_date") or r["instance_id"]
+        # review_after has passed, so the refresh is actionable now: by = today.
+        by = as_of.isoformat()
+        # Refresh comes from a statement (balance-only framing): never imply a feed.
+        action = render_next_action(
+            NextAction(
+                verb="Refresh estimate",
+                by=by,
+                account="the statement",
+                preposition="from",
+            )
+        )
         items.append(
             {
                 "surface_key": f"estimate-review:{r['obligation_id']}:{cycle}",
                 "content": f"Refresh estimate: {r['obligation_name']}",
                 "description": (
                     f"Amount is estimated (${_money(r['amount'])}); review_after "
-                    f"{r['review_after']} has passed - refresh from the statement."
+                    f"{r['review_after']} has passed. {action}"
                 ),
+                "due_date": by,
             }
         )
     return items
@@ -352,12 +409,27 @@ def _estimate_review_surface_items(conn: sqlite3.Connection, as_of: date) -> lis
 def _snapshot_due_surface_items(conn: sqlite3.Connection, as_of: date) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for it in _snapshot_refresh_items(conn, as_of):
-        acct = it["evidence"]["account_id"]
+        ev = it["evidence"]
+        acct = ev["account_id"]
+        name = ev["account_name"]
+        days_old = ev["days_old"]
+        # The snapshot is stale now, so the refresh is due today. Balance-only
+        # account: update from its portal (no live feed implied).
+        by = as_of.isoformat()
+        action = render_next_action(
+            NextAction(
+                verb="Update balance",
+                by=by,
+                account=f"the {name} portal",
+                preposition="from",
+            )
+        )
         items.append(
             {
                 "surface_key": f"snapshot-due:{acct}",
-                "content": f"Update balance: {it['evidence']['account_name']}",
-                "description": it["message"],
+                "content": f"Update balance: {name}",
+                "description": f"{name} snapshot is {days_old} days old. {action}",
+                "due_date": by,
             }
         )
     return items
@@ -726,6 +798,102 @@ def _guardrail_items(
             }
         )
     return items
+
+
+# --- next-action contract --------------------------------------------------
+# Every surfaced item closes with ONE consistent dated next-action line so the
+# task tells Albert exactly what to do without opening the app: WHAT (verb), HOW
+# MUCH (amount), WHICH account (from/to), BY WHEN (by). The builders compose their
+# own context sentence, then append render_next_action(...) and set due_date from
+# the same `by`, so the action deadline and the Todoist reminder agree.
+
+# Phrase used when no operating/working checking account name can be resolved.
+_DEFAULT_OPERATING_ACCOUNT = "your operating account"
+
+# Lead time for the onboarding-digest triage deadline: a soft "by when to triage"
+# a couple of days out, so the digest item is never dateless.
+_ONBOARDING_TRIAGE_LEAD_DAYS = 2
+
+
+@dataclass
+class NextAction:
+    """Structured next-action every surface builder fills.
+
+    ``verb`` and ``by`` are REQUIRED (a dateless action is never rendered); every
+    other piece degrades gracefully. ``direction`` chooses the preposition for a
+    money move (outflow -> "from", inflow -> "to") unless ``preposition`` overrides
+    it (e.g. "in the charge-onboarding review"). ``amount_status == "estimated"``
+    renders a trailing "(est)" so an estimate never reads as a fixed figure;
+    ``modeled_min`` renders the discretionary "(modeled min ~$X)" framing instead.
+    """
+
+    verb: str
+    by: str
+    amount: float | None = None
+    direction: str | None = None
+    account: str | None = None
+    preposition: str | None = None
+    amount_status: str | None = None
+    confidence: str | None = None
+    modeled_min: bool = False
+
+
+def render_next_action(action: NextAction) -> str:
+    """Render one deterministic trailing action line from a ``NextAction``.
+
+    Shape: ``Action: {verb} ${amount}{(est)} {from|to} {account} by {by}.`` Missing
+    pieces drop out cleanly - no amount means no money clause (never "$-"), no
+    account means no preposition clause - but verb and by-date are required.
+    """
+
+    if not action.verb or not action.verb.strip():
+        raise ValueError("NextAction requires a verb")
+    if not action.by or not str(action.by).strip():
+        raise ValueError("NextAction requires a by-date")
+
+    parts: list[str] = [action.verb.strip()]
+    if action.amount is not None:
+        if action.modeled_min:
+            money = f"(modeled min ~${_money(action.amount)})"
+        else:
+            money = f"${_money(action.amount)}"
+            if action.amount_status == "estimated":
+                money += " (est)"
+        parts.append(money)
+    if action.account:
+        prep = action.preposition
+        if prep is None:
+            prep = "to" if action.direction == "inflow" else "from"
+        parts.append(f"{prep} {action.account}")
+    return "Action: " + " ".join(parts) + f" by {action.by}."
+
+
+def _operating_account_name(conn: sqlite3.Connection) -> str:
+    """Resolve the operating/working checking account NAME for the action line.
+
+    Uses the same ``WORKING_ACCOUNT_HINT`` config the cashflow projection uses to
+    pick the operating account (matched against account names), falling back to the
+    first checking account, then to a generic phrase. Read-only and never raises -
+    a missing accounts table or no match degrades to "your operating account" so
+    the action line is still meaningful.
+    """
+
+    try:
+        hint = get_finance_config().get("working_account_hint")
+    except Exception:  # noqa: BLE001 - config is best-effort here; degrade to default
+        hint = None
+    try:
+        rows = conn.execute("SELECT name, kind FROM accounts").fetchall()
+    except sqlite3.OperationalError:
+        return _DEFAULT_OPERATING_ACCOUNT
+    if hint:
+        for r in rows:
+            if hint in (r["name"] or ""):
+                return r["name"]
+    for r in rows:
+        if (r["kind"] or "") == "checking" and r["name"]:
+            return r["name"]
+    return _DEFAULT_OPERATING_ACCOUNT
 
 
 # --- helpers ---------------------------------------------------------------
