@@ -53,10 +53,11 @@ def run_background_sync(
 ) -> dict[str, Any]:
     """Run the finance pipeline as one auditable background run.
 
-    Steps: scan charge candidates, reconcile transactions, detect drift, suppress
-    dormant estimates, and surface the day's due items to Todoist (gated off by
-    default). Each step is recorded as an event; a failing step is logged and the
-    run continues.
+    Steps: scan charge candidates (auto-triaging in enforce mode by default),
+    reconcile transactions, detect drift, suppress dormant estimates, suppress
+    contradicted estimates (enforce mode, on by default), and surface the day's
+    due items to Todoist (gated off by default). Each step is recorded as an
+    event; a failing step is logged and the run continues.
     """
 
     ensure_app_schema(conn)
@@ -83,21 +84,34 @@ def run_background_sync(
             ("sync_simplefin", lambda: _sync_simplefin_step(conn, opts)),
         ]
 
-    # Contradiction suppression is opt-in (default OFF) so the standard pipeline
-    # event sequence stays deterministic; it runs right after dormancy (which
-    # claims the clean-zero case first) when ``options["contradiction"]["enabled"]``.
+    # Contradiction suppression is ON by default and runs in enforce mode: the
+    # daily job actively rewrites stale-estimate obligations to their observed
+    # outflow. It runs right after dormancy (which claims the clean-zero case
+    # first). Escape hatch: pass ``options["contradiction"]["enabled"] = False``
+    # to skip it, or ``{"enabled": True, "mode": "report"}`` to observe only.
+    contradiction_opts = opts.get("contradiction")
+    if contradiction_opts is None:
+        contradiction_opts = {"enabled": True, "mode": "enforce"}
     contradiction_steps: list[tuple[str, Callable[[], dict[str, Any]]]] = []
-    if (opts.get("contradiction") or {}).get("enabled"):
+    if contradiction_opts.get("enabled"):
         contradiction_steps = [
             ("suppress_contradicted_estimates", lambda: _summarize_contradiction(
                 suppress_contradicted_estimates(
-                    conn, as_of_date=as_of_date, options=opts.get("contradiction")))),
+                    conn, as_of_date=as_of_date, options=contradiction_opts))),
         ]
+
+    # The candidate scan auto-triages in ENFORCE mode by default: the classifier
+    # auto-parks low-value patterns and auto-rejects noise (its three safety
+    # backstops still protect real bills). Escape hatch: pass
+    # ``options["scan"]["auto_triage"]["mode"] = "shadow"`` (or "off") to make the
+    # scan inert again.
+    scan_opts = dict(opts.get("scan") or {})
+    scan_opts.setdefault("auto_triage", {"mode": "enforce"})
 
     steps: list[tuple[str, Callable[[], dict[str, Any]]]] = [
         *sync_steps,
         ("scan_charge_candidates", lambda: _summarize_scan(
-            scan_charge_onboarding_candidates(conn, options=opts.get("scan")))),
+            scan_charge_onboarding_candidates(conn, options=scan_opts))),
         ("reconcile", lambda: reconcile_obligation_instances(
             conn, as_of_date=as_of_date, options=opts.get("reconcile"))),
         ("detect_drift", lambda: _summarize_drift(
