@@ -1,0 +1,26 @@
+[project]
+name = "financial-agent"
+version = "0.1.0"
+description = "Local finance MCP server for grounded cash-flow and Todoist workflows."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.12.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+financial-agent-mcp = "financial_agent.server:main"
+financial-agent-ui = "financial_agent.ui:main"
+financial-agent-daily = "financial_agent.scheduled:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

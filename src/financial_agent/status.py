@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+import uuid
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Any
+
+from .cashflow import build_cash_flow_projections
+from .drift import detect_drift
+from .guardrails import evaluate_guardrails
+
+
+SCHEMA_VERSION = "finance_status.v1"
+DEFAULT_WINDOWS = [7, 14, 30]
+DEFAULT_FRESHNESS_HOURS = 24
+
+
+def default_db_path() -> Path:
+    configured = os.environ.get("FINANCE_AGENT_DB_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[2] / "data" / "transactions.source-copy.sqlite"
+
+
+def get_finance_status(
+    *,
+    db_path: str | Path | None = None,
+    windows: list[int] | None = None,
+    working_account_id: str | None = None,
+    start_date: str | None = None,
+    now: datetime | None = None,
+    compact: bool = False,
+) -> dict[str, Any]:
+    """Return the first read-only finance status shape.
+
+    This intentionally starts with balances and source freshness. Cash-flow,
+    drift, recurring, and Todoist review candidates keep stable empty slots so
+    callers can integrate against the production-shaped contract now.
+    """
+
+    resolved_db_path = Path(db_path).expanduser() if db_path is not None else default_db_path()
+    observed_at = now or datetime.now(UTC)
+    requested_windows = windows or DEFAULT_WINDOWS
+    projection_start_date = _parse_date(start_date) if start_date else observed_at.date()
+    trace_id = _new_id("trace")
+    balances_result_id = _new_id("result")
+
+    with _connect(resolved_db_path) as conn:
+        accounts = _latest_balances(conn)
+        source_freshness = _source_freshness(conn, observed_at)
+        cash_flow_projections, cash_flow_warnings = build_cash_flow_projections(
+            conn,
+            accounts=accounts,
+            windows=requested_windows,
+            start_date=projection_start_date,
+            working_account_id=working_account_id,
+        )
+        drift_result = detect_drift(conn, as_of_date=projection_start_date, persist=False)
+        guardrail_result = evaluate_guardrails(
+            conn,
+            as_of_date=projection_start_date,
+            accounts=accounts,
+            drift_findings=drift_result["findings"],
+            now=observed_at,
+            persist=False,
+        )
+
+    drift_warnings = [f for f in drift_result["findings"] if f["finding_type"] != "unexpected_recurring"]
+    recurring_candidates = [f for f in drift_result["findings"] if f["finding_type"] == "unexpected_recurring"]
+    guardrail_findings = guardrail_result["findings"]
+
+    total_balance = round(sum(account["balance"] for account in accounts), 2)
+    total_available = round(sum(account["available"] for account in accounts), 2)
+
+    if compact:
+        cash_flow_projections = _compact_projections(cash_flow_projections)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "trace_id": trace_id,
+        "result_refs": [balances_result_id],
+        "observed_at": observed_at.isoformat(),
+        "requested_windows_days": requested_windows,
+        "balances": {
+            "result_id": balances_result_id,
+            "currency": "USD",
+            "total_balance": total_balance,
+            "total_available": total_available,
+            # Spendable deposit cash: available over deposit accounts only
+            # (balance >= 0). Prefer this over total_available, which folds a
+            # card's negative available into the sum. (See digest/grounding.)
+            "liquid_available": round(sum(a["available"] for a in accounts if a["balance"] >= 0), 2),
+            "accounts": accounts,
+            "provenance": {
+                "database": str(resolved_db_path),
+                "tables": ["accounts", "balance_snapshots"],
+                "selection": "latest balance snapshot per account by recorded_at and id",
+            },
+        },
+        "source_freshness": source_freshness,
+        "cash_flow_projections": cash_flow_projections,
+        "drift_warnings": drift_warnings,
+        "recurring_candidates": recurring_candidates,
+        "guardrail_findings": guardrail_findings,
+        "todoist_review_candidates": [],
+        "warnings": [
+            *cash_flow_warnings,
+            *[g["message"] for g in guardrail_findings if not g.get("advisory")],
+            "Todoist review candidates are not implemented yet",
+        ],
+    }
+
+
+def _compact_projections(projections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace each projection's per-event array with a count.
+
+    Keeps all summary stats (window, balances, lowest point, provenance) so the
+    shape stays useful for triage, but drops the large `events` list that makes
+    the full status response blow past model token limits.
+    """
+    compact = []
+    for projection in projections:
+        if "events" not in projection:
+            compact.append(projection)
+            continue
+        trimmed = {k: v for k, v in projection.items() if k != "events"}
+        trimmed["events_count"] = len(projection["events"])
+        compact.append(trimmed)
+    return compact
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise FileNotFoundError(f"Finance database not found: {db_path}")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _latest_balances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            a.id AS account_id,
+            a.name AS account_name,
+            a.org,
+            a.kind,
+            a.currency,
+            bs.balance,
+            bs.available,
+            bs.recorded_at,
+            bs.source
+        FROM balance_snapshots bs
+        JOIN accounts a ON a.id = bs.account_id
+        WHERE bs.id = (
+            SELECT inner_bs.id
+            FROM balance_snapshots inner_bs
+            WHERE inner_bs.account_id = bs.account_id
+            -- Pick the newest calendar day, then within that day prefer a
+            -- manual correction over a feed (simplefin) snapshot regardless of
+            -- recorded_at/id. A manual balance for an "Updated Monthly" account
+            -- (e.g. Apple Card) is authoritative for its day, so a same-day
+            -- simplefin sync recorded later cannot shadow it. Only feed rows on
+            -- the same day fall back to recency.
+            ORDER BY
+                date(inner_bs.recorded_at) DESC,
+                CASE WHEN inner_bs.source = 'manual' THEN 0 ELSE 1 END,
+                inner_bs.recorded_at DESC,
+                inner_bs.id DESC
+            LIMIT 1
+        )
+        ORDER BY a.name COLLATE NOCASE
+        """
+    ).fetchall()
+    return [
+        {
+            "account_id": row["account_id"],
+            "account_name": row["account_name"],
+            "org": row["org"],
+            "kind": row["kind"],
+            "currency": row["currency"],
+            "balance": round(float(row["balance"]), 2),
+            "available": round(float(row["available"]), 2),
+            "recorded_at": row["recorded_at"],
+            "source": row["source"],
+        }
+        for row in rows
+    ]
+
+
+def _source_freshness(conn: sqlite3.Connection, now: datetime) -> dict[str, Any]:
+    latest_sync = conn.execute(
+        """
+        SELECT finished_at, mode, accounts_seen, transactions_inserted,
+               transactions_updated, error
+        FROM sync_runs
+        ORDER BY finished_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    latest_todoist = conn.execute(
+        """
+        SELECT finished_at, project_id, sections_seen, tasks_seen,
+               cashflow_tasks_seen, inserted, updated, missing_marked_deleted,
+               error
+        FROM todoist_sync_runs
+        ORDER BY finished_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return {
+        "simplefin": _freshness_record(
+            latest_sync,
+            now,
+            extra_fields=["mode", "accounts_seen", "transactions_inserted", "transactions_updated"],
+        ),
+        "todoist": _freshness_record(
+            latest_todoist,
+            now,
+            extra_fields=[
+                "project_id",
+                "sections_seen",
+                "tasks_seen",
+                "cashflow_tasks_seen",
+                "inserted",
+                "updated",
+                "missing_marked_deleted",
+            ],
+        ),
+    }
+
+
+def _freshness_record(
+    row: sqlite3.Row | None,
+    now: datetime,
+    *,
+    extra_fields: list[str],
+) -> dict[str, Any]:
+    if row is None:
+        return {
+            "status": "unknown",
+            "last_finished_at": None,
+            "age_hours": None,
+            "error": "no sync run recorded",
+        }
+
+    finished_at = _parse_datetime(row["finished_at"])
+    age_hours = round((now - finished_at).total_seconds() / 3600, 2)
+    status = "error" if row["error"] else "fresh"
+    if status == "fresh" and age_hours > DEFAULT_FRESHNESS_HOURS:
+        status = "stale"
+
+    record = {
+        "status": status,
+        "last_finished_at": finished_at.isoformat(),
+        "age_hours": age_hours,
+        "max_fresh_age_hours": DEFAULT_FRESHNESS_HOURS,
+        "error": row["error"],
+    }
+    for field in extra_fields:
+        record[field] = row[field]
+    return record
+
+
+def _parse_datetime(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _parse_date(value: str) -> date:
+    return date.fromisoformat(value)
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"

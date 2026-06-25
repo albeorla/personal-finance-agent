@@ -1,0 +1,14 @@
+{
+  "_comment": "Drop this into ~/dev/areas/finances/.mcp.json (or merge the 'financial-agent' entry into an existing mcpServers map) to register the local finance MCP server with Claude Code in that workspace. Runs the stdio server out of this repo via uv, so no install/copy of the code is needed.",
+  "mcpServers": {
+    "financial-agent": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/owner/dev/financial-agent-mcp",
+        "financial-agent-mcp"
+      ]
+    }
+  }
+}

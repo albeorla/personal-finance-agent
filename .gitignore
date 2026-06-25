@@ -1,0 +1,15 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+data/
+
+# Secrets and local credentials
+.env
+.env.*
+
+# Local databases / data snapshots
+*.sqlite
+*.sqlite3
+*.db
+
