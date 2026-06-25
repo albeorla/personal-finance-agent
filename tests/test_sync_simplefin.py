@@ -26,7 +26,7 @@ def _insert_txn(conn, tid, account_id, posted):
 SAMPLE = {
     "accounts": [
         {
-            "id": "ACT-chk", "name": "PREMIER PLUS CKG (XXXX)", "org": {"name": "Chase Bank"},
+            "id": "ACT-chk", "name": "PREMIER PLUS CKG (4321)", "org": {"name": "Chase Bank"},
             "type": "checking", "currency": "USD", "balance": "5000.00", "available-balance": "4950.00",
             "balance-date": 1718000000,
             "transactions": [

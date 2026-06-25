@@ -17,7 +17,7 @@ def _status_db(path, *, available=9000.0, obligations=()):
         CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT, amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);
         """
     )
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (XXXX)','Chase','checking','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
     conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('chk',?,?,'2026-06-20T00:00:00+00:00','simplefin')", (available, available))
     conn.execute("INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) VALUES ('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00','i',1,0,0,NULL)")
     conn.row_factory = sqlite3.Row
@@ -29,7 +29,7 @@ def _status_db(path, *, available=9000.0, obligations=()):
     return str(path)
 
 
-def _legacy_md(path, rows, working_line="| Joint Checking (XXXX) | $5,000.00 present / $5,200.00 avail | primary |"):
+def _legacy_md(path, rows, working_line="| Joint Checking (4321) | $5,000.00 present / $5,200.00 avail | primary |"):
     body = ["# Finance", "## Obligations Due (window)", "| Due | Obligation | Amount | Auto | Notes |", "|--|--|--|--|--|"]
     body += rows
     body += ["## All Balances", working_line]

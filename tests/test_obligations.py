@@ -273,7 +273,7 @@ def test_obligation_instances_preserve_amount_lifecycle_fields(tmp_path):
         accounts=[
             {
                 "account_id": "checking-1",
-                "account_name": "Checking XXXX",
+                "account_name": "Checking 4321",
                 "kind": "checking",
                 "available": 10000.0,
                 "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -379,7 +379,7 @@ def test_fixed_outflow_instances_project_into_cash_flow(tmp_path):
         accounts=[
             {
                 "account_id": "checking-1",
-                "account_name": "Checking XXXX",
+                "account_name": "Checking 4321",
                 "kind": "checking",
                 "available": 5000.0,
                 "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -441,7 +441,7 @@ def test_seasonal_eversource_estimate_keeps_structured_model_metadata(tmp_path):
         accounts=[
             {
                 "account_id": "checking-1",
-                "account_name": "Checking XXXX",
+                "account_name": "Checking 4321",
                 "kind": "checking",
                 "available": 1000.0,
                 "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -517,7 +517,7 @@ def test_gault_card_spend_input_does_not_project_as_direct_checking_outflow(tmp_
         accounts=[
             {
                 "account_id": "checking-1",
-                "account_name": "Checking XXXX",
+                "account_name": "Checking 4321",
                 "kind": "checking",
                 "available": 2000.0,
                 "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -769,7 +769,7 @@ def test_deleted_instances_excluded_from_cash_flow_projection(tmp_path):
     accounts = [
         {
             "account_id": "checking-1",
-            "account_name": "Checking XXXX",
+            "account_name": "Checking 4321",
             "kind": "checking",
             "available": 5000.0,
             "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -961,7 +961,7 @@ def test_dormant_suppressed_excluded_from_cashflow_projection(tmp_path):
     accounts = [
         {
             "account_id": "checking-1",
-            "account_name": "Checking XXXX",
+            "account_name": "Checking 4321",
             "kind": "checking",
             "available": 10000.0,
             "recorded_at": "2026-06-24T00:00:00+00:00",
@@ -1126,7 +1126,7 @@ def test_suppress_dormant_is_reversible(tmp_path):
     accounts = [
         {
             "account_id": "checking-1",
-            "account_name": "Checking XXXX",
+            "account_name": "Checking 4321",
             "kind": "checking",
             "available": 10000.0,
             "recorded_at": "2026-06-24T00:00:00+00:00",

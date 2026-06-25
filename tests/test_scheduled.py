@@ -15,7 +15,7 @@ def _db(path):
         "CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT,"
         " amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);"
     )
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (XXXX)','Chase','','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','','USD')")
     ensure_app_schema(conn)
     conn.commit()
     conn.close()

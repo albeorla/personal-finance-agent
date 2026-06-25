@@ -17,6 +17,7 @@ import re
 from datetime import date
 from typing import Any
 
+from .config import get_finance_config
 from .digest import build_daily_digest
 from .migration import _amount_close, _label_tokens, parse_cashflow_md
 from .status import default_db_path
@@ -60,7 +61,10 @@ def compare_to_legacy(
     new_cmp = [o for o in new_obligations if horizon is None or o["due_date"] <= horizon]
 
     matched, changed, missing, extra = _diff(legacy_cmp, new_cmp)
-    working_cash = _compare_working_cash(legacy_cashflow_md_path, digest["balances"].get("working_cash"))
+    working_hint = get_finance_config().get("working_account_hint")
+    working_cash = _compare_working_cash(
+        legacy_cashflow_md_path, digest["balances"].get("working_cash"), working_hint
+    )
 
     # Parity discrepancies are ADVISORY: the legacy cash-flow.md is hand-maintained
     # and often structured differently (a combined paycheck vs two split inflows,
@@ -127,7 +131,7 @@ def render_parity_markdown(report: dict[str, Any]) -> str:
     ]
     wc = report["working_cash"]
     lines.append("## Working Cash")
-    lines.append(f"Legacy XXXX: ${_money(wc.get('legacy_working'))} | New working cash: ${_money(wc.get('new_working_cash'))} | Delta: ${_money(wc.get('delta'))}")
+    lines.append(f"Legacy working cash: ${_money(wc.get('legacy_working'))} | New working cash: ${_money(wc.get('new_working_cash'))} | Delta: ${_money(wc.get('delta'))}")
     lines.append("")
 
     lines.append(f"## Discrepancies ({len(report['discrepancies'])})")
@@ -234,12 +238,20 @@ def _parse_legacy_updated(md_path: str) -> dt.date | None:
     return None
 
 
-def _compare_working_cash(md_path: str, new_working_cash: float | None) -> dict[str, Any]:
+def _compare_working_cash(
+    md_path: str, new_working_cash: float | None, working_hint: str | None = None
+) -> dict[str, Any]:
     legacy_val = None
+    # Find the legacy balances line for the operating account by the configured
+    # name hint (e.g. its last-4). With no hint, fall back to the line that names
+    # an 'avail' balance so the parser still has something to compare against.
+    def _is_working_line(line: str) -> bool:
+        return working_hint in line if working_hint else "avail" in line.lower()
+
     try:
         with open(md_path) as fh:
             for line in fh:
-                if "XXXX" in line:
+                if _is_working_line(line):
                     amounts = re.findall(r"\$([\d,]+\.?\d*)", line)
                     if amounts:
                         legacy_val = float(amounts[-1].replace(",", ""))  # 'avail' is the last $ on the balances line

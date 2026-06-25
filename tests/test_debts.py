@@ -39,7 +39,7 @@ def _seed_balance(conn, *, account_id, balance, recorded_at="2026-06-20T00:00:00
     )
 
 
-_CHK = [{"account_id": "chk", "account_name": "Checking XXXX", "kind": "checking",
+_CHK = [{"account_id": "chk", "account_name": "Checking 4321", "kind": "checking",
          "available": 9000.0, "recorded_at": "2026-06-20T00:00:00+00:00"}]
 
 

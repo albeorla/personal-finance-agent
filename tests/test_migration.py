@@ -24,7 +24,7 @@ def _db(path):
 
 def _yaml(path, items):
     with open(path, "w") as fh:
-        json.dump({"working_account_id": "XXXX", "items": items}, fh)
+        json.dump({"working_account_id": "4321", "items": items}, fh)
     return str(path)
 
 

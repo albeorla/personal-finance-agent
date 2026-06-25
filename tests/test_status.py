@@ -47,7 +47,7 @@ def _build_status_db(path):
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [
-            ("checking-1", "Checking XXXX", "Chase", "checking", "USD", "2026-06-01T00:00:00+00:00", "2026-06-20T10:00:00+00:00"),
+            ("checking-1", "Checking 4321", "Chase", "checking", "USD", "2026-06-01T00:00:00+00:00", "2026-06-20T10:00:00+00:00"),
             ("savings-1", "Savings 6175", "Chase", "savings", "USD", "2026-06-01T00:00:00+00:00", "2026-06-20T10:00:00+00:00"),
         ],
     )

@@ -17,7 +17,7 @@ def _status_db(path, *, available, obligations=()):
         CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT, amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);
         """
     )
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (XXXX)','Chase','checking','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
     conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('chk',?,?,'2026-06-20T00:00:00+00:00','simplefin')", (available, available))
     conn.execute("INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) VALUES ('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00','i',1,0,0,NULL)")
     conn.row_factory = sqlite3.Row
@@ -38,7 +38,7 @@ def test_build_daily_digest_composes_grounded_status(tmp_path):
     assert digest["balances"]["working_cash"] == 9000.0
     assert digest["balances"]["net_across_accounts"] == 9000.0
     assert digest["balances"]["liquid_available"] == 9000.0
-    assert "XXXX" in digest["balances"]["working_account"]
+    assert "4321" in digest["balances"]["working_account"]
     assert [c["window_days"] for c in digest["cash_flow"]] == [7, 14, 30, 60]
     # Rent appears as an upcoming obligation in the 60-day window.
     assert any(o["obligation_name"] == "Rent check" and o["amount"] == 3000.0 for o in digest["upcoming_obligations"])
