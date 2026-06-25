@@ -86,12 +86,12 @@ def test_run_live_validation_cleans_up_its_temp_dir(tmp_path, monkeypatch):
 
 def test_run_live_validation_with_monkeypatched_sync(tmp_path, monkeypatch):
     db = _seed(tmp_path / "v.sqlite")
-    monkeypatch.setattr(val, "get_finance_config", lambda **k: {"has_simplefin": True, "has_todoist": True})
+    monkeypatch.setattr(val, "get_finance_config", lambda **k: {"has_simplefin": True})
     monkeypatch.setattr(val, "sync_simplefin", lambda *a, **k: {"accounts": 9, "inserted": 5, "updated": 700, "error": None})
-    monkeypatch.setattr(val, "sync_todoist", lambda *a, **k: {"tasks_seen": 20, "cashflow_tasks_seen": 7, "error": None})
 
     result = run_live_validation(source_db_path=db, as_of_date="2026-06-21", sync=True)
     assert result["synced"]["simplefin"]["accounts"] == 9
-    assert result["synced"]["todoist"]["tasks_seen"] == 20
+    # Todoist is output-only now, so the validation harness pulls SimpleFIN only.
+    assert "todoist" not in result["synced"]
     # Secret-free: the sync summaries carry only counts.
     assert "access_url" not in str(result["synced"]) and "token" not in str(result["synced"])

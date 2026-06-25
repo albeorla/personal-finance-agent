@@ -15,7 +15,6 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 ### 1. INGEST — pull the facts in
 
 - **SimpleFIN sync** (`sync_simplefin`) pulls live accounts, balances, and transactions into the local DB via idempotent upsert (default 90-day window; `incremental` mode resumes from the last synced transactions so a daily run stays cheap). Read-only against SimpleFIN.
-- **Todoist sync** (`sync_todoist`) pulls the task board (tasks + sections) read-only and normalizes each task into the cash-flow fields the obligation importer uses.
 - **Manual balance snapshots** (`set_manual_balance`) handle balance-only feeds that refresh slowly — for example a card whose portal shows "Updated Monthly". A manual snapshot is written as an ordinary `balance_snapshots` row (`source='manual'`) and is treated as authoritative for its calendar day, so the agent reads current reality instead of a stale feed value.
 
 ### 2. MODEL — turn facts into a forecast
@@ -35,7 +34,7 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 ## Tool catalog
 
-The server registers 69 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 62 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
@@ -79,18 +78,13 @@ The server registers 69 MCP tools. They group by area as follows. (Names are exa
 - `capture_followup`, `list_due_followups`, `resolve_followup`
 - `get_surface_queue` — the single read for the daily surfacing job.
 
-**Todoist surfacing and the action outbox** (writes gated OFF by default)
+**Todoist output and the action outbox** (writes gated OFF by default; Todoist is output-only)
 - `surface_due_items_to_todoist` — idempotent push via the emissions ledger.
-- `reconcile_todoist_emission`, `reconcile_todoist_completions` — adopt pre-existing tasks; absorb user completions.
-- `dedupe_todoist_recurring_duplicates`
-- `create_todoist_task`, `preview_todoist_review_batch`, `enqueue_todoist_review_batch`, `execute_action_outbox`, `list_action_outbox` — render and queue the day's review batch into a durable outbox; nothing is sent externally unless write-back is explicitly enabled.
-
-**Todoist as an obligation input**
-- `import_todoist_obligations` — turn cash-flow-candidate Todoist tasks into canonical one-off obligations (idempotent by task id; the local DB stays canonical, Todoist is the origin for one-offs only).
-- `list_todoist_sync_records`, `resolve_todoist_dedup_conflict`
+- `reconcile_todoist_emission`, `reconcile_todoist_completions` — adopt pre-existing tasks; absorb user completions of tasks we pushed.
+- `create_todoist_task`, `execute_action_outbox`, `list_action_outbox` — create a one-off reminder and process the durable outbox; nothing is sent externally unless write-back is explicitly enabled.
 
 **Background runner and job health**
-- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> preview review batch) as one auditable run with an ordered event log; a failing step is recorded and the run continues.
+- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues.
 - `get_background_run`, `list_background_runs`, `get_job_health`
 
 **Memory** (corrections, decisions, facts to recall)

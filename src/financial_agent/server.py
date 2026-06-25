@@ -38,7 +38,6 @@ from .digest import build_daily_digest as build_daily_digest_for_db
 from .digest import render_digest_markdown as render_digest_markdown_for_db
 from .analytics import render_spending_markdown as render_spending_markdown_for_db
 from .backfill import backfill_recurring_instances as backfill_recurring_instances_for_db
-from .backfill import dedupe_todoist_recurring_duplicates as dedupe_todoist_recurring_duplicates_for_db
 from .onboarding import auto_model_high_confidence_recurring as auto_model_high_confidence_recurring_for_db
 from .analytics import summarize_spending as summarize_spending_for_db
 from .grounding import verify_grounding as verify_grounding_for_db
@@ -58,7 +57,6 @@ from .memory import (
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
 from .migration import apply_obligation_migration as apply_obligation_migration_for_db
 from .sync_simplefin import sync_simplefin as sync_simplefin_for_db
-from .sync_todoist import sync_todoist as sync_todoist_for_db
 from .validate import run_live_validation as run_live_validation_for_db
 from .reconciliation import (
     confirm_reconciliation_match as confirm_reconciliation_match_for_db,
@@ -73,17 +71,10 @@ from .statements import (
     list_statement_cycles as list_statement_cycles_for_db,
     recompute_statement_estimates as recompute_statement_estimates_for_db,
 )
-from .todoist_input import (
-    import_todoist_obligations as import_todoist_obligations_for_db,
-    list_todoist_sync_records as list_todoist_sync_records_for_db,
-    resolve_todoist_dedup_conflict as resolve_todoist_dedup_conflict_for_db,
-)
 from .todoist_outbox import (
     create_todoist_task as create_todoist_task_impl,
-    enqueue_todoist_review_batch as enqueue_todoist_review_batch_for_db,
     execute_action_outbox as execute_action_outbox_for_db,
     list_action_outbox as list_action_outbox_for_db,
-    preview_todoist_review_batch as preview_todoist_review_batch_for_db,
     reconcile_emission as reconcile_emission_for_db,
     reconcile_todoist_completions as reconcile_todoist_completions_for_db,
     surface_to_todoist as surface_to_todoist_for_db,
@@ -993,58 +984,6 @@ def list_drift_findings(
 
 
 @mcp.tool()
-def preview_todoist_review_batch(
-    as_of_date: str,
-    options: dict | None = None,
-    db_path: str | None = None,
-) -> dict:
-    """Render the day's review items (drift findings) as a Todoist task + subtasks.
-
-    Read-only and sends nothing. Returns the parent task and per-item subtasks
-    with specific guidance, so the user can see the review batch before any write.
-    """
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        return preview_todoist_review_batch_for_db(conn, as_of_date=as_of_date, options=options)
-    finally:
-        conn.close()
-
-
-@mcp.tool()
-def enqueue_todoist_review_batch(
-    as_of_date: str,
-    options: dict | None = None,
-    dry_run: bool = True,
-    db_path: str | None = None,
-) -> dict:
-    """Record the day's review batch in the durable action outbox. No live write.
-
-    Idempotent (one batch per day). dry_run (default true) records the payload
-    without intending to send; dry_run=false marks it pending for a sender that
-    is intentionally not configured. Nothing is ever sent to Todoist here.
-    """
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        result = enqueue_todoist_review_batch_for_db(
-            conn, as_of_date=as_of_date, options=options, dry_run=dry_run
-        )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
-
-
-@mcp.tool()
 def execute_action_outbox(
     options: dict | None = None,
     db_path: str | None = None,
@@ -1251,8 +1190,9 @@ def run_background_sync(
     """Run the finance pipeline as one auditable background run.
 
     Orchestrates: scan charge candidates, reconcile transactions, detect drift,
-    and preview the Todoist review batch (dry run). Records a run record plus an
-    ordered operation-event log. A failing step is logged and the run continues
+    suppress dormant estimates, and surface the day's due items to Todoist
+    (de-duped, gated off by default). Records a run record plus an ordered
+    operation-event log. A failing step is logged and the run continues
     (partial_success). Returns the run id, trace id, status, and step summaries.
     """
 
@@ -1426,79 +1366,6 @@ def delete_finance_memory(memory_id: str, db_path: str | None = None) -> dict:
 
 
 @mcp.tool()
-def import_todoist_obligations(
-    tasks: list[dict] | None = None,
-    options: dict | None = None,
-    db_path: str | None = None,
-) -> dict:
-    """Import cashflow-candidate Todoist tasks as canonical one-off obligations.
-
-    The local DB stays the source of truth; Todoist is the origin for one-off
-    obligations only. Idempotent by task id. A checked/completed task sets a
-    review date but is never auto-marked paid; a deleted task cancels its
-    instance; a task resembling a recurring obligation is flagged
-    needs_review_dedup_conflict instead of imported. If tasks is omitted, reads
-    cashflow_candidate tasks from the local todoist_tasks snapshot.
-    """
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        result = import_todoist_obligations_for_db(conn, tasks=tasks, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
-
-
-@mcp.tool()
-def list_todoist_sync_records(
-    sync_status: str | None = None,
-    external_task_id: str | None = None,
-    db_path: str | None = None,
-) -> dict:
-    """List Todoist-to-obligation sync records, optionally filtered by status or task id."""
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        return _list_result(list_todoist_sync_records_for_db(conn, sync_status=sync_status, external_task_id=external_task_id))
-    finally:
-        conn.close()
-
-
-@mcp.tool()
-def resolve_todoist_dedup_conflict(
-    external_task_id: str,
-    decision: str,
-    merge_with_obligation_id: str | None = None,
-    db_path: str | None = None,
-) -> dict:
-    """Resolve a flagged Todoist dedup conflict: import_anyway, skip, or merge."""
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        result = resolve_todoist_dedup_conflict_for_db(
-            conn, external_task_id=external_task_id, decision=decision,
-            merge_with_obligation_id=merge_with_obligation_id,
-        )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
-
-
-@mcp.tool()
 def apply_obligation_migration(
     path: str,
     source: str = "obligations_yaml",
@@ -1625,29 +1492,6 @@ def sync_simplefin(
 
 
 @mcp.tool()
-def sync_todoist(db_path: str | None = None) -> dict:
-    """Pull the live Todoist board (tasks + sections) into the local DB, read-only.
-
-    Reads TODOIST_API_TOKEN and the project id from the finances .env /
-    obligations.yaml at runtime (never returned). Normalizes each task into the
-    cashflow fields the onboarding importer uses, upserts by id, and marks tasks
-    no longer seen as deleted. Does NOT write to Todoist.
-    """
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        result = sync_todoist_for_db(conn)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
-
-
-@mcp.tool()
 def run_live_validation(
     as_of_date: str,
     sync: bool = True,
@@ -1657,10 +1501,10 @@ def run_live_validation(
     """Validate the pipeline on live data without touching the committed snapshot.
 
     Copies the database to a throwaway working DB, optionally pulls live SimpleFIN
-    + Todoist into the copy, then runs the read pipeline (onboarding scan,
-    reconciliation, drift, guardrails) and returns a report with integrity checks
-    (e.g. no orphaned statement targets after a card rename). The source database
-    is never mutated.
+    into the copy, then runs the read pipeline (onboarding scan, reconciliation,
+    drift, guardrails) and returns a report with integrity checks (e.g. no
+    orphaned statement targets after a card rename). The source database is never
+    mutated.
     """
 
     resolved_db_path = db_path or str(default_db_path())
@@ -1860,27 +1704,6 @@ def auto_model_high_confidence_recurring(as_of_date: str | None = None, db_path:
     conn.row_factory = sqlite3.Row
     try:
         result = auto_model_high_confidence_recurring_for_db(conn, as_of_date=as_of_date)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
-
-
-@mcp.tool()
-def dedupe_todoist_recurring_duplicates(as_of_date: str, db_path: str | None = None) -> dict:
-    """Cancel future instances of a Todoist-imported obligation that duplicates a
-    proper recurring obligation (e.g. a stale one-off "New York Times" $28.62 vs
-    the recurring "New York Times subscription" $30.30). Conservative subset match;
-    reversible (status -> canceled).
-    """
-
-    import sqlite3
-
-    resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        result = dedupe_todoist_recurring_duplicates_for_db(conn, as_of_date=as_of_date)
         conn.commit()
         return result
     finally:

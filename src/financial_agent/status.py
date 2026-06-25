@@ -200,34 +200,11 @@ def _source_freshness(conn: sqlite3.Connection, now: datetime) -> dict[str, Any]
         LIMIT 1
         """
     ).fetchone()
-    latest_todoist = conn.execute(
-        """
-        SELECT finished_at, project_id, sections_seen, tasks_seen,
-               cashflow_tasks_seen, inserted, updated, missing_marked_deleted,
-               error
-        FROM todoist_sync_runs
-        ORDER BY finished_at DESC, id DESC
-        LIMIT 1
-        """
-    ).fetchone()
     return {
         "simplefin": _freshness_record(
             latest_sync,
             now,
             extra_fields=["mode", "accounts_seen", "transactions_inserted", "transactions_updated"],
-        ),
-        "todoist": _freshness_record(
-            latest_todoist,
-            now,
-            extra_fields=[
-                "project_id",
-                "sections_seen",
-                "tasks_seen",
-                "cashflow_tasks_seen",
-                "inserted",
-                "updated",
-                "missing_marked_deleted",
-            ],
         ),
     }
 

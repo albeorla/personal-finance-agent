@@ -6,10 +6,11 @@ never logs or persists the secret values. The
 `has_simplefin` / `has_todoist` booleans are safe to surface (they say whether a
 credential is present, not what it is).
 
-It also owns `ensure_source_tables`, the DDL for the SimpleFIN/Todoist source
-tables (accounts, balance_snapshots, transactions, sync_runs, todoist_*), so a
-sync can populate a fresh database. This mirrors the legacy
-`~/dev/areas/finances/finance/db.py` schema.
+It also owns `ensure_source_tables`, the DDL for the SimpleFIN source tables
+(accounts, balance_snapshots, transactions, sync_runs), so a sync can populate a
+fresh database. This mirrors the legacy `~/dev/areas/finances/finance/db.py`
+schema. Todoist is output-only now (push reminders + read back completions of
+tasks we pushed), so no Todoist input tables are created here.
 """
 
 from __future__ import annotations
@@ -115,26 +116,6 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
     mode TEXT NOT NULL, accounts_seen INTEGER NOT NULL, transactions_inserted INTEGER NOT NULL,
     transactions_updated INTEGER NOT NULL, error TEXT
-);
-CREATE TABLE IF NOT EXISTS todoist_sections (
-    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, section_order INTEGER,
-    is_archived INTEGER NOT NULL DEFAULT 0, is_deleted INTEGER NOT NULL DEFAULT 0,
-    added_at TEXT, updated_at TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, fetched_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS todoist_tasks (
-    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, section_id TEXT, parent_id TEXT,
-    content TEXT NOT NULL, description TEXT, labels_json TEXT NOT NULL, due_date TEXT, due_string TEXT,
-    due_is_recurring INTEGER NOT NULL DEFAULT 0, deadline_date TEXT, amount_value REAL,
-    amount_direction INTEGER NOT NULL DEFAULT 0, signed_amount REAL, cashflow_candidate INTEGER NOT NULL DEFAULT 0,
-    checked INTEGER NOT NULL DEFAULT 0, is_deleted INTEGER NOT NULL DEFAULT 0, added_at TEXT, updated_at TEXT,
-    completed_at TEXT, priority INTEGER, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, fetched_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_todoist_tasks_project_due ON todoist_tasks(project_id, due_date);
-CREATE TABLE IF NOT EXISTS todoist_sync_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
-    project_id TEXT NOT NULL, sections_seen INTEGER NOT NULL, tasks_seen INTEGER NOT NULL,
-    cashflow_tasks_seen INTEGER NOT NULL, inserted INTEGER NOT NULL, updated INTEGER NOT NULL,
-    missing_marked_deleted INTEGER NOT NULL, error TEXT
 );
 """
 

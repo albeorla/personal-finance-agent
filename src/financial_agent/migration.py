@@ -5,8 +5,8 @@ source of truth. Cash-flow truth now lives entirely in the `obligation_instances
 table (see cashflow.py, which reads only that table). `obligations.yaml` and
 `cash-flow.md` are retired and no longer authoritative; this module exists solely
 to seed a fresh database from them once. Day-to-day cash flows must be entered via
-the MCP tools (apply_obligation_instances, apply_charge_onboarding_candidate,
-import_todoist_obligations), never by editing the legacy files.
+the MCP tools (apply_obligation_instances, apply_charge_onboarding_candidate),
+never by editing the legacy files.
 
 Brings the complete current obligation set into canonical rows. The trustworthy,
 machine-readable source is `obligations.yaml` (a JSON object with an `items`
@@ -15,9 +15,9 @@ its rows are always imported as `needs_review`.
 
 Safety:
 - Dedup is instance-level against everything ALREADY modeled (seeded obligations,
-  income, Todoist one-offs): an item that matches an existing instance by name
-  tokens + amount bucket + direction + a +/-7 day window is skipped as
-  already_modeled, so migration never duplicates what is already there.
+  income, one-offs): an item that matches an existing instance by name tokens +
+  amount bucket + direction + a +/-7 day window is skipped as already_modeled, so
+  migration never duplicates what is already there.
 - Ambiguous rows (estimates, ranges, detector-neutralizing hacks) become
   `needs_review` instances rather than trusted obligations.
 - `dry_run=True` (default) computes the full plan and writes nothing.
