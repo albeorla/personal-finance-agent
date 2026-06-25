@@ -57,6 +57,7 @@ from .memory import (
     write_memory as write_memory_for_db,
 )
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
+from .card_import import import_card_statement_for_db
 from .migration import apply_obligation_migration as apply_obligation_migration_for_db
 from .sync_simplefin import sync_simplefin as sync_simplefin_for_db
 from .validate import run_live_validation as run_live_validation_for_db
@@ -454,6 +455,56 @@ def set_manual_balance(
             note=note,
         )
         if result.get("status") == "ok":
+            conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def import_card_statement(
+    text: str,
+    account_query: str = "Apple Card",
+    as_of_date: str | None = None,
+    statement_close_date: str | None = None,
+    statement_total: float | None = None,
+    dry_run: bool = True,
+    db_path: str | None = None,
+) -> dict:
+    """Import a pasted Apple Card statement (CSV or statement text) into the DB.
+
+    The Apple Card has no live transaction feed, so card spend never reaches the
+    projection. Paste a monthly download here: it parses into real transaction
+    rows (source='apple_card_paste'), dedups against prior pastes via a
+    deterministic synthetic id, fuzzy-matches the account, and feeds both the
+    onboarding scanner and the statement-estimate rollup. When the paste carries a
+    statement total, the Apple Card statement instance is promoted to that
+    observed total (a protected amount the rollup never overwrites) and a sticky
+    manual balance is recorded.
+
+    Default dry_run=True: parse + preview only. Re-run with dry_run=false to write.
+    as_of_date defaults to today. An ambiguous account match writes nothing and
+    returns candidates; a wrong-card paste is blocked by the match floor.
+    """
+
+    import datetime as _dt
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    resolved_as_of = as_of_date or _dt.date.today().isoformat()
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = import_card_statement_for_db(
+            conn,
+            text=text,
+            account_query=account_query,
+            as_of_date=resolved_as_of,
+            statement_close_date=statement_close_date,
+            statement_total=statement_total,
+            dry_run=dry_run,
+        )
+        if not dry_run and result.get("status") == "ok":
             conn.commit()
         return result
     finally:

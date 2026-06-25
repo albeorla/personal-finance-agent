@@ -6,7 +6,7 @@ Durable Mermaid diagrams for the local finance MCP server. These diagrams descri
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 67 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 69 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"read-only sync"| Server
     Portals["Bank/card portals<br/>manual balances and one-off facts"] -->|"manual inputs"| Server
@@ -36,6 +36,7 @@ flowchart LR
     subgraph Ingest["1. INGEST"]
         Sync["sync_simplefin<br/>pull SimpleFIN balances + transactions"]
         Manual["set_manual_balance<br/>record current portal balance when a feed is stale"]
+        CardPaste["import_card_statement<br/>paste a card statement when a card has no live feed (dry-run by default)"]
         TodoistRead["reconcile_todoist_completions<br/>read completion state for emitted tasks"]
     end
 

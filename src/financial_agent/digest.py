@@ -23,7 +23,7 @@ from .guardrails import CASH_FLOOR
 from .obligations import list_obligations
 from .onboarding import ACTIVE_STATUSES
 from .reconciliation import list_reconciliation_review_items
-from .status import DEFAULT_FRESHNESS_HOURS, default_db_path, get_finance_status
+from .status import default_db_path, get_finance_status
 from .surface_queue import MANUAL_DUE_LEAD_DAYS, _manual_obligation_due_rows
 
 # #7 sensitivity: per-confidence-tier downside fraction used when a per-instance
@@ -603,7 +603,6 @@ def _coverage(
         board_health = _board_health(
             conn,
             source_freshness=source_freshness,
-            accounts=accounts,
             drift_warnings=drift_warnings,
         )
     finally:
@@ -634,7 +633,6 @@ def _board_health(
     conn: sqlite3.Connection,
     *,
     source_freshness: dict[str, Any],
-    accounts: list[dict[str, Any]],
     drift_warnings: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Freshness of the surfacing board, so the counts are paired with "is the
@@ -660,32 +658,25 @@ def _board_health(
         "managed_clean": bool(last_surfaced_at) and open_big_drift == 0,
         "last_surfaced_at": last_surfaced_at,
         "last_sync_at": sf.get("last_finished_at"),
-        "apple_card_stale": _apple_card_stale(accounts),
+        "apple_card_stale": _apple_card_stale(conn),
     }
 
 
-def _apple_card_stale(accounts: list[dict[str, Any]]) -> bool:
-    """Whether an Apple Card account's balance snapshot is older than the
-    freshness window. Proxy for #4's "spend not pasted this cycle" signal, which
-    the card-spend paste-import will replace; the Apple Card has no live feed."""
+def _apple_card_stale(conn: sqlite3.Connection) -> bool:
+    """Whether the Apple Card cycle has had no covering paste (design #4).
 
-    now = dt.datetime.now(dt.timezone.utc)
-    for a in accounts:
-        label = f"{a.get('account_name') or ''} {a.get('org') or ''}".lower()
-        if "apple" not in label:
-            continue
-        recorded = a.get("recorded_at")
-        if not recorded:
-            return True
-        try:
-            ts = dt.datetime.fromisoformat(str(recorded).replace("Z", "+00:00"))
-        except ValueError:
-            return True
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=dt.timezone.utc)
-        if (now - ts).total_seconds() / 3600 > DEFAULT_FRESHNESS_HOURS:
-            return True
-    return False
+    The real paste-cycle freshness signal: stale when the current open statement
+    cycle has no covering card-spend paste (the latest card_import_runs row is
+    older than a cycle), measured against the statement cycle rather than the 36h
+    SimpleFIN sync clock. Replaces the slice-2 balance-snapshot-age proxy; the
+    Apple Card has no live feed, so a fresh balance never meant fresh spend."""
+
+    from .card_import import apple_card_paste_freshness
+
+    try:
+        return apple_card_paste_freshness(conn)["status"] == "stale"
+    except sqlite3.OperationalError:
+        return False
 
 
 def _relative_time(iso: Any) -> str:

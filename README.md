@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 68 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 69 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -40,6 +40,7 @@ flowchart LR
     subgraph Ingest["1. INGEST"]
         Sync["sync_simplefin<br/>pull balances + transactions"]
         Manual["set_manual_balance<br/>correct stale balance-only feeds"]
+        CardPaste["import_card_statement<br/>paste a card statement (dry-run by default)"]
         ReadBack["reconcile_todoist_completions<br/>absorb task completions"]
     end
 
@@ -72,6 +73,7 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 - **SimpleFIN sync** (`sync_simplefin`) pulls live accounts, balances, and transactions into the local DB via idempotent upsert (default 90-day window; `incremental` mode resumes from the last synced transactions so a daily run stays cheap). Read-only against SimpleFIN.
 - **Manual balance snapshots** (`set_manual_balance`) handle balance-only feeds that refresh slowly — for example a card whose portal shows "Updated Monthly". A manual snapshot is written as an ordinary `balance_snapshots` row (`source='manual'`) and is treated as authoritative for its calendar day, so the agent reads current reality instead of a stale feed value.
+- **Card-statement paste** (`import_card_statement`) fills the balance-only blind spot for cards with no live transaction feed (for example the Apple Card). Paste a monthly CSV or statement export: it parses into real transaction rows (`source='apple_card_paste'`), dedups against prior pastes via a deterministic synthetic id, fuzzy-matches the account, and feeds both the onboarding scanner and the statement-estimate rollup. When the paste carries a statement total, the card's statement instance is promoted to that observed amount and a sticky manual balance is recorded. Defaults to `dry_run=True` (parse + preview only); re-run with `dry_run=false` to write.
 
 ### 2. MODEL — turn facts into a forecast
 
@@ -90,7 +92,7 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 ## Tool catalog
 
-The server registers 68 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 69 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
@@ -117,6 +119,7 @@ The server registers 68 MCP tools. They group by area as follows. (Names are exa
 
 **Statement cycles** (for card-statement-payment obligations)
 - `aggregate_statement_inputs`, `list_statement_cycles`, `recompute_statement_estimates` — roll card-input charges into the statement cycle that pays them; never overwrites a confirmed/observed amount.
+- `import_card_statement` — paste a monthly card statement (CSV or statement text) for a card with no live transaction feed (for example the Apple Card) to fill the balance-only blind spot. Parses into real transaction rows, dedups against prior pastes, fuzzy-matches the account, feeds the onboarding scanner and statement rollup, and (when a total is supplied) promotes the statement instance to that observed amount. Dry-run by default; re-run with `dry_run=false` to write.
 
 **Reconciliation and drift**
 - `reconcile_obligation_instances` — match expected instances to observed transactions (conservative by default; never silently marks paid).
