@@ -1129,6 +1129,57 @@ def reconcile_todoist_project_for_db(
     return report
 
 
+def _forbidden_delete(*_args: Any, **_kwargs: Any) -> bool:
+    """Guard delete_func for the read-only LIST tool.
+
+    ``list_todoist_project_for_db`` reuses the reconcile classifier with
+    ``apply=False``, which never reaches the delete branch. This guard makes the
+    invariant structural rather than incidental: if a future refactor ever wired a
+    delete into the read path, it raises instead of silently mutating Todoist.
+    """
+
+    raise RuntimeError("list_todoist_project is read-only and must never delete a task")
+
+
+def list_todoist_project_for_db(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str,
+    write_enabled: bool | None = None,
+    token: str | None = None,
+    project_id: str | None = None,
+    env_path: str | None = None,
+    list_func: Callable[..., dict[str, Any]] = _list_tasks_request,
+) -> dict[str, Any]:
+    """Read-only LIST + classify of the whole Finance project.
+
+    Runs the SAME paginated LIST and per-task classification as
+    ``reconcile_todoist_project_for_db`` but with NO delete capability and NO
+    apply path: ``apply`` is hard-forced ``False`` and the delete hook is
+    ``_forbidden_delete`` (raises if ever reached), so this can never mutate
+    Todoist or the local ledger. The returned report is the reconcile report shape
+    with ``applied`` always ``False`` and every entry in ``actions`` zero; tasks
+    still carry their ``would_delete`` classification so a caller can see what a
+    cleanup WOULD remove without performing it.
+
+    The dry-run report needs only token+project (reads are allowed with write-back
+    off); no commit is required. A truncated or failed LIST is reported via
+    ``truncated`` / ``status`` exactly as the reconcile path reports it.
+    """
+
+    return reconcile_todoist_project_for_db(
+        conn,
+        as_of_date=as_of_date,
+        apply=False,
+        write_enabled=write_enabled,
+        token=token,
+        project_id=project_id,
+        env_path=env_path,
+        list_func=list_func,
+        delete_func=_forbidden_delete,
+    )
+
+
 def execute_action_outbox(
     conn: sqlite3.Connection,
     *,

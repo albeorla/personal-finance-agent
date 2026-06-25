@@ -78,6 +78,7 @@ from .todoist_outbox import (
     list_action_outbox as list_action_outbox_for_db,
     reconcile_emission as reconcile_emission_for_db,
     reconcile_todoist_completions as reconcile_todoist_completions_for_db,
+    list_todoist_project_for_db,
     reconcile_todoist_project_for_db,
     request_emission_retire_prefix,
     surface_to_todoist as surface_to_todoist_for_db,
@@ -1295,6 +1296,38 @@ def reconcile_todoist_project(
         result = reconcile_todoist_project_for_db(conn, as_of_date=as_of_date, apply=apply)
         conn.commit()
         return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_todoist_project(
+    as_of_date: str,
+    db_path: str | None = None,
+) -> dict:
+    """READ-ONLY LIST + classify of the whole Finance project (no delete, no apply).
+
+    The read-only sibling of ``reconcile_todoist_project``: it pages through every
+    task in the Finance project and classifies each as managed, stale_applied,
+    duplicate, fa_auto_orphan, or kept, returning the SAME report shape. It has NO
+    delete capability and NO apply path - ``applied`` is always false and every
+    ``actions`` count is zero - so it can never mutate Todoist or the local ledger.
+    Tasks a cleanup WOULD remove still show as ``would_delete`` for visibility, but
+    nothing is deleted.
+
+    Use this for board reads under the finance-scoped read-only permission profile;
+    use the delete-capable ``reconcile_todoist_project`` (kept prompting) when you
+    actually intend to clean up. A truncated or failed LIST is reported via the
+    ``truncated`` / ``status`` fields exactly as the reconcile path reports it.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list_todoist_project_for_db(conn, as_of_date=as_of_date)
     finally:
         conn.close()
 
