@@ -18,6 +18,7 @@ import datetime as dt
 import sqlite3
 from typing import Any
 
+from .config import get_finance_config
 from .status import default_db_path
 
 DEFAULT_TOLERANCE = 0.02
@@ -39,14 +40,25 @@ def verify_grounding(
     checks: list[dict[str, Any]] = []
     try:
         # 1. Working cash -> latest balance snapshot of the operating account.
-        snap = conn.execute(
-            "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
-            "WHERE a.name LIKE '%XXXX%' ORDER BY bs.recorded_at DESC LIMIT 1"
-        ).fetchone()
+        # Identify the operating account by the configured name hint (bound
+        # parameter, never interpolated). With no hint configured, fall back to
+        # the latest checking-kind account so grounding still has a source row.
+        hint = get_finance_config().get("working_account_hint")
+        if hint:
+            snap = conn.execute(
+                "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
+                "WHERE a.name LIKE '%' || ? || '%' ORDER BY bs.recorded_at DESC LIMIT 1",
+                (hint,),
+            ).fetchone()
+        else:
+            snap = conn.execute(
+                "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
+                "WHERE a.kind = 'checking' ORDER BY bs.recorded_at DESC LIMIT 1"
+            ).fetchone()
         if norm["working_cash"] is not None:
             checks.append(_num_check(
                 "working_cash", norm["working_cash"], snap["available"] if snap else None,
-                "balance_snapshots(operating account XXXX).available", tolerance))
+                "balance_snapshots(operating account).available", tolerance))
 
         # Net worth across all accounts must tie to the sum of each account's
         # latest balance (so a net line that secretly excludes card/loan debt is

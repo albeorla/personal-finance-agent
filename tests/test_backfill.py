@@ -18,7 +18,7 @@ def _db(path, transactions=()):
             first_seen_at TEXT, last_seen_at TEXT, fetched_at TEXT);
         """
     )
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-chk','PREMIER PLUS CKG (XXXX)','Chase','checking','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
     conn.executemany(
         "INSERT INTO transactions (id,account_id,posted,amount,payee,description,pending,source) VALUES (?,?,?,?,?,?,0,'simplefin')",
         transactions,

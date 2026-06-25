@@ -55,7 +55,7 @@ def _db(path):
 
 def _checking(conn, *, available=9000.0, recorded_at="2026-06-23T00:00:00+00:00"):
     conn.execute(
-        "INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','Checking XXXX','Chase','checking','USD')"
+        "INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','Checking 4321','Chase','checking','USD')"
     )
     conn.execute(
         "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('chk',?,?,?,'simplefin')",

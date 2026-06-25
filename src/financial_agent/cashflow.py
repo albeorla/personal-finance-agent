@@ -4,6 +4,7 @@ import sqlite3
 from datetime import date, timedelta
 from typing import Any
 
+from .config import get_finance_config
 from .schema import has_app_schema
 
 
@@ -26,11 +27,16 @@ def build_cash_flow_projections(
     windows: list[int],
     start_date: date,
     working_account_id: str | None = None,
+    working_account_hint: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not has_app_schema(conn):
         return [], ["local obligation schema is not initialized"]
 
-    working_account = _select_working_account(accounts, working_account_id)
+    # Resolve the operating-account name hint from config when not supplied and
+    # no explicit account id pins the selection. Kept out of source (config).
+    if working_account_hint is None and working_account_id is None:
+        working_account_hint = get_finance_config().get("working_account_hint")
+    working_account = _select_working_account(accounts, working_account_id, working_account_hint)
     if working_account is None:
         return [], ["no working cash account found for cash-flow projection"]
 
@@ -161,13 +167,17 @@ def _build_window_projection(
 def _select_working_account(
     accounts: list[dict[str, Any]],
     working_account_id: str | None,
+    working_account_hint: str | None = None,
 ) -> dict[str, Any] | None:
     if working_account_id is not None:
         return next((account for account in accounts if account["account_id"] == working_account_id), None)
 
-    for account in accounts:
-        if "XXXX" in (account["account_name"] or ""):
-            return account
+    # Name-match the operating account by the configured hint (e.g. its last-4).
+    # When no hint is configured, fall through to the first checking account.
+    if working_account_hint:
+        for account in accounts:
+            if working_account_hint in (account["account_name"] or ""):
+                return account
 
     for account in accounts:
         if account["kind"] == "checking":

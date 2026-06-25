@@ -15,7 +15,7 @@ def _seed(path, *, orphan_target=False):
     ensure_source_tables(conn)
     ensure_app_schema(conn)
     conn.execute("INSERT INTO accounts (id,name,org,kind,currency,first_seen_at,last_seen_at) "
-                 "VALUES ('chk','PREMIER PLUS CKG (XXXX)','Chase','','USD','x','x')")
+                 "VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','','USD','x','x')")
     conn.execute("INSERT INTO transactions (id,account_id,posted,amount,payee,source,first_seen_at,last_seen_at,fetched_at) "
                  "VALUES ('t1','chk','2026-06-10T08:00:00',-115.87,'Eversource Energy','simplefin','x','x','x')")
     apply_obligation_instances(

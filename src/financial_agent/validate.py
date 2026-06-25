@@ -47,7 +47,8 @@ def build_validation_report(
 
     matched = list_matched_obligation_instances(conn)
     unmatched = list_unmatched_obligation_instances(conn, past_grace_only=True)
-    checks = _integrity_checks(conn)
+    working_hint = get_finance_config().get("working_account_hint")
+    checks = _integrity_checks(conn, working_hint)
 
     return {
         "as_of_date": as_of_date,
@@ -122,13 +123,21 @@ def run_live_validation(
 # --- integrity checks ------------------------------------------------------
 
 
-def _integrity_checks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _integrity_checks(conn: sqlite3.Connection, working_hint: str | None = None) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
 
     accounts = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
     checks.append(_check("accounts_present", accounts > 0, {"count": accounts}))
 
-    working = conn.execute("SELECT COUNT(*) FROM accounts WHERE name LIKE '%XXXX%'").fetchone()[0]
+    # Operating account present: match by the configured name hint (bound
+    # parameter, never interpolated). With no hint, fall back to counting
+    # checking-kind accounts so the check still runs.
+    if working_hint:
+        working = conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE name LIKE '%' || ? || '%'", (working_hint,)
+        ).fetchone()[0]
+    else:
+        working = conn.execute("SELECT COUNT(*) FROM accounts WHERE kind = 'checking'").fetchone()[0]
     checks.append(_check("working_account_present", working >= 1, {"count": working}))
 
     # Card-statement-input instances must target an obligation that still exists,

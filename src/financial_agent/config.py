@@ -84,6 +84,13 @@ def get_finance_config(
     token = pick("TODOIST_API_TOKEN")
     # Live Todoist write-back is OFF unless explicitly enabled. Reads stay allowed.
     write_enabled = str(pick("TODOIST_WRITE_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
+    # Substring used to identify the operating/working checking account by name
+    # (e.g. the account-name last-4). Kept out of source so the public repo never
+    # carries a real account number; set WORKING_ACCOUNT_HINT in the finances .env.
+    # When unset, working-account selection falls back to the first checking
+    # account (see cashflow._select_working_account and the grounding/validate/
+    # parity fallbacks), so the pipeline still runs, just without name-matching.
+    working_account_hint = pick("WORKING_ACCOUNT_HINT")
     return {
         "simplefin_access_url": access_url,
         "todoist_api_token": token,
@@ -91,6 +98,7 @@ def get_finance_config(
         "has_simplefin": bool(access_url),
         "has_todoist": bool(token and project_id),
         "todoist_write_enabled": write_enabled,
+        "working_account_hint": working_account_hint,
     }
 
 

@@ -19,7 +19,7 @@ def _db(path):
     return conn
 
 
-_CHK = [{"account_id": "chk", "account_name": "Checking XXXX", "kind": "checking",
+_CHK = [{"account_id": "chk", "account_name": "Checking 4321", "kind": "checking",
          "available": 0.0, "recorded_at": "2026-06-20T00:00:00+00:00"}]
 
 

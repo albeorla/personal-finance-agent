@@ -27,7 +27,7 @@ def _status_db(path):
         CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT, amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);
         """
     )
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-chk','PREMIER PLUS CKG (XXXX)','Chase','checking','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
     conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('ACT-chk',5000,5000,'2026-06-20T00:00:00+00:00','simplefin')")
     conn.execute("INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) VALUES ('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00','incremental',1,3,0,NULL)")
     conn.row_factory = sqlite3.Row

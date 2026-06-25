@@ -19,7 +19,7 @@ def _db(path, transactions=()):
             amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);
         """
     )
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-chk','PREMIER PLUS CKG (XXXX)','Chase Bank','','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-chk','PREMIER PLUS CKG (4321)','Chase Bank','','USD')")
     conn.executemany(
         "INSERT INTO transactions (id,account_id,posted,amount,payee,description,pending,source) VALUES (?,?,?,?,?,?,0,'simplefin')",
         transactions,

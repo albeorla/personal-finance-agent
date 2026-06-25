@@ -5,7 +5,7 @@ transaction evidence. The acceptance cases use the real merchant amounts and
 account placements observed in ``data/transactions.source-copy.sqlite``:
 
 - Gault Energy fills land on the Amex Platinum card -> card statement input.
-- Eversource electric is paid from checking XXXX -> direct checking, seasonal.
+- Eversource electric is paid from checking 4321 -> direct checking, seasonal.
 - New York Times is a monthly checking subscription that settled at $30.30.
 
 Candidates are never cash-flow truth: they live in their own table and must not
@@ -36,7 +36,7 @@ from financial_agent.schema import ensure_app_schema
 # Account fixtures mirror the real copied database, where account.kind is empty
 # and class must be inferred from name/org.
 AMEX = ("ACT-amex", "Platinum Card® (5000)", "American Express", "", "USD")
-CHECKING = ("ACT-chk", "PREMIER PLUS CKG (XXXX)", "Chase Bank", "", "USD")
+CHECKING = ("ACT-chk", "PREMIER PLUS CKG (4321)", "Chase Bank", "", "USD")
 SAVINGS = ("ACT-sav", "PREMIER SAVINGS (6175)", "Chase Bank", "", "USD")
 
 GAULT_AMEX_ROWS = [
@@ -150,7 +150,7 @@ def test_normalize_merchant_key_is_deterministic_slug():
 
 
 def test_account_class_infers_from_name_and_org_when_kind_empty():
-    assert account_class({"name": "PREMIER PLUS CKG (XXXX)", "org": "Chase Bank", "kind": ""}) == "checking"
+    assert account_class({"name": "PREMIER PLUS CKG (4321)", "org": "Chase Bank", "kind": ""}) == "checking"
     assert account_class({"name": "PREMIER SAVINGS (6175)", "org": "Chase Bank", "kind": ""}) == "savings"
     assert account_class({"name": "Platinum Card® (5000)", "org": "American Express", "kind": ""}) == "card"
     assert account_class({"name": "Owner", "org": "Apple Card (Updated Monthly)", "kind": ""}) == "card"
@@ -324,7 +324,7 @@ def test_cash_flow_projection_excludes_unapplied_candidates(tmp_path):
     accounts = [
         {
             "account_id": "ACT-chk",
-            "account_name": "PREMIER PLUS CKG (XXXX)",
+            "account_name": "PREMIER PLUS CKG (4321)",
             "kind": "checking",
             "available": 9000.0,
             "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -707,7 +707,7 @@ def test_applied_direct_checking_obligation_projects_into_cash_flow(tmp_path):
     accounts = [
         {
             "account_id": "ACT-chk",
-            "account_name": "PREMIER PLUS CKG (XXXX)",
+            "account_name": "PREMIER PLUS CKG (4321)",
             "kind": "checking",
             "available": 1000.0,
             "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -735,7 +735,7 @@ def test_applied_card_statement_input_is_excluded_from_checking_but_listed(tmp_p
     accounts = [
         {
             "account_id": "ACT-chk",
-            "account_name": "PREMIER PLUS CKG (XXXX)",
+            "account_name": "PREMIER PLUS CKG (4321)",
             "kind": "checking",
             "available": 5000.0,
             "recorded_at": "2026-06-20T00:00:00+00:00",
@@ -817,7 +817,7 @@ def test_apply_inflow_projects_as_income(tmp_path):
     accounts = [
         {
             "account_id": "ACT-chk",
-            "account_name": "PREMIER PLUS CKG (XXXX)",
+            "account_name": "PREMIER PLUS CKG (4321)",
             "kind": "checking",
             "available": 100.0,
             "recorded_at": "2026-06-20T00:00:00+00:00",
