@@ -94,7 +94,7 @@ The server registers 67 MCP tools. They group by area as follows. (Names are exa
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
-- `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance.
+- `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance. Also includes an obligation coverage summary (how much of what you owe is modeled vs silent autopay vs unmodeled discovered charges) and a trough-sensitivity line that shows how much the projected low point swings on its estimated outflows, so a precise-looking low point is not read as fact.
 - `summarize_spending` — outflow spending by category / merchant / month with totals, a month-over-month trend, and the transaction ids behind each bucket (rules-based, no LLM).
 - `verify_grounding` — the "is the agent allowed to say this number" gate: confirms each headline figure traces to a source row.
 
