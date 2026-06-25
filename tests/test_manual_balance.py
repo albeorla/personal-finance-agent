@@ -285,12 +285,40 @@ def test_same_day_simplefin_before_manual_does_not_override(tmp_path):
     assert _latest_balance(db_path, "chase-1") == 6122.0
 
 
-def test_next_day_simplefin_supersedes_manual(tmp_path):
-    """Cross-day precedence: a NEXT-day SimpleFIN sync still supersedes manual.
+def test_next_day_simplefin_does_not_supersede_manual(tmp_path):
+    """Sticky manual: a NEXT-day SimpleFIN sync does NOT supersede the manual.
 
-    Manual is authoritative only for its own period (calendar day). A fresh feed
-    snapshot on a later day is newer reality and wins, so manual corrections do
-    not freeze the balance forever.
+    The user has decided manual balances are sticky: a manual correction holds
+    over every feed snapshot -- including one recorded on a later calendar day --
+    until the user records a newer manual or clears it. For balance-only
+    "Updated Monthly" accounts (e.g. the Apple Card) the feed can lag reality for
+    weeks, so a stale next-day feed value must not silently re-shadow the
+    correction.
+    """
+
+    db_path = tmp_path / "transactions.sqlite"
+    _build_db(db_path, accounts=[("chase-1", "Chase Checking", "Chase")])
+
+    conn = _connect(db_path)
+    set_manual_balance(conn, "chase", 6122.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+    assert _latest_balance(db_path, "chase-1") == 6122.0
+
+    # A later-day SimpleFIN snapshot must NOT shadow the sticky manual.
+    conn = _connect(db_path)
+    _add_snapshot(conn, "chase-1", 6100.0, "2026-06-21T09:00:00+00:00")
+    conn.commit()
+    conn.close()
+    now = datetime(2026, 6, 21, 18, 0, tzinfo=UTC)
+    assert _latest_balance(db_path, "chase-1", now=now) == 6122.0
+
+
+def test_newer_manual_replaces_older_manual_across_days(tmp_path):
+    """A newer manual correction supersedes an older manual ('until you change it').
+
+    Sticky does not mean frozen forever: the LATEST manual wins among manuals, so
+    a fresh manual correction on a later day replaces the prior manual value.
     """
 
     db_path = tmp_path / "transactions.sqlite"
@@ -303,10 +331,29 @@ def test_next_day_simplefin_supersedes_manual(tmp_path):
     assert _latest_balance(db_path, "chase-1") == 6122.0
 
     conn = _connect(db_path)
-    _add_snapshot(conn, "chase-1", 6100.0, "2026-06-21T09:00:00+00:00")
+    set_manual_balance(conn, "chase", 5800.0, "2026-06-22")
     conn.commit()
     conn.close()
-    assert _latest_balance(db_path, "chase-1") == 6100.0
+    now = datetime(2026, 6, 22, 18, 0, tzinfo=UTC)
+    assert _latest_balance(db_path, "chase-1", now=now) == 5800.0
+
+
+def test_no_manual_latest_feed_wins(tmp_path):
+    """With no manual snapshot, the latest feed snapshot wins (recency)."""
+
+    db_path = tmp_path / "transactions.sqlite"
+    _build_db(
+        db_path,
+        accounts=[("chase-1", "Chase Checking", "Chase")],
+        snapshots=[("chase-1", 5000.0, "2026-06-19T10:00:00+00:00")],
+    )
+
+    conn = _connect(db_path)
+    _add_snapshot(conn, "chase-1", 5500.0, "2026-06-21T10:00:00+00:00")
+    conn.commit()
+    conn.close()
+    now = datetime(2026, 6, 21, 18, 0, tzinfo=UTC)
+    assert _latest_balance(db_path, "chase-1", now=now) == 5500.0
 
 
 def test_set_manual_balance_negative_correction_wins_over_same_day_later_simplefin(tmp_path):

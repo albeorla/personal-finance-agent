@@ -220,6 +220,50 @@ def test_list_debts_balance_matches_get_finance_status_apple_card(tmp_path):
     assert status_apple["balance"] == debt["current_balance"] == -6122.03
 
 
+def test_list_debts_sticky_manual_wins_over_next_day_feed(tmp_path):
+    """Sticky manual propagates to list_debts across calendar days.
+
+    The live Apple Card bug: a manual correction on day D (-6122.03) was shadowed
+    by a next-day SimpleFIN feed row on D+1 (-5949.32) because the old precedence
+    ordered by calendar day first. With sticky manual precedence the manual wins
+    over the later-day feed, and list_debts (and thus the avalanche it feeds)
+    reports the corrected balance.
+    """
+
+    db_path = tmp_path / "d.sqlite"
+    conn = _db(db_path)
+    acct = "ACT-apple"
+    _seed_account(conn, account_id=acct, name="Albert", org="Apple Card (Updated Monthly)")
+    # Manual correction on day D.
+    _seed_balance(conn, account_id=acct, balance=-6122.03,
+                  recorded_at="2026-06-24T14:56:47+00:00")
+    conn.execute(
+        "UPDATE balance_snapshots SET source='manual' WHERE account_id=? AND balance=-6122.03",
+        (acct,),
+    )
+    # Stale SimpleFIN feed row on the NEXT day (D+1).
+    _seed_balance(conn, account_id=acct, balance=-5949.32,
+                  recorded_at="2026-06-25T08:10:18+00:00")
+    conn.execute(
+        "UPDATE balance_snapshots SET source='simplefin' WHERE account_id=? AND balance=-5949.32",
+        (acct,),
+    )
+    _seed_sync_run(conn, finished_at="2026-06-25T08:10:18+00:00")
+    set_debt_terms(conn, id="apple_card", name="Apple Card", apr=19.49,
+                   account_id=acct, is_revolving=True)
+    conn.commit()
+
+    debt = [d for d in list_debts(conn, "2026-06-25")["debts"] if d["id"] == "apple_card"][0]
+    assert debt["current_balance"] == -6122.03
+
+    # Status agrees on the same later day.
+    status = get_finance_status(db_path=str(db_path), start_date="2026-06-25")
+    status_apple = [
+        a for a in status["balances"]["accounts"] if a["account_id"] == acct
+    ][0]
+    assert status_apple["balance"] == -6122.03
+
+
 # --- avalanche ordering -----------------------------------------------------
 
 
