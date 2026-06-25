@@ -482,6 +482,16 @@ def suppress_dormant_avg_estimates(
             (DORMANT_SUPPRESSED_STATUS, now, obligation["id"]),
         )
 
+        # Auto-cleanup hook (spec section 2, OQ2 owner): this is the function that
+        # flips an obligation to dormant_suppressed, so it owns retiring the stale
+        # Todoist reminders for that obligation's due-date instances. Flag every
+        # open obligation-due emission for removal on the next live surface run.
+        # Imported locally to avoid the obligations -> todoist_outbox -> onboarding
+        # -> obligations import cycle.
+        from .todoist_outbox import request_emission_retire_prefix
+
+        request_emission_retire_prefix(conn, f"obligation-due:{obligation['id']}:")
+
         finding_id = f"drift:auto_suppressed_dormant_estimate:{obligation['id']}"
         evidence = {
             "obligation_name": obligation["name"],

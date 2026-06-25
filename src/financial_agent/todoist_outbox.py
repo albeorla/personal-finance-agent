@@ -18,13 +18,16 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from datetime import date, datetime
 from typing import Any, Callable
 
 from .config import get_finance_config
 from .follow_ups import resolve_followup
+from .onboarding import DECIDED_STATUSES
 from .schema import ensure_app_schema
 
 
@@ -81,6 +84,90 @@ def _read_task(token: str, task_id: str, *, timeout: int = 30) -> dict[str, Any]
             return TASK_NOT_FOUND
         raise
     return json.loads(raw) if raw else {}
+
+
+def _list_tasks_request(
+    token: str,
+    project_id: str,
+    *,
+    cursor: str | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """GET one page of active tasks for a project. Only called on the gated path.
+
+    Todoist unified v1 list endpoints are paginated: the response envelope is
+    ``{"results": [ {task}, ... ], "next_cursor": <str|None>}``. The caller loops,
+    passing ``cursor=next_cursor`` until ``next_cursor`` is null/empty. Headers
+    match ``_read_task`` (Bearer + Content-Type + User-Agent). The active-tasks
+    list returns ACTIVE tasks only (completed tasks live on a separate endpoint),
+    so there is no completed bucket to filter here.
+    """
+
+    url = f"{TODOIST_BASE_URL}/tasks?project_id={project_id}"
+    if cursor:
+        url = f"{url}&cursor={cursor}"
+    req = urllib.request.Request(  # noqa: S310 - token is the user's own .env credential
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "financial-agent-mcp/0.1",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw) if raw else {"results": [], "next_cursor": None}
+
+
+def _delete_request(
+    token: str,
+    task_id: str,
+    *,
+    timeout: int = 30,
+    max_retries: int = 5,
+) -> bool:
+    """Hard-DELETE a single task. Only called on the gated apply path.
+
+    Returns True on success. ``DELETE /api/v1/tasks/<id>`` returns 204 (200 on
+    some clients); a 404 means the task is already gone, which is treated as
+    success so the cleanup is idempotent. An HTTP 429 (rate limited) is retried up
+    to ``max_retries`` times, honoring the ``Retry-After`` header when present and
+    otherwise backing off on an exponential schedule (0.5, 1, 2, 4, 8s, capped).
+    Any other error, or a 429 that survives the retries, propagates so the caller
+    records the task failed without aborting the whole run.
+    """
+
+    req = urllib.request.Request(  # noqa: S310 - token is the user's own .env credential
+        f"{TODOIST_BASE_URL}/tasks/{task_id}",
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "financial-agent-mcp/0.1",
+        },
+    )
+    backoffs = [0.5, 1.0, 2.0, 4.0, 8.0]
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                resp.read()
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return True
+            if exc.code == 429 and attempt < max_retries:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                default_delay = backoffs[min(attempt, len(backoffs) - 1)]
+                try:
+                    delay = float(retry_after) if retry_after else default_delay
+                except (TypeError, ValueError):
+                    delay = default_delay
+                time.sleep(delay)
+                attempt += 1
+                continue
+            raise
 
 
 def send_review_batch(
@@ -357,6 +444,46 @@ def mark_emission_status(
     return {"surface_key": surface_key, "status": status, "updated": cur.rowcount}
 
 
+def request_emission_retire(conn: sqlite3.Connection, surface_key: str) -> dict[str, Any]:
+    """Mark a single open emission for removal on the next live surface run.
+
+    Sets the ``retire_requested_at`` tombstone on the matching open emission. This
+    is a pure local UPDATE (no Todoist call), so it is safe in dry-run and runs
+    regardless of ``todoist_write_enabled``: it records intent only. The actual
+    delete + status flip to ``retired`` happens later in ``surface_to_todoist``'s
+    drain. Use this for singleton surface keys (e.g. ``onboarding-digest``).
+    """
+
+    ensure_app_schema(conn)
+    cur = conn.execute(
+        "UPDATE todoist_emissions SET retire_requested_at = ? "
+        "WHERE surface_key = ? AND status = 'open'",
+        (_now(), surface_key),
+    )
+    return {"matched": surface_key, "retire_requested": cur.rowcount}
+
+
+def request_emission_retire_prefix(
+    conn: sqlite3.Connection, surface_key_prefix: str
+) -> dict[str, Any]:
+    """Mark every open emission whose surface_key starts with ``surface_key_prefix``.
+
+    ``obligation-due`` keys carry a per-instance date suffix
+    (``obligation-due:<obligation_id>:<due_date>``), so a single obligation has one
+    emission per due date. Passing ``"obligation-due:<obligation_id>:"`` retires
+    every due-date instance of that obligation in one call. Like
+    ``request_emission_retire`` this only sets intent on ``status='open'`` rows.
+    """
+
+    ensure_app_schema(conn)
+    cur = conn.execute(
+        "UPDATE todoist_emissions SET retire_requested_at = ? "
+        "WHERE surface_key LIKE ? || '%' AND status = 'open'",
+        (_now(), surface_key_prefix),
+    )
+    return {"prefix": surface_key_prefix, "retire_requested": cur.rowcount}
+
+
 def _task_is_completed(task: dict[str, Any]) -> bool:
     """Whether a fetched v1 task object represents a completed/closed task.
 
@@ -473,6 +600,7 @@ def surface_to_todoist(
     project_id: str | None = None,
     env_path: str | None = None,
     send_func: Callable[..., dict[str, Any]] = _write_request,
+    delete_func: Callable[..., bool] = _delete_request,
 ) -> dict[str, Any]:
     """Push due items to Todoist with automatic de-duplication via the ledger.
 
@@ -517,6 +645,7 @@ def surface_to_todoist(
         "updated": 0,
         "skipped": 0,
         "resolved": 0,
+        "retired": 0,
         "failed": 0,
         "items": [],
     }
@@ -528,6 +657,25 @@ def surface_to_todoist(
         for item in items:
             summary["items"].append({"surface_key": item.get("surface_key"), "action": "awaiting-integration"})
         return summary
+
+    # Drain retire tombstones first. A candidate/obligation decision may have
+    # flagged open emissions for removal (retire_requested_at set). Delete each
+    # task in Todoist, then flip the ledger row to 'retired' (NOT
+    # deleted_by_user, so a recurring surface_key can resurface when next due).
+    retire_rows = conn.execute(
+        "SELECT surface_key, todoist_task_id FROM todoist_emissions "
+        "WHERE status = 'open' AND retire_requested_at IS NOT NULL"
+    ).fetchall()
+    for r in retire_rows:
+        try:
+            delete_func(token, r["todoist_task_id"])
+        except Exception as exc:  # noqa: BLE001 - record, never crash the batch
+            summary["failed"] += 1
+            summary["items"].append({"surface_key": r["surface_key"], "action": "failed", "reason": f"{type(exc).__name__}: {exc}"[:200]})
+            continue
+        mark_emission_status(conn, r["surface_key"], "retired")
+        summary["retired"] += 1
+        summary["items"].append({"surface_key": r["surface_key"], "action": "retired", "todoist_task_id": r["todoist_task_id"]})
 
     for item in items:
         key = item.get("surface_key")
@@ -602,9 +750,15 @@ def surface_to_todoist(
             summary["items"].append({"surface_key": key, "action": "failed", "reason": "create returned no task id"})
             continue
         now = _now()
+        # INSERT OR REPLACE so a singleton surface_key (e.g. onboarding-digest)
+        # that was previously flipped to 'retired' resurfaces cleanly: the stale
+        # ledger row is replaced with a fresh open one rather than colliding on
+        # the surface_key primary key (rev 3 - retired must allow recreation). A
+        # genuinely new key is a plain insert. completed/deleted_by_user rows are
+        # already short-circuited above, so they never reach here.
         conn.execute(
             """
-            INSERT INTO todoist_emissions (
+            INSERT OR REPLACE INTO todoist_emissions (
                 surface_key, todoist_task_id, status, content_hash, created_at, last_seen
             ) VALUES (?, ?, 'open', ?, ?, ?)
             """,
@@ -614,6 +768,365 @@ def surface_to_todoist(
         summary["items"].append({"surface_key": key, "action": "created", "todoist_task_id": task_id})
 
     return summary
+
+
+# --- whole-project reconcile + cleanup -------------------------------------
+# Tasks are created but never retired, so the project can accumulate stale
+# leftovers over time. reconcile_todoist_project_for_db
+# adds the missing server-side LIST capability and a classify/clean pass over the
+# WHOLE Finance project. The safety invariant is hard: a task is deletable ONLY if
+# it matches one of three explicit positive rules; everything else is `kept` and
+# is NEVER passed to delete_func.
+
+# Literal title-prefix allowlist for legacy-mess cleanup (delete rule b). This is
+# the ONLY rule that can delete a task lacking the fa-auto label, so it is kept
+# deliberately narrow and confirmed against a live sample (V-LIVE): the 56
+# onboarding tasks carry no label and no marker, only this title prefix.
+LEGACY_CLEANUP_PREFIXES: list[str] = ["Onboard charge:"]
+
+# Page cap: drain at most this many LIST pages. Hitting it forces report-only
+# because duplicate/ledger-orphan inference is unsound on a partial view.
+MAX_LIST_PAGES = 50
+
+# Per-run delete ceiling: protects against a runaway loop and against tripping a
+# hard rate-limit ban mid-cleanup. Once hit, stop deleting and require a re-run.
+MAX_DELETES_PER_RUN = 200
+
+
+def _parse_legacy_display_name(content: str, prefix: str) -> str:
+    """Pull the merchant/display name out of a legacy ``"Onboard charge: <name>
+    not modeled"`` title. Heuristic and lossy; used only for the candidate join."""
+
+    rest = (content or "")[len(prefix):].strip()
+    low = rest.lower()
+    if low.endswith("not modeled"):
+        rest = rest[: len(rest) - len("not modeled")].strip()
+    return rest
+
+
+def reconcile_todoist_project_for_db(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str,
+    apply: bool = False,
+    write_enabled: bool | None = None,
+    token: str | None = None,
+    project_id: str | None = None,
+    env_path: str | None = None,
+    list_func: Callable[..., dict[str, Any]] = _list_tasks_request,
+    delete_func: Callable[..., bool] = _delete_request,
+) -> dict[str, Any]:
+    """LIST the whole Finance project, classify every task, and (in apply mode)
+    delete only the explicit delete set.
+
+    Classification precedence (first match wins):
+    ``managed > stale_applied > duplicate > fa_auto_orphan > kept``. The delete
+    set is the union of exactly three rules: (a) fa-auto orphan, (b) a
+    ``LEGACY_CLEANUP_PREFIXES``-matched task whose underlying candidate is decided,
+    (c) a duplicate extra copy whose surviving copy is itself managed or fa-auto.
+    Anything else is ``kept`` and is NEVER deleted (this protects the ritual
+    reminders and every hand-made task, which carry no marker and no fa-auto
+    label).
+
+    Gating mirrors ``surface_to_todoist``: the dry-run report needs only
+    token+project (reads are allowed with write-back off); apply (delete/resolve)
+    requires ``live`` = write_enabled AND token AND project. A truncated or
+    failed LIST forces report-only (zero deletes, zero ledger resolutions),
+    because duplicate and ledger-orphan inference are unsound on a partial view.
+    """
+
+    ensure_app_schema(conn)
+    _coerce_date(as_of_date)  # validate shape
+
+    # Resolve the gate. When write_enabled is explicitly False, do NOT read config
+    # so tests stay hermetic. Config only fills gaps.
+    if write_enabled is None:
+        cfg = get_finance_config(env_path=env_path)
+        write_enabled = cfg["todoist_write_enabled"]
+        token = token if token is not None else cfg["todoist_api_token"]
+        project_id = project_id if project_id is not None else cfg["todoist_project_id"]
+    elif write_enabled and (token is None or project_id is None):
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+        project_id = project_id if project_id is not None else cfg["todoist_project_id"]
+    live = bool(write_enabled and token and project_id)
+
+    report: dict[str, Any] = {
+        "status": "ok",
+        "integration_enabled": live,
+        "applied": False,
+        "truncated": False,
+        "truncated_deletes": False,
+        "as_of_date": str(as_of_date)[:10],
+        "project_id": project_id,
+        "listed": 0,
+        "counts": {
+            "managed": 0,
+            "stale_applied": 0,
+            "duplicate": 0,
+            "fa_auto_orphan": 0,
+            "kept": 0,
+            "needs_review": 0,
+        },
+        "ledger_findings": {"ledger_orphan": 0},
+        "actions": {"deleted": 0, "ledger_resolved": 0, "skipped_not_live": 0, "failed": 0},
+        "tasks": [],
+    }
+
+    # LIST requires token + project. Reads are allowed even with write-back off.
+    if not token or not project_id:
+        report["status"] = "awaiting-integration"
+        report["reason"] = "missing project_id" if (token and not project_id) else "awaiting-integration"
+        return report
+
+    # --- drain all pages -----------------------------------------------------
+    tasks: list[dict[str, Any]] = []
+    truncated = False
+    list_failed = False
+    cursor: str | None = None
+    pages = 0
+    while True:
+        if pages >= MAX_LIST_PAGES:
+            truncated = True
+            break
+        try:
+            resp = list_func(token, project_id, cursor=cursor)
+        except Exception:  # noqa: BLE001 - a failed page makes the view partial
+            list_failed = True
+            break
+        pages += 1
+        tasks.extend(resp.get("results") or [])
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+
+    incomplete = truncated or list_failed
+
+    # --- load ledger + candidates -------------------------------------------
+    emissions = conn.execute(
+        "SELECT surface_key, todoist_task_id, status FROM todoist_emissions"
+    ).fetchall()
+    emission_by_key = {r["surface_key"]: r for r in emissions}
+    open_task_ids = {r["todoist_task_id"] for r in emissions if r["status"] == "open"}
+
+    candidates = conn.execute(
+        "SELECT id, display_name, merchant_key, status FROM charge_onboarding_candidates"
+    ).fetchall()
+    cand_by_display: dict[str, Any] = {}
+    cand_by_merchant: dict[str, Any] = {}
+    for c in candidates:
+        if c["display_name"]:
+            cand_by_display[c["display_name"].strip().lower()] = c
+        if c["merchant_key"]:
+            cand_by_merchant[c["merchant_key"].strip().lower()] = c
+
+    # --- per-task raw attributes --------------------------------------------
+    attrs: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    groups: dict[str, list[str]] = defaultdict(list)
+    for t in tasks:
+        tid = str(t["id"])
+        content = t.get("content") or ""
+        description = t.get("description") or ""
+        sk = extract_surface_key(description)
+        labels = t.get("labels") or []
+        has_fa_auto = FA_AUTO_LABEL in labels
+        chash = content_hash_for(content, description)
+        attrs[tid] = {
+            "tid": tid,
+            "content": content,
+            "surface_key": sk,
+            "has_fa_auto": has_fa_auto,
+        }
+        order.append(tid)
+        dup_key = sk if sk else f"hash:{chash}"
+        groups[dup_key].append(tid)
+
+    def _is_managed(tid: str, sk: str | None) -> bool:
+        if not sk:
+            return False
+        row = emission_by_key.get(sk)
+        return bool(row and row["status"] == "open" and row["todoist_task_id"] == tid)
+
+    # --- duplicate survivors -------------------------------------------------
+    # Survivor: the copy matching an open emission id; else the NUMERICALLY
+    # smallest id (Todoist ids are large numeric strings -> numeric, not lexical).
+    duplicate_extra: set[str] = set()
+    survivor_of_extra: dict[str, str] = {}
+    duplicate_survivor: set[str] = set()
+    for dup_key, ids in groups.items():
+        if len(ids) < 2:
+            continue
+        matched = [i for i in ids if i in open_task_ids]
+        survivor = matched[0] if matched else min(ids, key=lambda x: int(x))
+        duplicate_survivor.add(survivor)
+        for i in ids:
+            if i != survivor:
+                duplicate_extra.add(i)
+                survivor_of_extra[i] = survivor
+
+    # --- classify ------------------------------------------------------------
+    deletable: list[str] = []
+    task_rows: dict[str, dict[str, Any]] = {}
+    for tid in order:
+        a = attrs[tid]
+        sk = a["surface_key"]
+        content = a["content"]
+        has_fa_auto = a["has_fa_auto"]
+
+        entry: dict[str, Any] = {
+            "task_id": tid,
+            "content": content,
+            "surface_key": sk,
+            "has_fa_auto": has_fa_auto,
+        }
+
+        # 1. managed
+        if _is_managed(tid, sk):
+            entry["classification"] = "managed"
+            entry["action"] = "kept"
+            entry["reason"] = "managed by open emission"
+            task_rows[tid] = entry
+            continue
+
+        # 2. stale_applied (legacy title prefix)
+        matched_prefix = next((p for p in LEGACY_CLEANUP_PREFIXES if content.startswith(p)), None)
+        if matched_prefix is not None:
+            name = _parse_legacy_display_name(content, matched_prefix)
+            cand = cand_by_display.get(name.lower()) or cand_by_merchant.get(name.lower())
+            entry["classification"] = "stale_applied"
+            entry["match_confidence"] = "heuristic"
+            entry["candidate_id"] = cand["id"] if cand else None
+            entry["candidate_status"] = cand["status"] if cand else None
+            if cand is not None and cand["status"] in DECIDED_STATUSES:
+                entry["action"] = "would_delete"
+                entry["reason"] = f"candidate {cand['status']}"
+                deletable.append(tid)
+            else:
+                entry["action"] = "needs_review"
+                entry["reason"] = (
+                    "legacy prefix but candidate not decided"
+                    if cand is not None
+                    else "legacy prefix with no candidate match"
+                )
+            task_rows[tid] = entry
+            continue
+
+        # 3. duplicate (non-survivor copy)
+        if tid in duplicate_extra:
+            survivor = survivor_of_extra[tid]
+            s = attrs[survivor]
+            survivor_managed = _is_managed(survivor, s["surface_key"])
+            survivor_fa_auto = s["has_fa_auto"]
+            if survivor_managed or survivor_fa_auto:
+                entry["classification"] = "duplicate"
+                entry["action"] = "would_delete"
+                entry["reason"] = f"duplicate of {survivor}"
+                entry["survivor_task_id"] = survivor
+                deletable.append(tid)
+            else:
+                # Survivor is a kept user/ritual task -> the duplicates are kept too.
+                entry["classification"] = "kept"
+                entry["action"] = "kept"
+                entry["reason"] = "duplicate of a kept task"
+                entry["survivor_task_id"] = survivor
+            task_rows[tid] = entry
+            continue
+
+        # Canonical duplicate survivor: keep exactly one copy this run. Even if it
+        # is itself a fa-auto orphan, it is protected here so we never delete every
+        # copy in one pass; a later run (now with no duplicate) removes a lone
+        # orphan via rule (a).
+        if tid in duplicate_survivor:
+            entry["classification"] = "kept"
+            entry["action"] = "kept"
+            entry["reason"] = "canonical surviving copy of a duplicate group"
+            task_rows[tid] = entry
+            continue
+
+        # 4. fa_auto_orphan
+        if has_fa_auto:
+            entry["classification"] = "fa_auto_orphan"
+            entry["had_marker"] = sk is not None
+            entry["action"] = "would_delete"
+            entry["reason"] = "fa-auto label with no open emission"
+            deletable.append(tid)
+            task_rows[tid] = entry
+            continue
+
+        # 5. kept
+        entry["classification"] = "kept"
+        entry["action"] = "kept"
+        entry["reason"] = "no fa-auto, no managed emission, no legacy prefix"
+        task_rows[tid] = entry
+
+    # --- counts + invariant --------------------------------------------------
+    for tid in order:
+        entry = task_rows[tid]
+        report["counts"][entry["classification"]] += 1
+        if entry["action"] == "needs_review":
+            report["counts"]["needs_review"] += 1
+    report["listed"] = len(order)
+    report["tasks"] = [task_rows[tid] for tid in order]
+
+    # --- ledger-orphan finding (only sound on a fully-drained, clean LIST) ----
+    listed_ids = set(order)
+    ledger_orphans: list[Any] = []
+    if not incomplete:
+        ledger_orphans = [
+            r for r in emissions if r["status"] == "open" and r["todoist_task_id"] not in listed_ids
+        ]
+        report["ledger_findings"]["ledger_orphan"] = len(ledger_orphans)
+
+    # --- gating outcome ------------------------------------------------------
+    if incomplete:
+        report["truncated"] = True
+        report["status"] = "truncated"
+        report["reason"] = "list truncated (page cap hit)" if truncated else "list page request failed"
+    elif apply and not live:
+        report["status"] = "awaiting-integration"
+        report["reason"] = "awaiting-integration"
+
+    can_apply = bool(apply and live and not incomplete)
+    report["applied"] = can_apply
+
+    # --- apply: deletes + ledger resolutions ---------------------------------
+    if apply and not live and not incomplete:
+        # Report-only: surface what WOULD be deleted, perform nothing.
+        report["actions"]["skipped_not_live"] = len(deletable)
+    elif can_apply:
+        deleted_count = 0
+        for tid in deletable:
+            entry = task_rows[tid]
+            if deleted_count >= MAX_DELETES_PER_RUN:
+                report["truncated_deletes"] = True
+                break  # leave the rest as would_delete; a re-run finishes them
+            try:
+                delete_func(token, tid)
+            except Exception as exc:  # noqa: BLE001 - isolate one failure, keep going
+                entry["action"] = "failed"
+                entry["reason"] = f"delete failed: {type(exc).__name__}: {exc}"[:200]
+                report["actions"]["failed"] += 1
+                continue
+            entry["action"] = "deleted"
+            report["actions"]["deleted"] += 1
+            deleted_count += 1
+            # If this task's marker maps to an OPEN emission for THIS id, retire it.
+            # (For the delete set this is effectively only the managed case, which
+            # is never deleted; the id guard prevents retiring another task's row.)
+            sk = entry["surface_key"]
+            if sk is not None:
+                row = emission_by_key.get(sk)
+                if row is not None and row["status"] == "open" and row["todoist_task_id"] == tid:
+                    mark_emission_status(conn, sk, "retired")
+                    report["actions"]["ledger_resolved"] += 1
+        # Ledger-orphans: the task is already gone, resolve the open row to
+        # 'retired' (NOT deleted_by_user, so a recurring key can resurface).
+        for r in ledger_orphans:
+            mark_emission_status(conn, r["surface_key"], "retired")
+            report["actions"]["ledger_resolved"] += 1
+
+    return report
 
 
 def execute_action_outbox(
