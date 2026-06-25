@@ -6,7 +6,7 @@ Durable Mermaid diagrams for the local finance MCP server. These diagrams descri
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 62 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 67 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"read-only sync"| Server
     Portals["Bank/card portals<br/>manual balances and one-off facts"] -->|"manual inputs"| Server
