@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Callable
 
+from . import build_info
 from .config import get_finance_config
 from .drift import detect_drift
 from .obligations import suppress_dormant_avg_estimates
@@ -273,6 +274,7 @@ def get_job_health(
             "hours_since_last_run": None,
             "stale_threshold_hours": stale_threshold_hours,
             "as_of_date": as_of_date,
+            **_code_health_block(),
         }
 
     finished = _parse_dt(row["finished_at"])
@@ -289,7 +291,40 @@ def get_job_health(
         "hours_since_last_run": hours_since,
         "stale_threshold_hours": stale_threshold_hours,
         "as_of_date": as_of_date,
+        **_code_health_block(),
     }
+
+
+def _code_health_block() -> dict[str, Any]:
+    """Report what code the server is running vs what is checked out right now.
+
+    ``running_commit`` is frozen at process startup; ``repo_head`` is read live on
+    this call. When they differ (and both are real commits), the server is running
+    older code than the repo on disk - the user should reload the MCP server to
+    pick up the newer code. With no git repo, ``code_stale`` is False and
+    ``repo_head`` is ``"unknown"``.
+    """
+
+    running_commit = build_info.RUNNING_COMMIT
+    repo_head = build_info.current_repo_head()
+    both_real = running_commit != "unknown" and repo_head != "unknown"
+    code_stale = both_real and running_commit != repo_head
+
+    block: dict[str, Any] = {
+        "server": {
+            "version": build_info.VERSION,
+            "running_commit": running_commit,
+            "started_at": build_info.STARTED_AT,
+        },
+        "repo_head": repo_head,
+        "code_stale": code_stale,
+    }
+    if code_stale:
+        block["code_stale_message"] = (
+            f"Running {running_commit}; repo at {repo_head}. "
+            "Reload the MCP server to apply the newer code."
+        )
+    return block
 
 
 # --- helpers ---------------------------------------------------------------

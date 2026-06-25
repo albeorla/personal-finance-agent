@@ -28,6 +28,7 @@ from .onboarding import (
     record_charge_onboarding_decision as record_charge_onboarding_decision_for_db,
     scan_charge_onboarding_candidates as scan_charge_onboarding_candidates_for_db,
 )
+from . import build_info
 from .background import (
     get_background_run as get_background_run_for_db,
     get_job_health as get_job_health_for_db,
@@ -1321,6 +1322,25 @@ def list_background_runs(
         return _list_result(list_background_runs_for_db(conn, run_type=run_type, status=status, limit=limit))
     finally:
         conn.close()
+
+
+@mcp.tool()
+def get_version() -> dict:
+    """Report the version and git commit of the code this server is RUNNING.
+
+    The MCP server is long-running: code merged to main only takes effect after a
+    restart, so a live session can keep serving stale logic. These values are
+    captured once at process startup, so they describe the running process - use
+    them to confirm which code is actually live. ``running_commit`` is "unknown"
+    when the server runs from a non-git checkout. Read-only.
+    """
+
+    return {
+        "version": build_info.VERSION,
+        "running_commit": build_info.RUNNING_COMMIT,
+        "running_dirty": build_info.RUNNING_DIRTY,
+        "started_at": build_info.STARTED_AT,
+    }
 
 
 @mcp.tool()
