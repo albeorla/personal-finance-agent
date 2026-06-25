@@ -81,6 +81,10 @@ from .todoist_outbox import (
 )
 from .status import default_db_path
 from .status import get_finance_status as build_finance_status
+from .debts import (
+    list_debts as list_debts_for_db,
+    set_debt_terms as set_debt_terms_for_db,
+)
 from .goals import (
     list_goals as list_goals_for_db,
     set_goal as set_goal_for_db,
@@ -197,6 +201,79 @@ def set_goal_override(
         )
         conn.commit()
         return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def set_debt_terms(
+    id: str,
+    name: str,
+    apr: float,
+    account_query: str | None = None,
+    account_id: str | None = None,
+    balance_source: str = "account",
+    balance_override: float | None = None,
+    min_payment: float | None = None,
+    is_revolving: bool = True,
+    autopay: bool = False,
+    note: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Create or update a debt's terms (APR, linked account, revolving flag).
+
+    Re-running with the same id updates the existing debt instead of creating a
+    duplicate. Pass account_query to resolve a synced account by name or org (an
+    explicit account_id wins). Use balance_source='manual' with balance_override
+    for debts with no synced account (e.g. a federal student loan). Set
+    is_revolving=False for cards paid in full each month so they are excluded
+    from the avalanche target order even when their APR is high.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = set_debt_terms_for_db(
+            conn,
+            id=id,
+            name=name,
+            apr=apr,
+            account_query=account_query,
+            account_id=account_id,
+            balance_source=balance_source,
+            balance_override=balance_override,
+            min_payment=min_payment,
+            is_revolving=is_revolving,
+            autopay=autopay,
+            note=note,
+        )
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_debts(as_of_date: str, db_path: str | None = None) -> dict:
+    """List debts with live balances, monthly interest, and total revolving interest.
+
+    Each debt reports its resolved current_balance (the linked account's latest
+    balance snapshot when balance_source='account', else balance_override), the
+    modeled monthly_interest (abs(balance) * apr/100 / 12), its is_revolving and
+    autopay flags, and min_payment. The result also carries a
+    total_monthly_interest summed across the revolving debts only.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list_debts_for_db(conn, as_of_date)
     finally:
         conn.close()
 
