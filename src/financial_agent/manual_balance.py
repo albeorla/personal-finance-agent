@@ -8,18 +8,18 @@ and ``get_daily_digest`` pick it up as the latest balance immediately.
 
 The manual snapshot is written as just another ``balance_snapshots`` row with
 ``source='manual'``. Balance resolution (in ``status._latest_balances``) makes a
-manual row authoritative for its calendar day: for the newest day it prefers
-``source='manual'`` over ``source='simplefin'`` regardless of ``recorded_at`` or
-insert order, so a same-day SimpleFIN sync -- whenever it lands -- cannot shadow
-the correction. A SimpleFIN sync on a *later* day records a newer-period snapshot
-and still supersedes the manual value, which is intended (fresh feed data beats a
-manual correction once a new period's reality arrives).
+manual row STICKY: it prefers ``source='manual'`` over ``source='simplefin'``
+regardless of calendar day, ``recorded_at``, or insert order, so a manual
+correction wins over every feed snapshot -- including a SimpleFIN sync on a later
+day -- until the user records a NEWER manual correction (which replaces the older
+one) or clears it. This is intended for balance-only "Updated Monthly" accounts
+(e.g. the Apple Card) whose feed lags reality for weeks: the user's correction
+must hold until they explicitly change it.
 
 The manual row is still stamped strictly later than any snapshot already present
 for the account. That out-stamping is now belt-and-suspenders rather than the
 load-bearing mechanism: the source-priority ordering is what guarantees the
-correction wins within its day, so the result no longer depends on a fragile
-timestamp race.
+correction wins, so the result no longer depends on a fragile timestamp race.
 
 The caller's sign is preserved verbatim: a liability correction such as the
 Apple Card stays negative (e.g. ``-6122.03``), matching how SimpleFIN stores
