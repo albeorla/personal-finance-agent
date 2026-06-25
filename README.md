@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 67 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 68 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -76,8 +76,8 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 ### 2. MODEL — turn facts into a forecast
 
 - **Obligations and dated instances** are the cash-flow truth. A durable obligation plus its exact dated `obligation_instances` drive a **deterministic, day-by-day cash-flow projection** over the requested windows. The projection reads only obligation instances — nothing else can move the forecast.
-- **Recurring-charge onboarding** discovers candidate recurring charges from transaction history and stages them in a review queue. Candidates are *not* cash-flow truth: they never write obligation instances and cannot change the forecast until a human accepts and applies them.
-- **Reconciliation and drift** match expected instances against observed transactions, and flag missing payments, stale estimates, amount changes, and unmodeled recurring charges.
+- **Recurring-charge onboarding** discovers candidate recurring charges from transaction history and stages them in a review queue. Candidates are *not* cash-flow truth: they never write obligation instances and cannot change the forecast until a human accepts and applies them. A candidate classifier triages each discovery into `surface` (worth a human look), `park` (low-signal, held quietly), or `auto_reject` (clear noise), with safety backstops so anything large, recurring with high confidence, or otherwise material is never silently rejected and always gets surfaced.
+- **Reconciliation and drift** match expected instances against observed transactions, and flag missing payments, stale estimates, amount changes, and unmodeled recurring charges. Estimates contradicted by a live balance (for example an averaged charge still projecting against a dormant, paid-off card) are auto-expired so stale outflows stop skewing the forecast.
 - **Goals** track savings targets and pace; **follow-ups** are dated reminders the daily routine fires on.
 - **Guardrails** carry forward operating rules of thumb as explicit, evidence-backed checks (for example a cash floor: the projected lowest balance must not drop below a threshold).
 
@@ -90,7 +90,7 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 ## Tool catalog
 
-The server registers 67 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 68 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.

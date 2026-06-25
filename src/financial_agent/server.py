@@ -17,6 +17,7 @@ from .obligations import (
     list_obligation_review_candidates as list_obligation_review_candidates_for_db,
     list_obligations as list_obligations_for_db,
     list_statement_input_estimates as list_statement_input_estimates_for_db,
+    suppress_contradicted_estimates as suppress_contradicted_estimates_for_db,
 )
 from .parity import compare_to_legacy as compare_to_legacy_for_db
 from .parity import render_parity_markdown as render_parity_markdown_for_db
@@ -588,6 +589,47 @@ def delete_obligation_instance(
     conn.row_factory = sqlite3.Row
     try:
         result = delete_obligation_instance_for_db(conn, instance_id)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def suppress_contradicted_estimates(
+    as_of_date: str,
+    mode: str = "report",
+    options: dict | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Lower or suppress an averaged estimate the account's real burn contradicts.
+
+    The "shrunk but not dead" companion to dormancy suppression: an averaged
+    auto-estimate (e.g. a card payment) that keeps projecting at full size while
+    the account's actual merchant burn has collapsed. Compares modeled monthly
+    outflow against observed burn over a lookback window; on a sustained
+    contradiction it either rewrites the instance amount down to the observed
+    figure (keeping the obligation active and projectable) or, when burn is near
+    zero, routes it to dormant. Both paths are reversible and emit a low-severity
+    drift finding.
+
+    mode='report' (default) emits findings but mutates nothing -- the observe
+    posture for the first live run. mode='enforce' applies the resolution. Tunable
+    thresholds (contradiction_ratio, flat_balance_ratio, modeled_floor,
+    contradiction_cycles, contradiction_lookback_days, near_zero_monthly) go in
+    options.
+    """
+
+    import sqlite3
+
+    opts = {**(options or {}), "mode": mode}
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = suppress_contradicted_estimates_for_db(
+            conn, as_of_date=as_of_date, options=opts
+        )
         conn.commit()
         return result
     finally:

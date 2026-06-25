@@ -16,8 +16,9 @@ State model (see CLAUDE_CODE_HANDOFF.md):
     discovered -> proposed -> in_review -> accepted -> applied
 
 with alternate states ``rejected``, ``deferred``, ``needs_more_evidence``,
-``merged``, and ``split``. A background re-scan never regresses a state that a
-human moved, so a rejected or deferred candidate is not silently revived.
+``merged``, ``split``, and ``parked`` (auto-triaged out of the active walk; see
+``classify_candidate_disposition``). A background re-scan never regresses a state
+that a human moved, so a rejected or deferred candidate is not silently revived.
 """
 
 from __future__ import annotations
@@ -41,10 +42,17 @@ from .schema import ensure_app_schema
 # Statuses that still want a human decision and are walked by the active queue.
 ACTIVE_STATUSES: tuple[str, ...] = ("discovered", "proposed", "in_review")
 
+# Auto-triage status: a real charge that is not a schedulable bill (variable
+# discretionary, internal transfer, loan/investment review). Kept and listed via
+# ``include_resolved=True``, re-scannable, but pulled out of the one-at-a-time
+# active walk. Reversible by a human ``reset`` back to ``proposed``.
+PARKED_STATUS = "parked"
+
 # Statuses produced by a human/system decision. A re-scan refreshes their
-# evidence but must not reset them back to ``proposed``.
+# evidence but must not reset them back to ``proposed``. ``parked`` is included so
+# an auto-parked candidate is never silently revived by a later scan.
 DECIDED_STATUSES: frozenset[str] = frozenset(
-    {"in_review", "accepted", "applied", "rejected", "deferred", "needs_more_evidence", "merged", "split"}
+    {"in_review", "accepted", "applied", "rejected", "deferred", "needs_more_evidence", "merged", "split", PARKED_STATUS}
 )
 
 # Statuses a fresh, never-reviewed candidate can be in.
@@ -56,6 +64,7 @@ FRESH_STATUSES: frozenset[str] = frozenset({"discovered", "proposed"})
 DECISION_ACTIONS: dict[str, str] = {
     "defer": "deferred",
     "reject": "rejected",
+    "park": PARKED_STATUS,
     "needs_more_evidence": "needs_more_evidence",
     "in_review": "in_review",
     "accept": "accepted",
@@ -149,7 +158,112 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "min_evidence": 2,
     "include_inflows": False,
     "link_existing_obligations": True,
+    # Auto-triage of newly discovered candidates (see classify_candidate_disposition).
+    # Modes: off (no disposition computed), shadow (disposition recorded on the
+    # candidate but no status changes), park_only (act on the park bucket only),
+    # enforce (act on park + auto_reject). Defaults to shadow on first ship so the
+    # would-reject list can be eyeballed before any candidate leaves the walk.
+    "auto_triage": {"mode": "shadow", "reject_floor": 75.0},
 }
+
+# Cadences treated as "regular" by the auto-triage classifier. A regular cadence
+# is a safety signal: a steadily-recurring charge is never auto-rejected even when
+# its amounts vary (utility/metered service) -- it is parked, not dismissed.
+REGULAR_CADENCES: frozenset[str] = frozenset({"weekly", "biweekly", "monthly", "quarterly"})
+
+# Auto-triage dispositions.
+DISPOSITION_SURFACE = "surface"
+DISPOSITION_PARK = "park"
+DISPOSITION_AUTO_REJECT = "auto_reject"
+
+
+def classify_candidate_disposition(
+    candidate: dict[str, Any], *, reject_floor: float = 75.0
+) -> dict[str, Any]:
+    """Map a built candidate to surface / park / auto_reject from signals in hand.
+
+    The detector already computes cadence regularity, amount variability (cv),
+    confidence, candidate type, and a modeled-impact ``priority_score``. This is
+    the judgment step that decides which of those candidates is worth a human's
+    one-at-a-time attention (``surface``), which is real spend but not a
+    schedulable bill (``park``), and which is structural noise (``auto_reject``).
+
+    Three safety backstops guarantee a real recurring bill is NEVER auto-rejected:
+      1. Confidence floor: only ``low``/``very_low`` candidates are reject-eligible;
+         any ``medium``/``high`` candidate surfaces.
+      2. Regularity override: a regular cadence is always parked (never rejected),
+         even when amounts swing (metered utilities).
+      3. Magnitude guard: a candidate whose modeled monthly impact
+         (``priority_score``) exceeds ``reject_floor`` is parked, never rejected.
+
+    Pure function of the candidate dict; no I/O. Returns
+    ``{"disposition": str, "reasons": [str, ...]}``.
+    """
+
+    schedule = candidate.get("proposed_schedule_policy") or {}
+    amount_policy = candidate.get("proposed_amount_policy") or {}
+    cadence = schedule.get("cadence") or "unknown"
+    cv = float(amount_policy.get("cv") or 0.0)
+    n = int(candidate.get("evidence_count") or 0)
+    months_covered = int(schedule.get("months_covered") or 0)
+    confidence = candidate.get("confidence") or "very_low"
+    candidate_type = candidate.get("candidate_type") or "review_only"
+    priority_score = float(candidate.get("priority_score") or 0.0)
+
+    regular = cadence in REGULAR_CADENCES
+    stable = cv <= 0.20  # matches the existing needs_review cutoff (_amount_policy)
+
+    base_reasons = [
+        f"cadence {cadence} ({'regular' if regular else 'irregular'})",
+        f"amounts {'stable' if stable else 'vary widely'} (cv {cv:.2f})",
+        f"{n} occurrence{'s' if n != 1 else ''} over {months_covered} month(s)",
+        f"{confidence} confidence",
+        f"${priority_score:.0f}/mo modeled impact",
+    ]
+
+    def _result(disposition: str, reason: str) -> dict[str, Any]:
+        return {"disposition": disposition, "reasons": base_reasons + [reason]}
+
+    def _reject_or_guard(reason: str) -> dict[str, Any]:
+        # Backstop 3 (magnitude guard): a material recurring charge is parked,
+        # never auto-dismissed, even when every other signal says "noise".
+        if priority_score > reject_floor:
+            return _result(
+                DISPOSITION_PARK,
+                f"magnitude guard: ${priority_score:.0f}/mo exceeds ${reject_floor:.0f} "
+                f"floor, parked not rejected ({reason})",
+            )
+        return _result(DISPOSITION_AUTO_REJECT, f"auto-dismissed: {reason}")
+
+    # Rule 1: one-off / single-burst -- not enough history to be a schedule.
+    if n < 2 or (months_covered < 2 and not regular):
+        return _reject_or_guard("too few occurrences / single-burst, not a recurring pattern")
+
+    # Rule 2: internal transfer / debt payment -- modeled elsewhere, park.
+    if candidate_type == "internal_transfer":
+        return _result(DISPOSITION_PARK, "internal transfer or debt payment, modeled elsewhere")
+
+    # Rule 3: irregular variable discretionary spend at low confidence -- the bulk
+    # of the noise (gas, dining, retail). Backstop 1 (confidence floor) lives in
+    # the ``confidence in {low, very_low}`` clause: medium/high never rejects here.
+    if candidate_type == "variable_spend" and not regular and confidence in {"low", "very_low"}:
+        return _reject_or_guard("irregular variable discretionary spend at low confidence")
+
+    # Rule 4 (regularity override, backstop 2): a regular cadence with variable
+    # amounts (metered utility) is parked, never rejected.
+    if candidate_type == "variable_spend" and regular:
+        return _result(
+            DISPOSITION_PARK,
+            "regular cadence with variable amounts (utility/metered), parked not rejected",
+        )
+
+    # Rule 5: loan / investment review item -- park (not a checking bill).
+    if candidate_type == "review_only":
+        return _result(DISPOSITION_PARK, "loan/investment review item, not a scheduled checking bill")
+
+    # Rule 6: plausible recurring obligation (clean bill, card statement input,
+    # inflow, or medium/high confidence) -- keep in the active walk.
+    return _result(DISPOSITION_SURFACE, "plausible recurring obligation; kept in the active queue")
 
 
 def normalize_merchant_key(payee: str | None) -> str:
@@ -213,6 +327,9 @@ def scan_charge_onboarding_candidates(
     opts = {**DEFAULT_OPTIONS, **(options or {})}
     min_evidence = int(opts["min_evidence"])
     include_inflows = bool(opts["include_inflows"])
+    triage = {**DEFAULT_OPTIONS["auto_triage"], **(opts.get("auto_triage") or {})}
+    triage_mode = str(triage.get("mode", "shadow"))
+    reject_floor = float(triage.get("reject_floor", 75.0))
 
     accounts = {
         row["id"]: {"name": row["name"], "org": row["org"], "kind": row["kind"]}
@@ -260,6 +377,8 @@ def scan_charge_onboarding_candidates(
     now = _now()
     created = updated = unchanged = skipped = 0
     candidate_ids: list[str] = []
+    by_disposition: dict[str, int] = defaultdict(int)
+    triage_counts: dict[str, int] = defaultdict(int)
     for (merchant_key, cls, direction), items in sorted(groups.items()):
         if direction == "inflow" and not include_inflows:
             continue
@@ -268,6 +387,17 @@ def scan_charge_onboarding_candidates(
             continue
         items.sort(key=lambda it: (it["date"], it["id"]))
         candidate = _build_candidate(merchant_key, cls, direction, items, existing_obligations)
+
+        # Auto-triage: stamp the disposition (and its reasons) on the candidate's
+        # review policy so it persists deterministically with the rest of the
+        # proposal. "off" leaves the candidate untouched.
+        disposition = None
+        if triage_mode != "off":
+            disposition = classify_candidate_disposition(candidate, reject_floor=reject_floor)
+            candidate["proposed_review_policy"]["auto_disposition"] = disposition["disposition"]
+            candidate["proposed_review_policy"]["disposition_reasons"] = disposition["reasons"]
+            by_disposition[disposition["disposition"]] += 1
+
         outcome = _upsert_candidate(conn, candidate, now)
         candidate_ids.append(candidate["id"])
         if outcome == "created":
@@ -276,6 +406,9 @@ def scan_charge_onboarding_candidates(
             updated += 1
         else:
             unchanged += 1
+
+        if disposition is not None:
+            _route_auto_triage(conn, candidate["id"], disposition, triage_mode, triage_counts)
 
     by_status: dict[str, int] = defaultdict(int)
     by_treatment: dict[str, int] = defaultdict(int)
@@ -298,8 +431,77 @@ def scan_charge_onboarding_candidates(
         ).fetchone()[0],
         "by_status": dict(by_status),
         "by_cash_flow_treatment": dict(by_treatment),
+        "by_disposition": dict(by_disposition),
+        "auto_triage": {
+            "mode": triage_mode,
+            "reject_floor": reject_floor,
+            "parked": triage_counts.get("parked", 0),
+            "auto_rejected": triage_counts.get("auto_rejected", 0),
+            "revived": triage_counts.get("revived", 0),
+        },
         "options": {"min_evidence": min_evidence, "include_inflows": include_inflows},
     }
+
+
+def _route_auto_triage(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    disposition: dict[str, Any],
+    mode: str,
+    counts: dict[str, int],
+) -> None:
+    """Act on a candidate's disposition without ever destroying it.
+
+    ``shadow`` records the disposition on the candidate (done by the caller) but
+    changes no status. ``park_only`` moves the park bucket out of the active walk.
+    ``enforce`` additionally auto-rejects structural noise. All moves go through
+    ``record_charge_onboarding_decision`` with ``decided_by="auto_classifier"`` so
+    they are auditable and reversible by a human ``reset``.
+
+    Only FRESH candidates (never human-decided) are auto-moved. As a maturing-
+    pattern safety valve, a candidate that an earlier auto run parked/rejected and
+    that now clears the surface bar is revived to ``proposed`` -- but only when the
+    prior decision was the classifier's, never a human's.
+    """
+
+    if mode not in {"park_only", "enforce"}:
+        return
+
+    row = conn.execute(
+        "SELECT status, decision_json FROM charge_onboarding_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None:
+        return
+    status = row["status"]
+    disp = disposition["disposition"]
+    reasons = disposition["reasons"]
+
+    if status in FRESH_STATUSES:
+        if disp == DISPOSITION_PARK:
+            record_charge_onboarding_decision(
+                conn, candidate_id,
+                {"action": "park", "decided_by": "auto_classifier", "reasons": reasons},
+            )
+            counts["parked"] += 1
+        elif disp == DISPOSITION_AUTO_REJECT and mode == "enforce":
+            record_charge_onboarding_decision(
+                conn, candidate_id,
+                {"action": "reject", "decided_by": "auto_classifier", "reasons": reasons},
+            )
+            counts["auto_rejected"] += 1
+        return
+
+    # Maturing-pattern revival: a previously auto-parked/rejected candidate that
+    # now surfaces is walked again -- but only if no human ever decided it.
+    if status in {PARKED_STATUS, "rejected"} and disp == DISPOSITION_SURFACE:
+        prior = _loads(row["decision_json"]) or {}
+        if prior.get("decided_by") == "auto_classifier":
+            record_charge_onboarding_decision(
+                conn, candidate_id,
+                {"action": "reset", "decided_by": "auto_classifier", "reasons": reasons},
+            )
+            counts["revived"] += 1
 
 
 def _build_candidate(

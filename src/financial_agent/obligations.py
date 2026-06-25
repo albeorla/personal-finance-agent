@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import date, datetime, timedelta
+from statistics import median as _stat_median
 from typing import Any
 
 from .schema import ensure_app_schema
@@ -18,6 +19,29 @@ AVG_ESTIMATE_METHODS = {"seasonal_card_spend", "seasonal_multiplier", "average",
 # excluded from projections (see cashflow.PROJECTABLE_STATUSES) but the row stays
 # in place so the suppression is fully reversible.
 DORMANT_SUPPRESSED_STATUS = "dormant_suppressed"
+
+# Marker stamped on instance ``amount_source`` when an averaged estimate is
+# lowered to the account's actual observed burn (see
+# ``suppress_contradicted_estimates``). The obligation stays ``active`` so it keeps
+# projecting -- at the smaller real figure -- rather than dropping off the runway.
+ESTIMATE_CONTRADICTED_STATUS = "estimate_contradicted"
+
+# Averaged methods that are NOT eligible for contradiction. Seasonal estimators
+# carry their own multiplier policy (peak-month ramp), so a low summer burn is not
+# evidence the estimate is stale; exclude them from the contradiction test.
+CONTRADICTION_EXCLUDED_METHODS = {"seasonal_card_spend", "seasonal_multiplier"}
+
+# Cadence -> occurrences per ~30-day month, used to roll a per-occurrence estimate
+# up to a modeled monthly outflow for the contradiction comparison.
+CADENCE_PER_MONTH: dict[str, float] = {
+    "weekly": 4.345,
+    "biweekly": 2.173,
+    "monthly": 1.0,
+    "quarterly": 1.0 / 3.0,
+    "semiannual": 1.0 / 6.0,
+    "annual": 1.0 / 12.0,
+    "yearly": 1.0 / 12.0,
+}
 
 
 def apply_obligation_instances(
@@ -564,6 +588,402 @@ def _suppression_summary(
         "suppressed": suppressed,
         "skipped": skipped,
     }
+
+
+def suppress_contradicted_estimates(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: date | str,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Lower or suppress an averaged estimate that the account's burn contradicts.
+
+    Dormancy (``suppress_dormant_avg_estimates``) only fires on a clean zero
+    balance with zero activity. This is the "shrunk but not dead" case from data
+    caveat #2: a card carrying a large averaged estimate (e.g. ~$1,162/mo) whose
+    live balance is low/flat and whose real merchant burn has collapsed to a small
+    figure. The estimate keeps projecting at full size and overstates the trough.
+
+    For each active charge-onboarding obligation whose every projectable instance
+    is an averaged auto-estimate (seasonal methods excluded -- they carry their own
+    multiplier policy), this compares the modeled monthly outflow against the
+    account's actual recent burn on that merchant:
+
+      - ``modeled_monthly`` = per-occurrence estimate x cadence-per-month.
+      - ``observed_monthly`` = summed merchant burn / months in the window.
+      - Fires when BOTH ``modeled_monthly >= max(modeled_floor, observed_monthly x
+        ratio)`` AND the gap is sustained across at least ``contradiction_cycles``
+        consecutive ~30-day sub-windows. A flat balance (statement not growing)
+        lowers the ratio (``flat_balance_ratio``) because there is no hidden spend.
+
+    Resolution is graceful, not binary:
+      - ``observed_monthly`` at/under ``near_zero_monthly`` -> route to dormant
+        (reuse ``DORMANT_SUPPRESSED_STATUS``); effectively dead without a clean $0.
+      - ``observed_monthly`` real but much smaller -> keep the obligation ``active``
+        and rewrite each projectable instance amount down to the observed figure
+        (``amount_source = 'estimate_contradicted'``), so the runway uses the
+        smaller real number instead of dropping the obligation entirely.
+
+    Both paths are fully reversible (rows kept, previous amounts recorded in the
+    finding evidence) and emit a low-severity ``auto_contradicted_estimate`` drift
+    finding -- never a silent edit.
+
+    Modes: ``report`` (default) emits findings but mutates nothing -- the observe
+    posture for the first live run; ``enforce`` applies the resolution. Insufficient
+    evidence (no transactions on the account at all, e.g. the balance-only Apple
+    Card) is always a no-op: never suppress on missing data.
+    """
+
+    ensure_app_schema(conn)
+    opts = options or {}
+    mode = str(opts.get("mode", "report"))
+    ratio = float(opts.get("contradiction_ratio", 2.0))
+    flat_ratio = float(opts.get("flat_balance_ratio", 1.5))
+    floor = float(opts.get("modeled_floor", 150.0))
+    cycles = int(opts.get("contradiction_cycles", 2))
+    lookback_days = int(opts.get("contradiction_lookback_days", 90))
+    near_zero = float(opts.get("near_zero_monthly", 5.0))
+    as_of = _coerce_date(as_of_date)
+    window_start = (as_of - timedelta(days=lookback_days)).isoformat()
+    now = _now()
+
+    have_transactions = _has_table(conn, "transactions")
+    have_balances = _has_table(conn, "balance_snapshots")
+    have_candidates = _has_table(conn, "charge_onboarding_candidates")
+
+    contradicted: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    evaluated = 0
+
+    if not (have_transactions and have_candidates):
+        # Without transactions we cannot observe burn, and without the onboarding
+        # candidate table we cannot resolve a source account/merchant. No-op.
+        return _contradiction_summary(as_of, mode, lookback_days, cycles, evaluated, contradicted, skipped)
+
+    candidate_obligations = conn.execute(
+        """
+        SELECT id, name, status, source, cadence
+        FROM obligations
+        WHERE status = 'active'
+          AND source LIKE 'charge_onboarding:%'
+        ORDER BY id
+        """
+    ).fetchall()
+
+    for obligation in candidate_obligations:
+        evaluated += 1
+        instances = conn.execute(
+            """
+            SELECT id, amount, direction, estimation_method, amount_status
+            FROM obligation_instances
+            WHERE obligation_id = ?
+              AND status IN ('expected', 'needs_review', 'partially_paid')
+            """,
+            (obligation["id"],),
+        ).fetchall()
+        if not instances:
+            continue
+        # Same guard as dormancy: only averaged auto-estimates are eligible.
+        if not all(_is_avg_estimate_instance(inst) for inst in instances):
+            continue
+        # Seasonal estimators opt out (their own peak-month policy explains low burn).
+        if any((inst["estimation_method"] or "") in CONTRADICTION_EXCLUDED_METHODS for inst in instances):
+            continue
+        # Contradiction is an outflow concept (overstated burn); skip inflows.
+        if any(inst["direction"] != "outflow" for inst in instances):
+            continue
+
+        account_ids = _source_account_ids(conn, obligation["id"], obligation["source"])
+        if not account_ids:
+            skipped.append({"obligation_id": obligation["id"], "reason": "no_source_account"})
+            continue
+        merchant_key = _obligation_merchant_key(conn, obligation["id"], obligation["source"])
+        if not merchant_key:
+            skipped.append({"obligation_id": obligation["id"], "reason": "no_merchant_key"})
+            continue
+
+        burn = _merchant_monthly_burn(
+            conn, account_ids, merchant_key,
+            window_start=window_start, as_of=as_of.isoformat(), sub_windows=cycles,
+        )
+        if burn["insufficient"]:
+            # No transactions on the account at all (e.g. balance-only Apple Card):
+            # cannot observe burn -> never suppress on missing data.
+            skipped.append({"obligation_id": obligation["id"], "reason": "insufficient_evidence"})
+            continue
+
+        observed_monthly = burn["observed_monthly"]
+        cadence_factor = CADENCE_PER_MONTH.get((obligation["cadence"] or "monthly").lower(), 1.0)
+        amounts = sorted(round(float(inst["amount"]), 2) for inst in instances)
+        per_occurrence = float(_stat_median(amounts)) if amounts else 0.0
+        modeled_monthly = round(per_occurrence * cadence_factor, 2)
+
+        balance_flat = (
+            _account_balance_flat(conn, account_ids, window_start) if have_balances else False
+        )
+        effective_ratio = flat_ratio if balance_flat else ratio
+        threshold = max(floor, observed_monthly * effective_ratio)
+
+        # Sustained check: the gap must hold across the recent consecutive
+        # sub-windows, not just on average (a single quiet month is not enough).
+        sustained = 0
+        for sub_burn in burn["sub_window_burn"]:  # recent-first
+            if modeled_monthly >= max(floor, sub_burn * effective_ratio):
+                sustained += 1
+            else:
+                break
+        fires = (modeled_monthly >= threshold) and sustained >= cycles
+        if not fires:
+            continue
+
+        previous_amounts = {inst["id"]: round(float(inst["amount"]), 2) for inst in instances}
+        if observed_monthly <= near_zero:
+            resolution = "dormant"
+            new_per_occurrence = None
+        else:
+            resolution = "rewrite"
+            new_per_occurrence = round(observed_monthly / cadence_factor, 2) if cadence_factor else observed_monthly
+
+        if mode == "enforce":
+            if resolution == "dormant":
+                conn.execute(
+                    "UPDATE obligations SET status = ?, updated_at = ? WHERE id = ?",
+                    (DORMANT_SUPPRESSED_STATUS, now, obligation["id"]),
+                )
+                # Retire any stale due reminders for the now-suppressed obligation.
+                from .todoist_outbox import request_emission_retire_prefix
+
+                request_emission_retire_prefix(conn, f"obligation-due:{obligation['id']}:")
+            else:
+                for inst in instances:
+                    conn.execute(
+                        """
+                        UPDATE obligation_instances
+                        SET amount = ?, amount_status = 'estimated', amount_source = ?,
+                            notes = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            new_per_occurrence,
+                            ESTIMATE_CONTRADICTED_STATUS,
+                            f"Auto-lowered to observed burn (~${observed_monthly:.0f}/mo); "
+                            f"was ${previous_amounts[inst['id']]:.2f}.",
+                            now,
+                            inst["id"],
+                        ),
+                    )
+
+        finding_id = f"drift:auto_contradicted_estimate:{obligation['id']}"
+        evidence = {
+            "obligation_name": obligation["name"],
+            "resolution": resolution,
+            "previous_status": obligation["status"],
+            "account_ids": account_ids,
+            "merchant_key": merchant_key,
+            "modeled_monthly": modeled_monthly,
+            "observed_monthly": observed_monthly,
+            "ratio": effective_ratio,
+            "threshold": round(threshold, 2),
+            "sub_window_burn": burn["sub_window_burn"],
+            "balance_flat": balance_flat,
+            "previous_amounts": previous_amounts,
+            "rewritten_amount": new_per_occurrence,
+            "lookback_days": lookback_days,
+            "contradiction_cycles": cycles,
+            "window_start": window_start,
+            "as_of_date": as_of.isoformat(),
+            "mode": mode,
+            "applied": mode == "enforce",
+        }
+        if resolution == "dormant":
+            recommended = (
+                f"Source account barely used (~${observed_monthly:.0f}/mo) but the estimate "
+                f"projects ~${modeled_monthly:.0f}/mo. Treated as dormant; reactivate the "
+                f"obligation (status back to 'active') if it ramps back up."
+            )
+        else:
+            recommended = (
+                f"Estimate projected ~${modeled_monthly:.0f}/mo but the merchant has run "
+                f"~${observed_monthly:.0f}/mo for {cycles} cycles"
+                f"{' (balance flat)' if balance_flat else ''}. Lowered the forecast to the "
+                f"smaller real figure; re-estimate or reactivate if the card ramps back up."
+            )
+        conn.execute(
+            """
+            INSERT INTO drift_findings (
+                id, finding_type, severity, obligation_id, obligation_instance_id,
+                related_transaction_ids_json, cash_flow_impact, confidence,
+                evidence_json, recommended_action, status, as_of_date,
+                created_at, updated_at, resolved_at
+            ) VALUES (?, ?, 'low', ?, NULL, '[]', NULL, 'medium', ?, ?, 'active', ?, ?, ?, NULL)
+            ON CONFLICT(id) DO UPDATE SET
+                severity = 'low',
+                evidence_json = excluded.evidence_json,
+                recommended_action = excluded.recommended_action,
+                status = 'active',
+                as_of_date = excluded.as_of_date,
+                updated_at = excluded.updated_at,
+                resolved_at = NULL
+            """,
+            (
+                finding_id,
+                "auto_contradicted_estimate",
+                obligation["id"],
+                json.dumps(evidence, sort_keys=True),
+                recommended,
+                as_of.isoformat(),
+                now,
+                now,
+            ),
+        )
+        contradicted.append(
+            {
+                "obligation_id": obligation["id"],
+                "obligation_name": obligation["name"],
+                "resolution": resolution,
+                "modeled_monthly": modeled_monthly,
+                "observed_monthly": observed_monthly,
+                "rewritten_amount": new_per_occurrence,
+                "applied": mode == "enforce",
+                "finding_id": finding_id,
+            }
+        )
+
+    return _contradiction_summary(as_of, mode, lookback_days, cycles, evaluated, contradicted, skipped)
+
+
+def _contradiction_summary(
+    as_of: date,
+    mode: str,
+    lookback_days: int,
+    cycles: int,
+    evaluated: int,
+    contradicted: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "as_of_date": as_of.isoformat(),
+        "mode": mode,
+        "lookback_days": lookback_days,
+        "contradiction_cycles": cycles,
+        "evaluated": evaluated,
+        "contradicted_count": len(contradicted),
+        "contradicted": contradicted,
+        "skipped": skipped,
+    }
+
+
+def _obligation_merchant_key(
+    conn: sqlite3.Connection, obligation_id: str, source: str | None
+) -> str | None:
+    """Resolve the merchant key for an onboarded obligation via its candidate."""
+
+    candidate_id = None
+    if source and source.startswith("charge_onboarding:"):
+        candidate_id = source.split(":", 1)[1]
+    row = conn.execute(
+        """
+        SELECT merchant_key
+        FROM charge_onboarding_candidates
+        WHERE existing_obligation_id = ? OR id = ?
+        LIMIT 1
+        """,
+        (obligation_id, candidate_id),
+    ).fetchone()
+    return row["merchant_key"] if row else None
+
+
+def _merchant_monthly_burn(
+    conn: sqlite3.Connection,
+    account_ids: list[str],
+    merchant_key: str,
+    *,
+    window_start: str,
+    as_of: str,
+    sub_windows: int,
+) -> dict[str, Any]:
+    """Observed monthly burn for ``merchant_key`` on the given accounts.
+
+    Same ``transactions`` shape as ``_account_dormancy`` but summing per ~30-day
+    sub-window (most recent first). ``insufficient`` is True when the accounts have
+    NO transactions at all in the window (e.g. a balance-only card) so the caller
+    can no-op rather than suppress on missing data.
+    """
+
+    # Local import avoids the obligations <-> onboarding import cycle.
+    from .onboarding import normalize_merchant_key
+
+    placeholders = ",".join("?" for _ in account_ids)
+    rows = conn.execute(
+        f"""
+        SELECT amount, payee, COALESCE(posted, transacted_at) AS ts
+        FROM transactions
+        WHERE account_id IN ({placeholders})
+          AND COALESCE(posted, transacted_at) >= ?
+          AND COALESCE(posted, transacted_at) <= ?
+        """,
+        (*account_ids, window_start, as_of + "T23:59:59"),
+    ).fetchall()
+
+    account_txn_count = len(rows)
+    matched = [
+        (abs(float(r["amount"])), (r["ts"] or "")[:10])
+        for r in rows
+        if r["payee"] and normalize_merchant_key(r["payee"]) == merchant_key
+    ]
+
+    as_of_date = date.fromisoformat(as_of)
+    sub_window_burn: list[float] = []
+    for i in range(max(1, sub_windows)):
+        win_end = (as_of_date - timedelta(days=30 * i)).isoformat()
+        win_start = (as_of_date - timedelta(days=30 * (i + 1))).isoformat()
+        sub_window_burn.append(
+            round(sum(amt for amt, d in matched if win_start < d <= win_end), 2)
+        )
+
+    total = sum(amt for amt, _ in matched)
+    months = max(1.0, (as_of_date - date.fromisoformat(window_start)).days / 30.0)
+    return {
+        "insufficient": account_txn_count == 0,
+        "account_txn_count": account_txn_count,
+        "matched_count": len(matched),
+        "observed_monthly": round(total / months, 2),
+        "sub_window_burn": sub_window_burn,
+        "months": round(months, 2),
+    }
+
+
+def _account_balance_flat(
+    conn: sqlite3.Connection, account_ids: list[str], window_start: str
+) -> bool:
+    """True when total balance magnitude has not grown across the window.
+
+    For a card, a non-growing statement balance means no hidden spend is masking
+    the low observed burn, so the contradiction test uses the gentler ratio.
+    Compared by magnitude (``abs``) because card balances are negative.
+    """
+
+    oldest = newest = 0.0
+    have = False
+    for account_id in account_ids:
+        first = conn.execute(
+            "SELECT balance FROM balance_snapshots WHERE account_id = ? AND recorded_at >= ? "
+            "ORDER BY recorded_at ASC LIMIT 1",
+            (account_id, window_start),
+        ).fetchone()
+        last = conn.execute(
+            "SELECT balance FROM balance_snapshots WHERE account_id = ? "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (account_id,),
+        ).fetchone()
+        if first is None or last is None:
+            continue
+        have = True
+        oldest += abs(float(first["balance"]))
+        newest += abs(float(last["balance"]))
+    if not have:
+        return False
+    return newest <= oldest + 1e-9
 
 
 def _is_avg_estimate_instance(inst: sqlite3.Row) -> bool:

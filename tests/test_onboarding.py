@@ -20,9 +20,14 @@ import pytest
 from financial_agent.cashflow import build_cash_flow_projections
 from financial_agent.obligations import apply_obligation_instances, list_statement_input_estimates
 from financial_agent.onboarding import (
+    DISPOSITION_AUTO_REJECT,
+    DISPOSITION_PARK,
+    DISPOSITION_SURFACE,
+    PARKED_STATUS,
     _confidence,
     account_class,
     apply_charge_onboarding_candidate,
+    classify_candidate_disposition,
     get_next_charge_onboarding_candidate,
     list_charge_onboarding_queue,
     normalize_merchant_key,
@@ -827,3 +832,286 @@ def test_apply_inflow_projects_as_income(tmp_path):
     # Inflows raise the projected balance (income behavior): 100 + 3 * 196.02.
     assert all(e["direction"] == "inflow" for e in projections[0]["events"])
     assert projections[0]["ending_balance"] == 688.06
+
+
+# ---------------------------------------------------------------------------
+# #6 Quiet onboarding noise: auto-triage disposition classifier
+# ---------------------------------------------------------------------------
+
+# A sporadic dining merchant: 3 visits spread far apart with wildly different
+# tickets. Lumpy timing (median interval > 100 days) reads as an "irregular"
+# cadence at low confidence, and the swinging amounts make it variable spend --
+# i.e. structural noise, not a schedulable bill.
+SHAKE_SHACK_ROWS = [
+    ("ss-1", "ACT-chk", "2025-10-12T08:00:00", -14.00, "Shake Shack", "SHAKE SHACK"),
+    ("ss-2", "ACT-chk", "2026-01-20T08:00:00", -58.00, "Shake Shack", "SHAKE SHACK"),
+    ("ss-3", "ACT-chk", "2026-05-15T08:00:00", -9.50, "Shake Shack", "SHAKE SHACK"),
+]
+
+# Groceries on the card: monthly cadence (regular) but the ticket swings from
+# $12 to $277. Regular-but-variable is the metered/utility shape -- a safety case
+# that must be parked, never auto-rejected.
+WHOLE_FOODS_ROWS = [
+    ("wf-1", "ACT-amex", "2026-01-05T08:00:00", -12.00, "Whole Foods", "WHOLE FOODS"),
+    ("wf-2", "ACT-amex", "2026-02-05T08:00:00", -45.00, "Whole Foods", "WHOLE FOODS"),
+    ("wf-3", "ACT-amex", "2026-03-05T08:00:00", -130.00, "Whole Foods", "WHOLE FOODS"),
+    ("wf-4", "ACT-amex", "2026-04-05T08:00:00", -277.00, "Whole Foods", "WHOLE FOODS"),
+]
+
+
+def _disposition_candidate(**overrides):
+    """A built-candidate-shaped dict for the pure classifier.
+
+    Defaults describe a clean, confident, regular monthly bill (the ``surface``
+    baseline); each test overrides only the signals it is exercising.
+    """
+
+    base = {
+        "candidate_type": "direct_checking_outflow",
+        "confidence": "high",
+        "priority_score": 30.0,
+        "evidence_count": 6,
+        "proposed_schedule_policy": {"cadence": "monthly", "months_covered": 6},
+        "proposed_amount_policy": {"cv": 0.04},
+    }
+    base.update({k: v for k, v in overrides.items() if k not in {"cadence", "months_covered", "cv"}})
+    if "cadence" in overrides or "months_covered" in overrides:
+        base["proposed_schedule_policy"] = {
+            "cadence": overrides.get("cadence", "monthly"),
+            "months_covered": overrides.get("months_covered", 6),
+        }
+    if "cv" in overrides:
+        base["proposed_amount_policy"] = {"cv": overrides["cv"]}
+    return base
+
+
+# --- pure classifier: the spectrum -----------------------------------------
+
+
+def test_classify_clean_monthly_subscription_surfaces():
+    result = classify_candidate_disposition(_disposition_candidate())
+    assert result["disposition"] == DISPOSITION_SURFACE
+
+
+def test_classify_irregular_low_confidence_variable_spend_auto_rejects():
+    # Sporadic high-CV dining at low confidence and trivial modeled impact: the
+    # bulk of the noise the queue should quietly dismiss.
+    candidate = _disposition_candidate(
+        candidate_type="variable_spend",
+        confidence="low",
+        cadence="irregular",
+        cv=0.80,
+        priority_score=2.0,
+        evidence_count=3,
+        months_covered=3,
+    )
+    result = classify_candidate_disposition(candidate)
+    assert result["disposition"] == DISPOSITION_AUTO_REJECT
+
+
+def test_classify_single_burst_auto_rejects():
+    # One-off / single-burst with no magnitude is not a recurring pattern.
+    candidate = _disposition_candidate(
+        candidate_type="variable_spend", confidence="very_low",
+        evidence_count=1, months_covered=1, cadence="unknown", cv=0.0, priority_score=12.0,
+    )
+    assert classify_candidate_disposition(candidate)["disposition"] == DISPOSITION_AUTO_REJECT
+
+
+def test_classify_internal_transfer_parks():
+    candidate = _disposition_candidate(candidate_type="internal_transfer", priority_score=300.0)
+    assert classify_candidate_disposition(candidate)["disposition"] == DISPOSITION_PARK
+
+
+def test_classify_review_only_parks():
+    candidate = _disposition_candidate(candidate_type="review_only", confidence="low")
+    assert classify_candidate_disposition(candidate)["disposition"] == DISPOSITION_PARK
+
+
+# --- pure classifier: the three safety backstops ---------------------------
+# Each guarantees a real-bill-looking candidate is NEVER auto_rejected.
+
+
+def test_backstop_1_confidence_floor_blocks_auto_reject():
+    # Variable + irregular looks like noise, but medium confidence means the
+    # detector is fairly sure this recurs -> it must surface, never auto_reject.
+    candidate = _disposition_candidate(
+        candidate_type="variable_spend",
+        confidence="medium",
+        cadence="irregular_multiweek",
+        cv=0.45,
+        priority_score=20.0,
+        evidence_count=3,
+        months_covered=3,
+    )
+    result = classify_candidate_disposition(candidate)
+    assert result["disposition"] != DISPOSITION_AUTO_REJECT
+    assert result["disposition"] == DISPOSITION_SURFACE
+
+
+def test_backstop_2_regularity_override_parks_not_rejects():
+    # A steadily monthly charge whose amounts swing (metered utility shape). Even
+    # at low confidence and trivial magnitude, a regular cadence is parked.
+    candidate = _disposition_candidate(
+        candidate_type="variable_spend",
+        confidence="low",
+        cadence="monthly",
+        cv=0.70,
+        priority_score=8.0,
+        evidence_count=4,
+        months_covered=4,
+    )
+    result = classify_candidate_disposition(candidate)
+    assert result["disposition"] != DISPOSITION_AUTO_REJECT
+    assert result["disposition"] == DISPOSITION_PARK
+
+
+def test_backstop_3_magnitude_guard_parks_not_rejects():
+    # Every soft signal says "noise" (variable, irregular, low confidence) but the
+    # modeled monthly impact is material ($250/mo > $75 floor): parked, never lost.
+    candidate = _disposition_candidate(
+        candidate_type="variable_spend",
+        confidence="low",
+        cadence="irregular",
+        cv=0.90,
+        priority_score=250.0,
+        evidence_count=3,
+        months_covered=3,
+    )
+    result = classify_candidate_disposition(candidate)
+    assert result["disposition"] != DISPOSITION_AUTO_REJECT
+    assert result["disposition"] == DISPOSITION_PARK
+    assert any("magnitude guard" in reason for reason in result["reasons"])
+
+
+def test_reject_floor_is_tunable():
+    # The same noisy candidate flips from auto_reject to park when the floor drops
+    # below its modeled impact -- the guard is a single tunable threshold.
+    candidate = _disposition_candidate(
+        candidate_type="variable_spend", confidence="low", cadence="irregular",
+        cv=0.80, priority_score=40.0, evidence_count=3, months_covered=3,
+    )
+    assert classify_candidate_disposition(candidate, reject_floor=75.0)["disposition"] == DISPOSITION_AUTO_REJECT
+    assert classify_candidate_disposition(candidate, reject_floor=30.0)["disposition"] == DISPOSITION_PARK
+
+
+# --- integration: scan stamps the disposition (shadow default) -------------
+
+
+def test_scan_stamps_disposition_across_the_spectrum(tmp_path):
+    conn = _seed_source_db(
+        tmp_path / "src.sqlite",
+        accounts=[AMEX, CHECKING],
+        transactions=NYT_CHECKING_ROWS + WHOLE_FOODS_ROWS + SHAKE_SHACK_ROWS,
+    )
+
+    result = scan_charge_onboarding_candidates(conn)
+
+    # Default mode is shadow: dispositions are computed and stamped, but no
+    # candidate is moved out of the active walk.
+    assert result["auto_triage"]["mode"] == "shadow"
+    assert result["auto_triage"]["parked"] == 0
+    assert result["auto_triage"]["auto_rejected"] == 0
+
+    queue = list_charge_onboarding_queue(conn)
+    by_key = {c["merchant_key"]: c for c in queue}
+
+    def disposition(key):
+        return by_key[key]["proposed_review_policy"]["auto_disposition"]
+
+    assert disposition("new_york_times") == DISPOSITION_SURFACE
+    assert disposition("whole_foods") == DISPOSITION_PARK
+    assert disposition("shake_shack") == DISPOSITION_AUTO_REJECT
+
+    # Shadow changed nothing: all three are still walkable.
+    assert {"new_york_times", "whole_foods", "shake_shack"} <= set(by_key)
+    assert all(c["status"] == "proposed" for c in queue)
+    assert result["by_disposition"][DISPOSITION_SURFACE] >= 1
+    assert result["by_disposition"][DISPOSITION_PARK] >= 1
+    assert result["by_disposition"][DISPOSITION_AUTO_REJECT] >= 1
+
+
+def test_scan_with_triage_off_stamps_nothing(tmp_path):
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[CHECKING], transactions=NYT_CHECKING_ROWS)
+    scan_charge_onboarding_candidates(conn, options={"auto_triage": {"mode": "off"}})
+    nyt = _find(list_charge_onboarding_queue(conn), "new_york_times")
+    assert "auto_disposition" not in nyt["proposed_review_policy"]
+
+
+# --- integration: enforce routes (park + auto_reject), reversibly ----------
+
+
+def test_enforce_parks_and_rejects_but_keeps_surface_walkable(tmp_path):
+    conn = _seed_source_db(
+        tmp_path / "src.sqlite",
+        accounts=[AMEX, CHECKING],
+        transactions=NYT_CHECKING_ROWS + WHOLE_FOODS_ROWS + SHAKE_SHACK_ROWS,
+    )
+    result = scan_charge_onboarding_candidates(conn, options={"auto_triage": {"mode": "enforce"}})
+
+    assert result["auto_triage"]["parked"] >= 1
+    assert result["auto_triage"]["auto_rejected"] >= 1
+
+    statuses = {
+        row["merchant_key"]: row["status"]
+        for row in list_charge_onboarding_queue(conn, include_resolved=True)
+    }
+    assert statuses["whole_foods"] == PARKED_STATUS
+    assert statuses["shake_shack"] == "rejected"
+    # The plausible bill stays in the active one-at-a-time walk.
+    assert statuses["new_york_times"] == "proposed"
+
+    active_keys = {c["merchant_key"] for c in list_charge_onboarding_queue(conn)}
+    assert active_keys == {"new_york_times"}
+
+
+def test_enforce_park_only_mode_does_not_auto_reject(tmp_path):
+    conn = _seed_source_db(
+        tmp_path / "src.sqlite",
+        accounts=[AMEX, CHECKING],
+        transactions=WHOLE_FOODS_ROWS + SHAKE_SHACK_ROWS,
+    )
+    result = scan_charge_onboarding_candidates(conn, options={"auto_triage": {"mode": "park_only"}})
+
+    assert result["auto_triage"]["parked"] >= 1
+    assert result["auto_triage"]["auto_rejected"] == 0
+    statuses = {
+        row["merchant_key"]: row["status"]
+        for row in list_charge_onboarding_queue(conn, include_resolved=True)
+    }
+    assert statuses["whole_foods"] == PARKED_STATUS
+    # park_only leaves the auto_reject bucket untouched and walkable.
+    assert statuses["shake_shack"] == "proposed"
+
+
+def test_enforce_preserves_a_human_decision(tmp_path):
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[CHECKING], transactions=NYT_CHECKING_ROWS)
+    scan_charge_onboarding_candidates(conn)
+    nyt = _find(list_charge_onboarding_queue(conn), "new_york_times")
+
+    # A human rejects the surfaced subscription. A later enforce scan must not
+    # revive it just because the classifier would have surfaced it.
+    record_charge_onboarding_decision(conn, nyt["id"], {"action": "reject", "notes": "duplicate"})
+    result = scan_charge_onboarding_candidates(conn, options={"auto_triage": {"mode": "enforce"}})
+
+    assert result["auto_triage"]["revived"] == 0
+    row = conn.execute(
+        "SELECT status, decision_json FROM charge_onboarding_candidates WHERE id = ?", (nyt["id"],)
+    ).fetchone()
+    assert row["status"] == "rejected"
+    assert "auto_classifier" not in (row["decision_json"] or "")
+
+
+def test_auto_parked_candidate_is_reversible_by_human_reset(tmp_path):
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[AMEX], transactions=WHOLE_FOODS_ROWS)
+    scan_charge_onboarding_candidates(conn, options={"auto_triage": {"mode": "enforce"}})
+
+    parked = _find(list_charge_onboarding_queue(conn, include_resolved=True), "whole_foods")
+    assert parked["status"] == PARKED_STATUS
+    # Auto-park pulls it out of the active walk...
+    assert _find(list_charge_onboarding_queue(conn), "whole_foods") is None
+
+    # ...but a human reset restores it to the active queue (fully reversible).
+    reset = record_charge_onboarding_decision(conn, parked["id"], {"action": "reset"})
+    assert reset["status"] == "proposed"
+    assert _find(list_charge_onboarding_queue(conn), "whole_foods") is not None
