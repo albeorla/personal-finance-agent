@@ -38,20 +38,6 @@ def _build_status_db(path):
             transactions_updated INTEGER NOT NULL,
             error TEXT
         );
-
-        CREATE TABLE todoist_sync_runs (
-            id INTEGER PRIMARY KEY,
-            started_at TEXT NOT NULL,
-            finished_at TEXT NOT NULL,
-            project_id TEXT NOT NULL,
-            sections_seen INTEGER NOT NULL,
-            tasks_seen INTEGER NOT NULL,
-            cashflow_tasks_seen INTEGER NOT NULL,
-            inserted INTEGER NOT NULL,
-            updated INTEGER NOT NULL,
-            missing_marked_deleted INTEGER NOT NULL,
-            error TEXT
-        );
         """
     )
     conn.executemany(
@@ -85,15 +71,6 @@ def _build_status_db(path):
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         ("2026-06-20T09:58:00+00:00", "2026-06-20T10:00:00+00:00", "incremental", 2, 4, 1, None),
-    )
-    conn.execute(
-        """
-        INSERT INTO todoist_sync_runs (
-            started_at, finished_at, project_id, sections_seen, tasks_seen,
-            cashflow_tasks_seen, inserted, updated, missing_marked_deleted, error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        ("2026-06-19T03:00:00+00:00", "2026-06-19T03:05:00+00:00", "finance-project", 3, 10, 4, 1, 2, 0, None),
     )
     conn.commit()
     conn.close()
@@ -302,7 +279,8 @@ def test_get_finance_status_returns_balances_freshness_and_trace(tmp_path):
 
     assert result["source_freshness"]["simplefin"]["status"] == "fresh"
     assert result["source_freshness"]["simplefin"]["age_hours"] == 2.0
-    assert result["source_freshness"]["todoist"]["status"] == "stale"
+    # Todoist is output-only now: source freshness reports SimpleFIN only.
+    assert "todoist" not in result["source_freshness"]
 
     assert result["cash_flow_projections"] == []
     assert result["drift_warnings"] == []

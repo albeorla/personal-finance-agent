@@ -20,9 +20,9 @@ dollar figures.
 ## Daily ritual (the common path)
 
 1. **Refresh** live data: `run_background_sync` with `options={"sync": true}`
-   (pulls SimpleFIN + Todoist, then scans/reconciles/detects drift in one
-   audited run). For a quick manual refresh use `sync_simplefin`
-   (`incremental=true`) and `sync_todoist`.
+   (pulls SimpleFIN, then scans/reconciles/detects drift and surfaces due items
+   in one audited run). For a quick manual refresh use `sync_simplefin`
+   (`incremental=true`).
 2. **Read the digest**: `get_daily_digest` (working cash, 7/14/30/60d projection,
    upcoming obligations, drift, matches to confirm, guardrail status). This is
    the morning summary. Lead your answer with its `status_color` and working cash.
@@ -54,13 +54,14 @@ fresh legacy `cash-flow.md` against the new digest and reports where they
 disagree (missing / extra / changed obligations + working-cash delta). Use it to
 decide when the new system is trustworthy enough to rely on alone.
 
-## Todoist (read vs. write)
+## Todoist (output only)
 
-- Reading one-off obligations from Todoist: `sync_todoist` then
-  `import_todoist_obligations`.
-- Writing review tasks back to Todoist is **dry-run only** unless the user has
-  explicitly enabled it. `preview_todoist_review_batch` and
-  `enqueue_todoist_review_batch` stage work in a durable outbox;
+- Todoist is **output-only**: the server pushes reminders out and reads back
+  completions of tasks it pushed; it is not a source of obligations.
+- `surface_due_items_to_todoist` pushes the day's due items idempotently via the
+  emissions ledger; `reconcile_todoist_completions` absorbs user completions of
+  those tasks; `create_todoist_task` makes a one-off reminder.
+- All writing is **gated off** unless the user has explicitly enabled it.
   `execute_action_outbox` only sends when live Todoist integration is turned on.
   Do not enable or send without explicit user instruction.
 

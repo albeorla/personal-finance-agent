@@ -116,32 +116,17 @@ def test_send_failure_is_recorded_not_raised(tmp_path):
     assert row["status"] == "failed" and "boom" in row["last_error"]
 
 
-def test_succeeded_batch_reenqueues_and_updates_same_task_on_change(tmp_path, monkeypatch):
-    import financial_agent.todoist_outbox as tb
+def test_outbox_send_updates_same_task_on_payload_change(tmp_path):
+    """A pending row with an existing task id and a changed payload UPDATES the
+    same task (preserving external_task_id) instead of creating a duplicate."""
 
     conn = _db(tmp_path / "o.sqlite")
-    def fake_batch(content):
-        return {"idempotency_key": _KEY, "batch_id": "b", "item_count": 1,
-                "parent_task": {"content": content, "description": "d"}, "subtasks": []}
-
-    monkeypatch.setattr(tb, "_build_batch", lambda c, a, o: fake_batch("A"))
-    tb.enqueue_todoist_review_batch(conn, as_of_date="2026-06-21", dry_run=False)
-    tb.execute_action_outbox(conn, write_enabled=True, token="t", project_id="p", send_func=_Spy({"task_id": "T1", "action": "created"}))
-    assert _row(conn)["status"] == "succeeded" and _row(conn)["external_task_id"] == "T1"
-
-    # re-enqueue with the SAME payload -> skipped, no re-send
-    assert tb.enqueue_todoist_review_batch(conn, as_of_date="2026-06-21", dry_run=False)["action"] == "skipped_already_sent"
-
-    # re-enqueue with a CHANGED payload -> re-queued, external_task_id preserved
-    monkeypatch.setattr(tb, "_build_batch", lambda c, a, o: fake_batch("B-changed"))
-    e3 = tb.enqueue_todoist_review_batch(conn, as_of_date="2026-06-21", dry_run=False)
-    assert e3["status"] == "pending" and e3["action"] == "updated"
-    assert _row(conn)["external_task_id"] == "T1"
-
-    # execute -> UPDATES the same task (not a new one)
+    _insert(conn, external_task_id="T1", last_pushed_hash="h0", payload_hash="h1")  # content changed
     spy = _Spy({"task_id": "T1", "action": "updated"})
-    r = tb.execute_action_outbox(conn, write_enabled=True, token="t", project_id="p", send_func=spy)
-    assert r["updated"] == 1 and spy.calls[0]["existing_task_id"] == "T1"
+    result = execute_action_outbox(conn, write_enabled=True, token="t", project_id="p", send_func=spy)
+    assert result["updated"] == 1 and spy.calls[0]["existing_task_id"] == "T1"
+    row = _row(conn)
+    assert row["external_task_id"] == "T1" and row["last_pushed_hash"] == "h1"
 
 
 def test_finance_agent_env_override(tmp_path, monkeypatch):

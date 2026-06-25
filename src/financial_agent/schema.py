@@ -310,35 +310,6 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memory_records_kind
             ON memory_records(kind);
 
-        CREATE TABLE IF NOT EXISTS todoist_sync_records (
-            external_task_id TEXT PRIMARY KEY,
-            obligation_id TEXT,
-            obligation_instance_id TEXT,
-            content_hash TEXT,
-            last_observed_state_json TEXT,
-            sync_status TEXT NOT NULL,
-            is_deleted_in_source INTEGER NOT NULL DEFAULT 0,
-            checked_in_source INTEGER NOT NULL DEFAULT 0,
-            completed_at_in_source TEXT,
-            error_notes TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS todoist_import_log (
-            id TEXT PRIMARY KEY,
-            run_timestamp TEXT NOT NULL,
-            tasks_scanned INTEGER NOT NULL,
-            tasks_imported INTEGER NOT NULL,
-            tasks_skipped INTEGER NOT NULL,
-            dedup_conflicts INTEGER NOT NULL,
-            needs_review_count INTEGER NOT NULL,
-            errors_json TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_todoist_sync_records_status
-            ON todoist_sync_records(sync_status);
-
         CREATE TABLE IF NOT EXISTS obligation_migration_log (
             id TEXT PRIMARY KEY,
             run_timestamp TEXT NOT NULL,

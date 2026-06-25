@@ -58,7 +58,7 @@ def _db(path):
 
 _EXPECTED_SEQUENCE = [
     "run_started", "scan_charge_candidates", "reconcile", "detect_drift",
-    "suppress_dormant_estimates", "preview_review_batch", "surface_due_items",
+    "suppress_dormant_estimates", "surface_due_items",
     "run_finished",
 ]
 
@@ -72,10 +72,10 @@ def test_run_background_sync_records_run_and_ordered_events(tmp_path):
     assert result["run_id"].startswith("run_")
     assert result["trace_id"].startswith("trace_")
     assert result["duration_ms"] >= 0
-    # All four pipeline steps ran and produced summaries.
+    # Every pipeline step ran and produced a summary.
     assert set(result["result_summary"]) == {
         "scan_charge_candidates", "reconcile", "detect_drift",
-        "suppress_dormant_estimates", "preview_review_batch", "surface_due_items",
+        "suppress_dormant_estimates", "surface_due_items",
     }
     assert result["result_summary"]["scan_charge_candidates"]["created"] == 1
     # With Todoist write-back gated off (the default), surfacing makes no live
@@ -137,33 +137,30 @@ def test_get_background_run_unknown_returns_none(tmp_path):
 
 
 _EXPECTED_WITH_SYNC = [
-    "run_started", "sync_simplefin", "sync_todoist", "scan_charge_candidates",
+    "run_started", "sync_simplefin", "scan_charge_candidates",
     "reconcile", "detect_drift", "suppress_dormant_estimates",
-    "preview_review_batch", "surface_due_items", "run_finished",
+    "surface_due_items", "run_finished",
 ]
 
 
 def test_sync_steps_run_when_enabled_and_configured(tmp_path, monkeypatch):
     conn = _db(tmp_path / "b.sqlite")
-    monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": True, "has_todoist": True})
+    monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": True})
     monkeypatch.setattr(background, "sync_simplefin", lambda *a, **k: {"accounts": 9, "inserted": 700, "updated": 0, "error": None})
-    monkeypatch.setattr(background, "sync_todoist", lambda *a, **k: {"tasks_seen": 20, "cashflow_tasks_seen": 7, "inserted": 20, "updated": 0, "error": None})
 
     result = run_background_sync(conn, as_of_date="2026-06-30", options={"sync": True})
     assert result["status"] == "succeeded"
     assert result["result_summary"]["sync_simplefin"]["accounts"] == 9
-    assert result["result_summary"]["sync_todoist"]["tasks_seen"] == 20
     run = get_background_run(conn, result["run_id"])
     assert [e["event_type"] for e in run["events"]] == _EXPECTED_WITH_SYNC
 
 
 def test_sync_steps_skipped_when_not_configured(tmp_path, monkeypatch):
     conn = _db(tmp_path / "b.sqlite")
-    monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": False, "has_todoist": False})
+    monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": False})
     result = run_background_sync(conn, as_of_date="2026-06-30", options={"sync": True})
-    # Steps still appear in the timeline but no network call is made.
+    # The SimpleFIN step still appears in the timeline but no network call is made.
     assert "skipped" in result["result_summary"]["sync_simplefin"]
-    assert "skipped" in result["result_summary"]["sync_todoist"]
 
 
 def test_run_background_sync_suppresses_dormant_estimate(tmp_path):

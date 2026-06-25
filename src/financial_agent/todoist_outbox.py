@@ -1,8 +1,9 @@
-"""Todoist reflection: review-batch preview and a durable action outbox.
+"""Todoist output: push due-item reminders and a durable action outbox.
 
-Todoist is a reflection/action surface, not the source of financial truth. This
-module renders the day's review items (drift findings) into a Todoist task /
-subtask payload and records intended writes in a durable, idempotent outbox.
+Todoist is an OUTPUT/action surface, not the source of financial truth. This
+module pushes the day's due items to Todoist (idempotently, via the emissions
+ledger), reads back completions of tasks we pushed, and records intended writes
+in a durable action outbox.
 
 Live Todoist write-back is GATED OFF by default. The sender exists
 (``send_review_batch`` + the live path in ``execute_action_outbox``) but only
@@ -23,104 +24,11 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 from .config import get_finance_config
-from .drift import detect_drift
 from .follow_ups import resolve_followup
 from .schema import ensure_app_schema
 
 
-ACTION_TYPE = "todoist_review_batch"
 TODOIST_BASE_URL = "https://api.todoist.com/api/v1"
-
-DEFAULT_OPTIONS: dict[str, Any] = {
-    "min_severity": "low",          # include findings at or above this severity
-    "include_recurring": True,      # include unexpected-recurring (onboarding) items
-}
-
-_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-
-
-def preview_todoist_review_batch(
-    conn: sqlite3.Connection,
-    *,
-    as_of_date: date | str,
-    options: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Render the day's review batch as a Todoist task + subtasks. Read-only."""
-
-    ensure_app_schema(conn)
-    opts = {**DEFAULT_OPTIONS, **(options or {})}
-    as_of = _coerce_date(as_of_date)
-    return _build_batch(conn, as_of, opts)
-
-
-def enqueue_todoist_review_batch(
-    conn: sqlite3.Connection,
-    *,
-    as_of_date: date | str,
-    options: dict[str, Any] | None = None,
-    dry_run: bool = True,
-) -> dict[str, Any]:
-    """Record the day's review batch in the durable outbox. No live write.
-
-    Idempotent: one batch per day keyed by ``todoist_review_batch:<date>``. A
-    succeeded item is never re-queued; a dry-run or pending item is updated in
-    place when the payload changes.
-    """
-
-    ensure_app_schema(conn)
-    opts = {**DEFAULT_OPTIONS, **(options or {})}
-    as_of = _coerce_date(as_of_date)
-    batch = _build_batch(conn, as_of, opts)
-    idempotency_key = batch["idempotency_key"]
-    payload = {"parent_task": batch["parent_task"], "subtasks": batch["subtasks"]}
-    payload_json = json.dumps(payload, sort_keys=True)
-    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()[:16]
-    now = _now()
-
-    existing = conn.execute(
-        "SELECT status, payload_hash FROM action_outbox WHERE idempotency_key = ?", (idempotency_key,)
-    ).fetchone()
-
-    # A succeeded batch is skipped only when nothing changed. When the day's
-    # findings change, re-queue it: execute() then UPDATES the same task (the
-    # external_task_id is preserved) instead of leaving a stale board task.
-    if existing is not None and existing["status"] == "succeeded" and existing["payload_hash"] == payload_hash:
-        return {"idempotency_key": idempotency_key, "status": "succeeded", "action": "skipped_already_sent", "item_count": batch["item_count"]}
-
-    target_status = "dry_run" if dry_run else "pending"
-    if existing is None:
-        conn.execute(
-            """
-            INSERT INTO action_outbox (
-                id, idempotency_key, action_type, target_type, target_id,
-                payload_json, payload_hash, dry_run, status, attempts, item_count,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, 'review_batch', ?, ?, ?, ?, ?, 0, ?, ?, ?)
-            """,
-            (idempotency_key, idempotency_key, ACTION_TYPE, batch["batch_id"], payload_json,
-             payload_hash, 1 if dry_run else 0, target_status, batch["item_count"], now, now),
-        )
-        action = "created"
-    else:
-        conn.execute(
-            """
-            UPDATE action_outbox
-            SET payload_json = ?, payload_hash = ?, dry_run = ?, status = ?,
-                item_count = ?, updated_at = ?
-            WHERE idempotency_key = ?
-            """,
-            (payload_json, payload_hash, 1 if dry_run else 0, target_status, batch["item_count"], now, idempotency_key),
-        )
-        action = "updated" if existing["payload_hash"] != payload_hash else "unchanged"
-
-    return {
-        "idempotency_key": idempotency_key,
-        "status": target_status,
-        "action": action,
-        "dry_run": dry_run,
-        "item_count": batch["item_count"],
-        "payload_hash": payload_hash,
-    }
 
 
 def _write_request(token: str, path: str, body: dict[str, Any], *, timeout: int = 30) -> dict[str, Any]:
@@ -846,144 +754,6 @@ def list_action_outbox(
         }
         for r in rows
     ]
-
-
-# --- batch rendering -------------------------------------------------------
-
-
-def _build_batch(conn: sqlite3.Connection, as_of: date, opts: dict[str, Any]) -> dict[str, Any]:
-    min_rank = _SEVERITY_RANK.get(opts["min_severity"], 1)
-    drift = detect_drift(conn, as_of_date=as_of, persist=False)
-
-    subtasks: list[dict[str, Any]] = []
-
-    # Make a silently-stopped daily job visible. If the last successful daily run
-    # is stale, surface a HIGH-priority alert at the top of the batch so a stopped
-    # scheduler becomes visible the next time anything runs (not only when the
-    # daily job itself runs, which by definition it no longer does).
-    stale_finding = _stale_job_finding(conn, as_of)
-    if stale_finding is not None and _SEVERITY_RANK.get(stale_finding["severity"], 0) >= min_rank:
-        subtasks.append(
-            {
-                "finding_id": stale_finding["id"],
-                "finding_type": stale_finding["finding_type"],
-                "severity": stale_finding["severity"],
-                "content": stale_finding["message"],
-                "obligation_instance_id": None,
-                "cash_flow_impact": None,
-            }
-        )
-
-    for finding in drift["findings"]:
-        if _SEVERITY_RANK.get(finding["severity"], 0) < min_rank:
-            continue
-        if finding["finding_type"] == "unexpected_recurring" and not opts["include_recurring"]:
-            continue
-        subtasks.append(
-            {
-                "finding_id": finding["id"],
-                "finding_type": finding["finding_type"],
-                "severity": finding["severity"],
-                "content": _subtask_content(finding),
-                "obligation_instance_id": finding["obligation_instance_id"],
-                "cash_flow_impact": finding["cash_flow_impact"],
-            }
-        )
-
-    batch_id = f"finance-review-{as_of.isoformat()}"
-    return {
-        "batch_id": batch_id,
-        "as_of_date": as_of.isoformat(),
-        "idempotency_key": f"{ACTION_TYPE}:{as_of.isoformat()}",
-        "parent_task": {
-            "content": f"Finance review {as_of.isoformat()}",
-            "description": f"{len(subtasks)} item(s) need review. This task reflects the review workflow; it is not bank evidence.",
-        },
-        "subtasks": subtasks,
-        "item_count": len(subtasks),
-    }
-
-
-def _stale_job_finding(conn: sqlite3.Connection, as_of: date) -> dict[str, Any] | None:
-    """Synthesize a HIGH-severity finding when the daily job has gone stale.
-
-    Returns None when the daily job is healthy. Imported lazily because
-    ``background`` imports this module (the daily run enqueues the review batch),
-    so a top-level import would be circular.
-    """
-
-    from .background import get_job_health  # local import: avoids import cycle
-
-    health = get_job_health(conn, as_of_date=as_of.isoformat())
-    if not health["is_stale"]:
-        return None
-
-    hours = health["hours_since_last_run"]
-    threshold = health["stale_threshold_hours"]
-    if hours is None:
-        detail = (
-            f"no successful daily sync on record (threshold: {threshold}h) - "
-            "the job may never have run"
-        )
-    else:
-        detail = (
-            f"last completed {hours:.1f}h ago (threshold: {threshold}h) - "
-            "job may be stopped"
-        )
-    return {
-        "id": "drift:stale_daily_job",
-        "finding_type": "stale_daily_job",
-        "severity": "high",
-        "status": "active",
-        "message": (
-            f"Daily sync is stale: {detail}. Check cron/scheduler logs and "
-            "restart the daily runner."
-        ),
-        "recommended_action": "Check cron/scheduler logs; restart the daily runner",
-    }
-
-
-def _subtask_content(finding: dict[str, Any]) -> str:
-    ev = finding.get("evidence") or {}
-    ftype = finding["finding_type"]
-    if ftype == "missing_expected":
-        return (
-            f"Confirm payment: {ev.get('obligation_name')} expected "
-            f"${_money(ev.get('expected_amount'))} on {ev.get('due_date')} "
-            f"({ev.get('age_days')}d past due, no matching transaction found)."
-        )
-    if ftype == "stale_estimate":
-        return (
-            f"Refresh estimate: {ev.get('obligation_name')} ${_money(ev.get('current_estimate'))} "
-            f"estimate is past its review date ({ev.get('review_after')}); update from the portal/bill."
-        )
-    if ftype == "amount_changed":
-        return (
-            f"Review amount change: {ev.get('obligation_name')} expected "
-            f"${_money(ev.get('expected_amount'))}, charged ${_money(ev.get('observed_amount'))} "
-            f"({_pct(ev.get('pct_change'))})."
-        )
-    if ftype == "unexpected_recurring":
-        return (
-            f"Onboard charge: {ev.get('merchant')} recurs "
-            f"(~${_money(ev.get('estimated_monthly_impact'))}/mo) but is not modeled yet; "
-            f"review it in the onboarding queue."
-        )
-    return f"Review: {ftype} ({finding['severity']})."
-
-
-def _money(value: Any) -> str:
-    try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
-        return "?"
-
-
-def _pct(value: Any) -> str:
-    try:
-        return f"{float(value) * 100:.0f}%"
-    except (TypeError, ValueError):
-        return "?"
 
 
 def _coerce_date(value: date | str) -> date:

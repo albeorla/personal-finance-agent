@@ -1,8 +1,8 @@
 """Background runner + telemetry (BUILD_PLAN M3 + M6).
 
 A background run orchestrates the deterministic finance pipeline in one place -
-discover charges, reconcile transactions, detect drift, preview the review batch
-- and records an auditable run with an ordered event log. This is the proactive
+discover charges, reconcile transactions, detect drift, surface due items - and
+records an auditable run with an ordered event log. This is the proactive
 execution layer (it does not need an active chat session) and the per-operation
 telemetry answer: every step emits an event with its operation, result counts,
 timing, and any error.
@@ -29,8 +29,7 @@ from .reconciliation import reconcile_obligation_instances
 from .schema import ensure_app_schema
 from .surface_queue import build_surface_items
 from .sync_simplefin import sync_simplefin
-from .sync_todoist import sync_todoist
-from .todoist_outbox import enqueue_todoist_review_batch, surface_to_todoist
+from .todoist_outbox import surface_to_todoist
 
 
 DEFAULT_RUN_TYPE = "daily_sync"
@@ -53,9 +52,10 @@ def run_background_sync(
 ) -> dict[str, Any]:
     """Run the finance pipeline as one auditable background run.
 
-    Steps: scan charge candidates, reconcile transactions, detect drift, preview
-    the Todoist review batch (dry run). Each step is recorded as an event; a
-    failing step is logged and the run continues.
+    Steps: scan charge candidates, reconcile transactions, detect drift, suppress
+    dormant estimates, and surface the day's due items to Todoist (gated off by
+    default). Each step is recorded as an event; a failing step is logged and the
+    run continues.
     """
 
     ensure_app_schema(conn)
@@ -80,7 +80,6 @@ def run_background_sync(
     if opts.get("sync"):
         sync_steps = [
             ("sync_simplefin", lambda: _sync_simplefin_step(conn, opts)),
-            ("sync_todoist", lambda: _sync_todoist_step(conn, opts)),
         ]
 
     steps: list[tuple[str, Callable[[], dict[str, Any]]]] = [
@@ -94,8 +93,6 @@ def run_background_sync(
         ("suppress_dormant_estimates", lambda: _summarize_suppression(
             suppress_dormant_avg_estimates(
                 conn, as_of_date=as_of_date, options=opts.get("suppress_dormant")))),
-        ("preview_review_batch", lambda: enqueue_todoist_review_batch(
-            conn, as_of_date=as_of_date, options=opts.get("review"), dry_run=True)),
         ("surface_due_items", lambda: _summarize_surface(_surface_due_items_step(
             conn, as_of_date, opts))),
     ]
@@ -323,13 +320,6 @@ def _sync_simplefin_step(conn: sqlite3.Connection, opts: dict[str, Any]) -> dict
         return {"skipped": "no SIMPLEFIN_ACCESS_URL configured"}
     r = sync_simplefin(conn, env_path=opts.get("env_path"), incremental=True)
     return {k: r[k] for k in ("accounts", "inserted", "updated", "error") if k in r}
-
-
-def _sync_todoist_step(conn: sqlite3.Connection, opts: dict[str, Any]) -> dict[str, Any]:
-    if not get_finance_config(env_path=opts.get("env_path"))["has_todoist"]:
-        return {"skipped": "no TODOIST_API_TOKEN / project id configured"}
-    r = sync_todoist(conn, env_path=opts.get("env_path"))
-    return {k: r[k] for k in ("tasks_seen", "cashflow_tasks_seen", "inserted", "updated", "error") if k in r}
 
 
 def _summarize_scan(result: dict[str, Any]) -> dict[str, Any]:

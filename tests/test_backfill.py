@@ -81,35 +81,6 @@ def test_backfill_does_not_create_future_instances(tmp_path):
     assert future == 1
 
 
-def test_dedupe_cancels_todoist_duplicate_of_proper_recurring(tmp_path):
-    from financial_agent.backfill import dedupe_todoist_recurring_duplicates
-    conn = _db(tmp_path / "d.sqlite")
-    # a stale Todoist one-off + the proper recurring twin for the same subscription
-    apply_obligation_instances(conn,
-        obligation={"id": "todoist_oneoff_x", "name": "New York Times", "kind": "subscription", "status": "active", "source": "todoist"},
-        instances=[{"id": "todoist_oneoff_x:2026-06-23", "due_date": "2026-06-23", "amount": 28.62, "direction": "outflow", "source": "todoist"}])
-    apply_obligation_instances(conn,
-        obligation={"id": "nyt_sub", "name": "New York Times subscription", "kind": "subscription", "cadence": "monthly", "status": "active", "source": "obligations_yaml_manual"},
-        instances=[{"id": "nyt_sub:2026-07-23", "due_date": "2026-07-23", "amount": 30.30, "direction": "outflow", "source": "seed"}])
-    res = dedupe_todoist_recurring_duplicates(conn, as_of_date="2026-06-21")
-    assert res["count"] == 1 and res["deduped"][0]["duplicate_of"] == "New York Times subscription"
-    # the duplicate's future instance is canceled; the proper one survives
-    assert conn.execute("SELECT status FROM obligation_instances WHERE id='todoist_oneoff_x:2026-06-23'").fetchone()[0] == "canceled"
-    assert conn.execute("SELECT status FROM obligation_instances WHERE id='nyt_sub:2026-07-23'").fetchone()[0] == "expected"
-
-
-def test_dedupe_leaves_non_duplicates_alone(tmp_path):
-    from financial_agent.backfill import dedupe_todoist_recurring_duplicates
-    conn = _db(tmp_path / "d.sqlite")
-    # a Todoist obligation with NO proper twin must not be touched
-    apply_obligation_instances(conn,
-        obligation={"id": "todoist_oneoff_sp", "name": "Spotify charge", "kind": "subscription", "status": "active", "source": "todoist"},
-        instances=[{"id": "todoist_oneoff_sp:2026-06-26", "due_date": "2026-06-26", "amount": 13.46, "direction": "outflow", "source": "todoist"}])
-    res = dedupe_todoist_recurring_duplicates(conn, as_of_date="2026-06-21")
-    assert res["count"] == 0
-    assert conn.execute("SELECT status FROM obligation_instances WHERE id='todoist_oneoff_sp:2026-06-26'").fetchone()[0] == "expected"
-
-
 def test_backfill_skips_inflows(tmp_path):
     # income/reimbursements must never be backfilled (they'd read as bogus "missing"/"owe")
     conn = _db(tmp_path / "b.sqlite")

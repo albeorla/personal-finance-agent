@@ -197,7 +197,6 @@ def test_status_surfaces_drift_and_recurring(tmp_path):
     )
     conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('ACT-chk',5000,5000,'2026-06-20T00:00:00+00:00','simplefin')")
     conn.execute("CREATE TABLE sync_runs (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT, accounts_seen INT, transactions_inserted INT, transactions_updated INT, error TEXT)")
-    conn.execute("CREATE TABLE todoist_sync_runs (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, project_id TEXT, sections_seen INT, tasks_seen INT, cashflow_tasks_seen INT, inserted INT, updated INT, missing_marked_deleted INT, error TEXT)")
     _ob(conn, "rent", "Rent check", "housing",
         [{"id": "rent:2026-06-01", "due_date": "2026-06-01", "amount": -3000.0, "source": "seed"}])
     scan_charge_onboarding_candidates(conn)

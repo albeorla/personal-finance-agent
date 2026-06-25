@@ -1,10 +1,10 @@
 """Live-data validation harness (cutover slice O).
 
 Proves the pipeline is correct on real data and supports the parallel-run: copy
-the canonical snapshot to a throwaway working DB, pull live SimpleFIN + Todoist
-into the COPY (never the committed snapshot or the legacy source), then run the
-whole read pipeline (onboarding scan, reconciliation, drift, guardrails) and
-return a structured report with integrity checks.
+the canonical snapshot to a throwaway working DB, pull live SimpleFIN into the
+COPY (never the committed snapshot or the legacy source), then run the whole read
+pipeline (onboarding scan, reconciliation, drift, guardrails) and return a
+structured report with integrity checks.
 
 ``build_validation_report`` is the pure, network-free core (testable on any DB).
 ``run_live_validation`` adds the copy + live sync around it.
@@ -29,7 +29,6 @@ from .reconciliation import (
 )
 from .status import default_db_path
 from .sync_simplefin import sync_simplefin
-from .sync_todoist import sync_todoist
 
 
 def build_validation_report(
@@ -101,10 +100,6 @@ def run_live_validation(
                 synced["simplefin"] = _safe_counts(sync_simplefin(conn, incremental=True, env_path=env_path))
             else:
                 synced["simplefin"] = {"skipped": "no SIMPLEFIN_ACCESS_URL"}
-            if cfg["has_todoist"]:
-                synced["todoist"] = _safe_counts(sync_todoist(conn, env_path=env_path))
-            else:
-                synced["todoist"] = {"skipped": "no TODOIST_API_TOKEN / project id"}
             conn.commit()
         report = build_validation_report(conn, as_of_date=as_of_date)
     finally:
