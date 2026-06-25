@@ -58,7 +58,8 @@ def _db(path):
 
 _EXPECTED_SEQUENCE = [
     "run_started", "scan_charge_candidates", "reconcile", "detect_drift",
-    "suppress_dormant_estimates", "surface_due_items",
+    "suppress_dormant_estimates", "suppress_contradicted_estimates",
+    "surface_due_items",
     "run_finished",
 ]
 
@@ -72,11 +73,14 @@ def test_run_background_sync_records_run_and_ordered_events(tmp_path):
     assert result["run_id"].startswith("run_")
     assert result["trace_id"].startswith("trace_")
     assert result["duration_ms"] >= 0
-    # Every pipeline step ran and produced a summary.
+    # Every pipeline step ran and produced a summary. Contradiction suppression
+    # is active by default (enforce mode) and appears in the standard pipeline.
     assert set(result["result_summary"]) == {
         "scan_charge_candidates", "reconcile", "detect_drift",
-        "suppress_dormant_estimates", "surface_due_items",
+        "suppress_dormant_estimates", "suppress_contradicted_estimates",
+        "surface_due_items",
     }
+    assert result["result_summary"]["suppress_contradicted_estimates"]["mode"] == "enforce"
     assert result["result_summary"]["scan_charge_candidates"]["created"] == 1
     # With Todoist write-back gated off (the default), surfacing makes no live
     # call and reports awaiting-integration.
@@ -98,6 +102,71 @@ def test_event_sequence_is_deterministic_across_runs(tmp_path):
     assert seq1 == seq2 == _EXPECTED_SEQUENCE
     # Idempotent pipeline: the second scan creates nothing new.
     assert second["result_summary"]["scan_charge_candidates"]["created"] == 0
+
+
+def _add_whole_foods(conn):
+    """Add a card account with regular-but-variable grocery spend.
+
+    This is the classifier's PARK case: monthly cadence with a swinging ticket.
+    Under the active (enforce) default the scan pulls it out of the active walk.
+    """
+
+    conn.execute(
+        "INSERT INTO accounts (id,name,org,kind,currency) VALUES "
+        "('ACT-amex','Platinum Card (5000)','American Express','','USD')"
+    )
+    conn.executemany(
+        "INSERT INTO transactions (id,account_id,posted,amount,payee,description,pending,source) "
+        "VALUES (?,?,?,?,?,?,0,'simplefin')",
+        [
+            ("wf-1", "ACT-amex", "2026-01-05T08:00:00", -12.00, "Whole Foods", "WHOLE FOODS"),
+            ("wf-2", "ACT-amex", "2026-02-05T08:00:00", -45.00, "Whole Foods", "WHOLE FOODS"),
+            ("wf-3", "ACT-amex", "2026-03-05T08:00:00", -130.00, "Whole Foods", "WHOLE FOODS"),
+            ("wf-4", "ACT-amex", "2026-04-05T08:00:00", -277.00, "Whole Foods", "WHOLE FOODS"),
+        ],
+    )
+    conn.commit()
+
+
+def test_scan_auto_triages_in_enforce_mode_by_default(tmp_path):
+    """The daily pipeline turns the classifier on: a PARK candidate is pulled out
+    of the active walk with no options passed."""
+    conn = _db(tmp_path / "b.sqlite")
+    _add_whole_foods(conn)
+
+    run_background_sync(conn, as_of_date="2026-06-30")
+
+    status = conn.execute(
+        "SELECT status FROM charge_onboarding_candidates WHERE merchant_key='whole_foods'"
+    ).fetchone()["status"]
+    assert status == "parked"
+
+
+def test_safe_option_still_disables_active_steps(tmp_path):
+    """Escape hatch: shadow scan + contradiction disabled returns the pipeline to
+    its inert posture -- the off switch still works, only the default changed."""
+    conn = _db(tmp_path / "b.sqlite")
+    _add_whole_foods(conn)
+
+    result = run_background_sync(
+        conn,
+        as_of_date="2026-06-30",
+        options={
+            "scan": {"auto_triage": {"mode": "shadow"}},
+            "contradiction": {"enabled": False},
+        },
+    )
+
+    # Contradiction step is skipped entirely when explicitly disabled.
+    assert "suppress_contradicted_estimates" not in result["result_summary"]
+    run = get_background_run(conn, result["run_id"])
+    assert "suppress_contradicted_estimates" not in [e["event_type"] for e in run["events"]]
+
+    # Shadow scan stamps a disposition but does not move the candidate.
+    status = conn.execute(
+        "SELECT status FROM charge_onboarding_candidates WHERE merchant_key='whole_foods'"
+    ).fetchone()["status"]
+    assert status == "proposed"
 
 
 def test_list_background_runs(tmp_path):
@@ -139,7 +208,7 @@ def test_get_background_run_unknown_returns_none(tmp_path):
 _EXPECTED_WITH_SYNC = [
     "run_started", "sync_simplefin", "scan_charge_candidates",
     "reconcile", "detect_drift", "suppress_dormant_estimates",
-    "surface_due_items", "run_finished",
+    "suppress_contradicted_estimates", "surface_due_items", "run_finished",
 ]
 
 
