@@ -78,6 +78,8 @@ from .todoist_outbox import (
     list_action_outbox as list_action_outbox_for_db,
     reconcile_emission as reconcile_emission_for_db,
     reconcile_todoist_completions as reconcile_todoist_completions_for_db,
+    reconcile_todoist_project_for_db,
+    request_emission_retire_prefix,
     surface_to_todoist as surface_to_todoist_for_db,
 )
 from .status import default_db_path
@@ -795,6 +797,23 @@ def record_charge_onboarding_decision(
     conn.row_factory = sqlite3.Row
     try:
         result = record_charge_onboarding_decision_for_db(conn, candidate_id, decision)
+        # Auto-cleanup hook (spec section 2): when a candidate is rejected or
+        # deferred, the surfaced cash-flow reminders for its linked obligation are
+        # no longer wanted - flag every due-date instance for removal on the next
+        # live surface run. When it is accepted or un-decided (reset), clear any
+        # earlier tombstone so a re-surfaced item is not immediately retired again.
+        existing_obligation_id = result.get("existing_obligation_id")
+        if existing_obligation_id:
+            status = result.get("status")
+            prefix = f"obligation-due:{existing_obligation_id}:"
+            if status in ("rejected", "deferred"):
+                request_emission_retire_prefix(conn, prefix)
+            elif status in ("proposed", "accepted"):
+                conn.execute(
+                    "UPDATE todoist_emissions SET retire_requested_at = NULL "
+                    "WHERE surface_key LIKE ? || '%' AND status = 'open'",
+                    (prefix,),
+                )
         conn.commit()
         return result
     finally:
@@ -1233,6 +1252,47 @@ def reconcile_todoist_completions(
     conn.row_factory = sqlite3.Row
     try:
         result = reconcile_todoist_completions_for_db(conn, as_of_date=as_of_date)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def reconcile_todoist_project(
+    as_of_date: str,
+    apply: bool = False,
+    db_path: str | None = None,
+) -> dict:
+    """LIST the whole Finance project, classify every task, and clean up drift.
+
+    Closes the root gap that lets the Finance project drift (tasks were created
+    but never retired, and there was no server-side LIST). This pages through every
+    task in the project and classifies each as
+    managed, stale_applied (a legacy "Onboard charge:" task), duplicate,
+    fa_auto_orphan, or kept. A task is deletable ONLY if it matches one of three
+    explicit rules - a fa-auto-labelled task we lost track of, a legacy onboarding
+    task whose candidate is already decided, or a duplicate copy of a managed/
+    fa-auto survivor. Everything else (ritual reminders, hand-made tasks) is kept
+    and never deleted.
+
+    ``apply`` defaults to false (dry-run): the report shows what WOULD be deleted
+    with no external call. Apply (real deletes + ledger retire) requires live
+    write-back (TODOIST_WRITE_ENABLED + token + project); with the gate off it
+    returns the report with applied=false and reason "awaiting-integration" and
+    mutates nothing. A truncated or failed LIST forces report-only (zero deletes,
+    zero ledger resolutions) because duplicate and ledger-orphan inference are
+    unsound on a partial view. Idempotent: a second run over a cleaned project
+    finds nothing to delete.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = reconcile_todoist_project_for_db(conn, as_of_date=as_of_date, apply=apply)
         conn.commit()
         return result
     finally:

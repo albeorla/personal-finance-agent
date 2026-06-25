@@ -68,7 +68,10 @@ def _enabled(conn, items, spy):
 def test_ledger_table_and_columns_exist(tmp_path):
     conn = _db(tmp_path / "f.db")
     cols = {r[1] for r in conn.execute("PRAGMA table_info(todoist_emissions)").fetchall()}
-    assert cols == {"surface_key", "todoist_task_id", "status", "content_hash", "created_at", "last_seen"}
+    assert cols == {
+        "surface_key", "todoist_task_id", "status", "content_hash", "created_at",
+        "last_seen", "retire_requested_at",
+    }
     # surface_key is the primary key.
     pk = [r[1] for r in conn.execute("PRAGMA table_info(todoist_emissions)").fetchall() if r[5]]
     assert pk == ["surface_key"]
