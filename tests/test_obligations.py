@@ -8,6 +8,7 @@ from financial_agent.obligations import (
     list_obligation_review_candidates,
     list_obligations,
     list_statement_input_estimates,
+    suppress_contradicted_estimates,
     suppress_dormant_avg_estimates,
 )
 from financial_agent.schema import ensure_app_schema
@@ -1149,4 +1150,258 @@ def test_suppress_dormant_noop_without_source_tables(tmp_path):
     conn = _db(tmp_path / "obligations.sqlite")
     result = suppress_dormant_avg_estimates(conn, as_of_date="2026-06-24")
     assert result["suppressed_count"] == 0
+    assert result["evaluated"] == 0
+
+
+# --- #5 stale estimate contradicted by observed burn -----------------------
+#
+# Data caveat #2: a card carried a large averaged estimate (~$1,162/mo) from old
+# history, but the card has gone quiet -- real merchant burn collapsed to a small
+# figure. The estimate keeps projecting full size and overstates the trough. The
+# merchant_key the burn is matched on is the candidate id (see ``_seed_candidate``),
+# so transactions must use a payee that slugifies to that same key.
+
+CONTRADICTED_MERCHANT = "chase_amazon_visa"
+CONTRADICTED_PAYEE = "Chase Amazon Visa"  # normalize_merchant_key(...) == CONTRADICTED_MERCHANT
+
+
+def _seed_burn_txn(conn, txn_id, account_id, posted, amount, payee=CONTRADICTED_PAYEE):
+    conn.execute(
+        "INSERT INTO transactions (id, account_id, posted, amount, payee, description) "
+        "VALUES (?, ?, ?, ?, ?, 'card spend')",
+        (txn_id, account_id, posted, amount, payee),
+    )
+
+
+def _seed_stale_estimate(conn, *, amount=-1162.0, estimation_method="average"):
+    """An onboarded avg-estimate obligation whose modeled figure may be stale."""
+    return _seed_avg_estimate_obligation(
+        conn,
+        obligation_id="onboarded_chase_amazon_visa",
+        candidate_id=CONTRADICTED_MERCHANT,
+        account_ids=("chase_amazon",),
+        estimation_method=estimation_method,
+    ), amount
+
+
+def _seed_low_burn(conn, account_id="chase_amazon", each=-40.0):
+    """~$40/mo on the merchant across the two most recent 30-day sub-windows."""
+    _seed_burn_txn(conn, "burn-1", account_id, "2026-04-10T00:00:00", each)
+    _seed_burn_txn(conn, "burn-2", account_id, "2026-05-12T00:00:00", each)
+    _seed_burn_txn(conn, "burn-3", account_id, "2026-06-14T00:00:00", each)
+
+
+def test_contradiction_report_mode_emits_finding_without_mutating(tmp_path):
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    _seed_low_burn(conn)
+    obligation_id, _ = _seed_stale_estimate(conn)
+    instance_id = f"{obligation_id}:2026-07-10"
+
+    before = conn.execute(
+        "SELECT amount, amount_source FROM obligation_instances WHERE id = ?", (instance_id,)
+    ).fetchone()
+    assert before["amount"] == 1162.0
+
+    result = suppress_contradicted_estimates(
+        conn, as_of_date="2026-06-25", options={"mode": "report"}
+    )
+
+    assert result["mode"] == "report"
+    assert result["contradicted_count"] == 1
+    hit = result["contradicted"][0]
+    assert hit["obligation_id"] == obligation_id
+    assert hit["resolution"] == "rewrite"
+    assert hit["modeled_monthly"] == 1162.0
+    assert hit["observed_monthly"] == 40.0
+    assert hit["applied"] is False
+
+    # Report mode mutates nothing: the instance amount is untouched.
+    after = conn.execute(
+        "SELECT amount, amount_source FROM obligation_instances WHERE id = ?", (instance_id,)
+    ).fetchone()
+    assert after["amount"] == 1162.0
+    assert after["amount_source"] != "estimate_contradicted"
+    assert conn.execute(
+        "SELECT status FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()["status"] == "active"
+
+    # ...but the drift finding is emitted so the gap is visible, never silent.
+    finding = conn.execute(
+        "SELECT severity, status, evidence_json FROM drift_findings "
+        "WHERE obligation_id = ? AND finding_type = 'auto_contradicted_estimate'",
+        (obligation_id,),
+    ).fetchone()
+    assert finding is not None
+    assert finding["severity"] == "low"
+    assert finding["status"] == "active"
+    evidence = json.loads(finding["evidence_json"])
+    assert evidence["modeled_monthly"] == 1162.0
+    assert evidence["observed_monthly"] == 40.0
+    assert evidence["previous_amounts"][instance_id] == 1162.0
+
+
+def test_contradiction_enforce_rewrites_to_observed_and_keeps_active(tmp_path):
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    _seed_low_burn(conn)
+    obligation_id, _ = _seed_stale_estimate(conn)
+    instance_id = f"{obligation_id}:2026-07-10"
+
+    result = suppress_contradicted_estimates(
+        conn, as_of_date="2026-06-25", options={"mode": "enforce"}
+    )
+    assert result["contradicted_count"] == 1
+    assert result["contradicted"][0]["applied"] is True
+    assert result["contradicted"][0]["rewritten_amount"] == 40.0
+
+    # Enforce lowers the modeled amount to the real burn but keeps the obligation
+    # projectable (status stays active) -- corrected, not dropped off the runway.
+    row = conn.execute(
+        "SELECT amount, amount_status, amount_source FROM obligation_instances WHERE id = ?",
+        (instance_id,),
+    ).fetchone()
+    assert row["amount"] == 40.0
+    assert row["amount_source"] == "estimate_contradicted"
+    assert row["amount_status"] == "estimated"
+    assert conn.execute(
+        "SELECT status FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()["status"] == "active"
+
+
+def test_contradiction_rewrite_is_reversible(tmp_path):
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    _seed_low_burn(conn)
+    obligation_id, _ = _seed_stale_estimate(conn)
+    instance_id = f"{obligation_id}:2026-07-10"
+
+    suppress_contradicted_estimates(conn, as_of_date="2026-06-25", options={"mode": "enforce"})
+    assert conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = ?", (instance_id,)
+    ).fetchone()["amount"] == 40.0
+
+    # The pre-rewrite amount is preserved in the finding evidence, so a human can
+    # restore it exactly. Restoring re-projects the obligation at the old figure.
+    evidence = json.loads(
+        conn.execute(
+            "SELECT evidence_json FROM drift_findings "
+            "WHERE obligation_id = ? AND finding_type = 'auto_contradicted_estimate'",
+            (obligation_id,),
+        ).fetchone()["evidence_json"]
+    )
+    previous = evidence["previous_amounts"][instance_id]
+    assert previous == 1162.0
+
+    conn.execute(
+        "UPDATE obligation_instances SET amount = ?, amount_source = 'average' WHERE id = ?",
+        (previous, instance_id),
+    )
+    accounts = [
+        {
+            "account_id": "checking-1",
+            "account_name": "Checking 4321",
+            "kind": "checking",
+            "available": 10000.0,
+            "recorded_at": "2026-06-24T00:00:00+00:00",
+        }
+    ]
+    projections, _ = build_cash_flow_projections(
+        conn, accounts=accounts, windows=[31], start_date=date(2026, 7, 1)
+    )
+    restored = next(e for e in projections[0]["events"] if e["obligation_id"] == obligation_id)
+    assert restored["amount"] == 1162.0
+
+
+def test_contradiction_leaves_a_consistent_estimate_alone(tmp_path):
+    # Modeled $200/mo and the merchant really runs ~$200/mo. Above the $150 floor
+    # but consistent, so it must NOT fire.
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    _seed_burn_txn(conn, "b1", "chase_amazon", "2026-04-10T00:00:00", -200.0)
+    _seed_burn_txn(conn, "b2", "chase_amazon", "2026-05-12T00:00:00", -200.0)
+    _seed_burn_txn(conn, "b3", "chase_amazon", "2026-06-14T00:00:00", -200.0)
+    obligation_id, _ = _seed_stale_estimate(conn, amount=-200.0)
+    conn.execute(
+        "UPDATE obligation_instances SET amount = 200.0 WHERE obligation_id = ?", (obligation_id,)
+    )
+
+    result = suppress_contradicted_estimates(
+        conn, as_of_date="2026-06-25", options={"mode": "enforce"}
+    )
+    assert result["contradicted_count"] == 0
+    row = conn.execute(
+        "SELECT amount, amount_source FROM obligation_instances WHERE obligation_id = ?",
+        (obligation_id,),
+    ).fetchone()
+    assert row["amount"] == 200.0
+    assert row["amount_source"] != "estimate_contradicted"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM drift_findings WHERE obligation_id = ? "
+        "AND finding_type = 'auto_contradicted_estimate'",
+        (obligation_id,),
+    ).fetchone()[0] == 0
+
+
+def test_contradiction_near_zero_burn_routes_to_dormant(tmp_path):
+    # Burn has effectively died (~$0.67/mo) but the card still has activity, so
+    # this is the "dead without a clean $0" case -> dormant, not a rewrite.
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    _seed_burn_txn(conn, "tiny-1", "chase_amazon", "2026-06-10T00:00:00", -2.0)
+    obligation_id, _ = _seed_stale_estimate(conn)
+
+    result = suppress_contradicted_estimates(
+        conn, as_of_date="2026-06-25", options={"mode": "enforce"}
+    )
+    assert result["contradicted_count"] == 1
+    assert result["contradicted"][0]["resolution"] == "dormant"
+    assert conn.execute(
+        "SELECT status FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()["status"] == "dormant_suppressed"
+
+
+def test_contradiction_never_suppresses_on_missing_data(tmp_path):
+    # Apple Card shape: balance-only account with NO transactions. Burn cannot be
+    # observed, so the estimate is left fully intact (never suppress on no data).
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    obligation_id, _ = _seed_stale_estimate(conn)
+    instance_id = f"{obligation_id}:2026-07-10"
+
+    result = suppress_contradicted_estimates(
+        conn, as_of_date="2026-06-25", options={"mode": "enforce"}
+    )
+    assert result["contradicted_count"] == 0
+    assert any(s["reason"] == "insufficient_evidence" for s in result["skipped"])
+    assert conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = ?", (instance_id,)
+    ).fetchone()["amount"] == 1162.0
+    assert conn.execute(
+        "SELECT status FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()["status"] == "active"
+
+
+def test_contradiction_skips_seasonal_estimates(tmp_path):
+    # Seasonal estimators carry their own peak-month ramp, so low summer burn is
+    # not evidence the estimate is stale -- they opt out of the contradiction test.
+    conn = _db_with_source(tmp_path / "obligations.sqlite")
+    _seed_account(conn)
+    _seed_low_burn(conn)
+    obligation_id, _ = _seed_stale_estimate(conn, estimation_method="seasonal_card_spend")
+
+    result = suppress_contradicted_estimates(
+        conn, as_of_date="2026-06-25", options={"mode": "enforce"}
+    )
+    assert result["contradicted_count"] == 0
+    assert conn.execute(
+        "SELECT amount FROM obligation_instances WHERE obligation_id = ?", (obligation_id,)
+    ).fetchone()["amount"] == 1162.0
+
+
+def test_contradiction_noop_without_source_tables(tmp_path):
+    # App schema only (no transactions table): burn is unobservable -> no-op.
+    conn = _db(tmp_path / "obligations.sqlite")
+    result = suppress_contradicted_estimates(conn, as_of_date="2026-06-25")
+    assert result["contradicted_count"] == 0
     assert result["evaluated"] == 0

@@ -24,7 +24,7 @@ from typing import Any, Callable
 from . import build_info
 from .config import get_finance_config
 from .drift import detect_drift
-from .obligations import suppress_dormant_avg_estimates
+from .obligations import suppress_contradicted_estimates, suppress_dormant_avg_estimates
 from .onboarding import scan_charge_onboarding_candidates
 from .reconciliation import reconcile_obligation_instances
 from .schema import ensure_app_schema
@@ -83,6 +83,17 @@ def run_background_sync(
             ("sync_simplefin", lambda: _sync_simplefin_step(conn, opts)),
         ]
 
+    # Contradiction suppression is opt-in (default OFF) so the standard pipeline
+    # event sequence stays deterministic; it runs right after dormancy (which
+    # claims the clean-zero case first) when ``options["contradiction"]["enabled"]``.
+    contradiction_steps: list[tuple[str, Callable[[], dict[str, Any]]]] = []
+    if (opts.get("contradiction") or {}).get("enabled"):
+        contradiction_steps = [
+            ("suppress_contradicted_estimates", lambda: _summarize_contradiction(
+                suppress_contradicted_estimates(
+                    conn, as_of_date=as_of_date, options=opts.get("contradiction")))),
+        ]
+
     steps: list[tuple[str, Callable[[], dict[str, Any]]]] = [
         *sync_steps,
         ("scan_charge_candidates", lambda: _summarize_scan(
@@ -94,6 +105,7 @@ def run_background_sync(
         ("suppress_dormant_estimates", lambda: _summarize_suppression(
             suppress_dormant_avg_estimates(
                 conn, as_of_date=as_of_date, options=opts.get("suppress_dormant")))),
+        *contradiction_steps,
         ("surface_due_items", lambda: _summarize_surface(_surface_due_items_step(
             conn, as_of_date, opts))),
     ]
@@ -370,6 +382,15 @@ def _summarize_suppression(result: dict[str, Any]) -> dict[str, Any]:
         "evaluated": result.get("evaluated"),
         "suppressed_count": result.get("suppressed_count"),
         "suppressed": result.get("suppressed"),
+    }
+
+
+def _summarize_contradiction(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mode": result.get("mode"),
+        "evaluated": result.get("evaluated"),
+        "contradicted_count": result.get("contradicted_count"),
+        "contradicted": result.get("contradicted"),
     }
 
 
