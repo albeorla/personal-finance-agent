@@ -331,6 +331,8 @@ transient list gap must never be read as "user deleted it." Never use
       "content": "Onboard charge: Acme not modeled",
       "surface_key": null,
       "has_fa_auto": false,
+      "due_date": "2026-06-26",
+      "description": "[fa:onboarding-digest]",
       "classification": "stale_applied",
       "candidate_id": "cand_abc",
       "candidate_status": "applied",

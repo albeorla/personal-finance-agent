@@ -259,3 +259,43 @@ def test_no_token_returns_awaiting_integration_with_zero_actions(tmp_path):
         "skipped_not_live": 0,
         "failed": 0,
     }
+
+
+# --- new fields: due_date + description -------------------------------------
+
+
+def test_tasks_expose_due_date_and_description(tmp_path):
+    """Every ``tasks[]`` entry carries the task's ``due_date`` (the Todoist
+    ``due.date`` string, or None when the task has no due) and its raw
+    ``description`` (or "" when blank). A LIST task with a due date and a body and
+    a second task with due=null and an empty body must both round-trip correctly."""
+
+    conn = _db(tmp_path / "f.db")
+
+    due_task = _task("DUE", "Pay rent", description="Send to landlord by ACH")
+    due_task["due"] = {"date": "2026-07-23"}
+
+    no_due_task = _task("NODUE", "Call the plumber", description="")
+    no_due_task["due"] = None
+
+    report = list_todoist_project_for_db(
+        conn,
+        as_of_date=AS_OF,
+        write_enabled=False,
+        token="tok",
+        project_id="proj",
+        list_func=_single_page([due_task, no_due_task]),
+    )
+
+    by_id = {t["task_id"]: t for t in report["tasks"]}
+
+    # Every entry exposes both fields.
+    for entry in report["tasks"]:
+        assert "due_date" in entry
+        assert "description" in entry
+
+    assert by_id["DUE"]["due_date"] == "2026-07-23"
+    assert by_id["DUE"]["description"] == "Send to landlord by ACH"
+
+    assert by_id["NODUE"]["due_date"] is None
+    assert by_id["NODUE"]["description"] == ""

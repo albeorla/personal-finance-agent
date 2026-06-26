@@ -141,7 +141,7 @@ The server registers 69 MCP tools. They group by area as follows. (Names are exa
 **Todoist output and the action outbox** (writes gated OFF by default; Todoist is output-only)
 - `surface_due_items_to_todoist` — idempotent push via the emissions ledger.
 - `reconcile_todoist_emission`, `reconcile_todoist_completions` — adopt pre-existing tasks; absorb user completions of tasks we pushed.
-- `reconcile_todoist_project` — server-side LIST + classify of the whole Finance project, cleaning drift via a safe three-rule deletion model (ritual/manual tasks are never deleted). `list_todoist_project` — the read-only counterpart (LIST + classify, no delete path), so the agent's board read goes through the server, never raw HTTP.
+- `reconcile_todoist_project` — server-side LIST + classify of the whole Finance project, cleaning drift via a safe three-rule deletion model (ritual/manual tasks are never deleted). `list_todoist_project` — the read-only counterpart (LIST + classify, no delete path), so the agent's board read goes through the server, never raw HTTP. Each task entry includes its `due_date` and `description`, so a due-date audit can run through the MCP without touching the raw Todoist API.
 - `create_todoist_task`, `execute_action_outbox`, `list_action_outbox` — create a one-off reminder and process the durable outbox; nothing is sent externally unless write-back is explicitly enabled.
 
 **Background runner and job health**
