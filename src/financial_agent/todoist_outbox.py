@@ -828,6 +828,12 @@ def reconcile_todoist_project_for_db(
     reminders and every hand-made task, which carry no marker and no fa-auto
     label).
 
+    Each entry in the returned ``tasks`` list carries the task's
+    ``task_id``, ``content``, ``surface_key``, ``has_fa_auto``,
+    ``classification``, ``action``, ``reason``, plus ``due_date`` (the task's
+    due date string, or None when the task has no due date) and ``description``
+    (the raw Todoist description, "" when empty).
+
     Gating mirrors ``surface_to_todoist``: the dry-run report needs only
     token+project (reads are allowed with write-back off); apply (delete/resolve)
     requires ``live`` = write_enabled AND token AND project. A truncated or
@@ -937,6 +943,8 @@ def reconcile_todoist_project_for_db(
             "content": content,
             "surface_key": sk,
             "has_fa_auto": has_fa_auto,
+            "due_date": (t.get("due") or {}).get("date"),
+            "description": description,
         }
         order.append(tid)
         dup_key = sk if sk else f"hash:{chash}"
@@ -979,6 +987,8 @@ def reconcile_todoist_project_for_db(
             "content": content,
             "surface_key": sk,
             "has_fa_auto": has_fa_auto,
+            "due_date": a["due_date"],
+            "description": a["description"],
         }
 
         # 1. managed
