@@ -6,7 +6,7 @@ Durable Mermaid diagrams for the local finance MCP server. These diagrams descri
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 69 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 71 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"read-only sync"| Server
     Portals["Bank/card portals<br/>manual balances and one-off facts"] -->|"manual inputs"| Server
@@ -46,6 +46,7 @@ flowchart LR
         Drift["detect_drift<br/>flag stale estimates, missing payments, amount changes"]
         Guardrails["evaluate_guardrails<br/>cash floor, drift threshold, debt order"]
         Projection["get_finance_status / get_daily_digest<br/>project cash flow from obligation_instances"]
+        Verify["run_verification<br/>prove source rows tie together, persist findings"]
     end
 
     subgraph Surface["3. SURFACE"]
@@ -78,6 +79,7 @@ sequenceDiagram
     MCP->>DB: Scan charge candidates
     MCP->>DB: Reconcile obligation_instances to transactions
     MCP->>DB: Detect drift and evaluate guardrails
+    MCP->>DB: Verify row-tie identities and persist findings
     MCP-->>Agent: Run summary and trace_id
 
     Agent->>MCP: get_daily_digest(as_of_date)
@@ -426,6 +428,7 @@ flowchart TB
         Reconcile["Transaction reconciliation<br/>creates/updates transaction_obligation_matches<br/>creates/updates unmatched_obligations<br/>can update instance status to needs_review or paid<br/>(reconcile_obligation_instances, confirm_reconciliation_match)"]
         Drift["Drift detection<br/>creates/updates active drift_findings<br/>marks disappeared findings resolved<br/>(detect_drift persist=true)"]
         Guardrails["Guardrail evaluation<br/>creates guardrail_rules if missing<br/>optionally inserts guardrail_evaluations<br/>(evaluate_guardrails persist=true)"]
+        Verify["Row-tie verification<br/>runs four deterministic checks that prove source rows agree<br/>inserts verification_findings when persist=true<br/>(run_verification)"]
     end
 
     subgraph SurfaceAndTelemetry["5. Surfacing and run telemetry"]
@@ -452,6 +455,7 @@ flowchart TB
     Background -. wraps daily steps .-> Scan
     Background -. wraps daily steps .-> Reconcile
     Background -. wraps daily steps .-> Drift
+    Background -. wraps daily steps .-> Verify
     Background -. wraps daily steps .-> Queue
     Background -. wraps daily steps .-> Todoist
 
@@ -468,7 +472,7 @@ flowchart TB
     Reconcile --> Drift --> Guardrails
     Reconcile --> Queue
     Drift --> Queue
-    Guardrails --> Queue
+    Guardrails --> Verify --> Queue
     GoalsDebtsFollowups --> Queue
     Queue --> Todoist
 
@@ -480,7 +484,7 @@ flowchart TB
     class Sync,ManualBalance,CardPaste,Calendar ingest
     class Obligations,Income,IncomeInstances,Statements,GoalsDebtsFollowups model
     class Scan,Decide,Apply review
-    class Reconcile,Drift,Guardrails risk
+    class Reconcile,Drift,Guardrails,Verify risk
     class Queue,Todoist,Outbox,Background,Schema surface
 ```
 

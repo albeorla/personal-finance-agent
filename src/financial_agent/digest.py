@@ -155,7 +155,33 @@ def build_daily_digest(
         longest_projection=longest,
     )
     digest["status_color"] = _status_color(digest)
+    # Deterministic self-checks: does the model tie out internally? Read-only
+    # here (persist=False), so the digest reports the live consistency state
+    # without writing findings. The grounding gate proves each number traces to
+    # a row; this proves the rows add up. A compact summary plus any open
+    # findings so a broken identity is visible alongside the numbers it affects.
+    digest["verification"] = _verification_block(resolved_db_path, as_of)
     return digest
+
+
+def _verification_block(db_path: str, as_of_date: str) -> dict[str, Any]:
+    import sqlite3
+
+    from .verification import run_verification
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = run_verification(conn, as_of_date=as_of_date, persist=False)
+    finally:
+        conn.close()
+    return {
+        "ok": result["ok"],
+        "checks_total": result["checks_total"],
+        "findings_total": result["findings_total"],
+        "by_severity": result["by_severity"],
+        "findings": result["findings"],
+    }
 
 
 def render_digest_markdown(digest: dict[str, Any]) -> str:

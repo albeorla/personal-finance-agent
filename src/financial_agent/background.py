@@ -31,6 +31,7 @@ from .schema import ensure_app_schema
 from .surface_queue import build_surface_items, build_surface_retire_keys
 from .sync_simplefin import sync_simplefin
 from .todoist_outbox import surface_to_todoist
+from .verification import run_verification
 
 
 DEFAULT_RUN_TYPE = "daily_sync"
@@ -55,9 +56,10 @@ def run_background_sync(
 
     Steps: scan charge candidates (auto-triaging in enforce mode by default),
     reconcile transactions, detect drift, suppress dormant estimates, suppress
-    contradicted estimates (enforce mode, on by default), and surface the day's
-    due items to Todoist (gated off by default). Each step is recorded as an
-    event; a failing step is logged and the run continues.
+    contradicted estimates (enforce mode, on by default), verify the model's
+    internal consistency (deterministic self-checks), and surface the day's due
+    items to Todoist (gated off by default). Each step is recorded as an event;
+    a failing step is logged and the run continues.
     """
 
     ensure_app_schema(conn)
@@ -120,6 +122,12 @@ def run_background_sync(
             suppress_dormant_avg_estimates(
                 conn, as_of_date=as_of_date, options=opts.get("suppress_dormant")))),
         *contradiction_steps,
+        # Verify the model's internal consistency before surfacing it: every
+        # check is deterministic pure code, so a failure is a real broken
+        # identity, not a model guess. Findings persist (tagged with this run)
+        # and feed the daily digest's verification block.
+        ("verify", lambda: _summarize_verification(
+            run_verification(conn, as_of_date=as_of_date, run_id=run_id))),
         ("surface_due_items", lambda: _summarize_surface(_surface_due_items_step(
             conn, as_of_date, opts))),
     ]
@@ -443,6 +451,17 @@ def _surface_due_items_step(
         env_path=surface_opts.get("env_path", opts.get("env_path")),
         retire_keys=retire_keys,
     )
+
+
+def _summarize_verification(result: dict[str, Any]) -> dict[str, Any]:
+    # Keep the run summary compact: counts only. The full per-finding detail
+    # lives in verification_findings, queryable via list_verification_findings.
+    return {
+        "ok": result.get("ok"),
+        "checks_total": result.get("checks_total"),
+        "findings_total": result.get("findings_total"),
+        "by_severity": result.get("by_severity"),
+    }
 
 
 def _summarize_surface(result: dict[str, Any]) -> dict[str, Any]:

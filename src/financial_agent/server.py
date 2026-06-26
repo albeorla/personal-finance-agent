@@ -38,6 +38,10 @@ from .background import (
 )
 from .digest import build_daily_digest as build_daily_digest_for_db
 from .digest import render_digest_markdown as render_digest_markdown_for_db
+from .verification import (
+    list_verification_findings as list_verification_findings_for_db,
+    run_verification as run_verification_for_db,
+)
 from .analytics import render_spending_markdown as render_spending_markdown_for_db
 from .backfill import backfill_recurring_instances as backfill_recurring_instances_for_db
 from .onboarding import auto_model_high_confidence_recurring as auto_model_high_confidence_recurring_for_db
@@ -1553,6 +1557,69 @@ def get_job_health(
     try:
         return get_job_health_for_db(
             conn, as_of_date=as_of_date, stale_threshold_hours=stale_threshold_hours
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def run_verification(
+    as_of_date: str,
+    persist: bool = True,
+    db_path: str | None = None,
+) -> dict:
+    """Run the deterministic consistency checks over the local finance model.
+
+    The grounding gate proves each headline number traces to a source row; this
+    proves the rows tie together. Checks (all pure code, no model, so a finding
+    is a real broken identity, not a guess): the projection's ending balance
+    equals its own signed events; no obligation has two projectable instances on
+    one due date; each statement cycle's rollup matches its input rows; and
+    projectable amounts are non-negative (direction carries the sign). Returns a
+    summary plus each finding. With persist=True (default) findings are written
+    to verification_findings for later listing; pass persist=False for a
+    read-only check. This runs automatically inside run_background_sync; call it
+    directly to re-check after a correction.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = run_verification_for_db(conn, as_of_date=as_of_date, persist=persist)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_verification_findings(
+    status: str | None = "open",
+    check_id: str | None = None,
+    limit: int = 100,
+    db_path: str | None = None,
+) -> dict:
+    """List persisted verification findings (broken consistency checks), newest first.
+
+    Defaults to open findings; pass status=null for every status, or a check_id
+    to filter to one check (projection_identity / duplicate_instances /
+    statement_identity / instance_sign_sanity). This is the read to confirm a
+    correction cleared a finding after re-running run_verification.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return _list_result(
+            list_verification_findings_for_db(
+                conn, status=status, check_id=check_id, limit=limit
+            )
         )
     finally:
         conn.close()

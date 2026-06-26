@@ -72,8 +72,9 @@ the legacy/manual workflow and the remaining cutover criteria are accepted.
 1. The user starts the daily finance loop.
 2. The MCP client calls `run_background_sync` for the target date.
 3. The server syncs readable sources, scans recurring-charge candidates,
-   reconciles expected payments, checks drift, evaluates guardrails, and records
-   an auditable run.
+   reconciles expected payments, checks drift, evaluates guardrails, runs the
+   deterministic verification phase that proves the source rows tie together,
+   and records an auditable run.
 4. The client calls `get_daily_digest`.
 5. The user sees a status color, working cash, projected low point, upcoming
    obligations, sensitivity to estimates, and the highest-priority review items.
@@ -219,6 +220,7 @@ The primary interface is the MCP tool catalog registered by
   `list_todoist_project`, `reconcile_todoist_project`.
 - Operations: `run_background_sync`, `get_background_run`,
   `list_background_runs`, `get_job_health`.
+- Verification: `run_verification`, `list_verification_findings`.
 - Cutover support: `run_live_validation`, `compare_to_legacy`.
 
 The command-line entry points are:
