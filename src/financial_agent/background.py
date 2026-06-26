@@ -28,7 +28,7 @@ from .obligations import suppress_contradicted_estimates, suppress_dormant_avg_e
 from .onboarding import scan_charge_onboarding_candidates
 from .reconciliation import reconcile_obligation_instances
 from .schema import ensure_app_schema
-from .surface_queue import build_surface_items
+from .surface_queue import build_surface_items, build_surface_retire_keys
 from .sync_simplefin import sync_simplefin
 from .todoist_outbox import surface_to_todoist
 
@@ -421,6 +421,7 @@ def _surface_due_items_step(
     """
 
     surface_opts = opts.get("surface")
+    retire_keys = build_surface_retire_keys(conn, as_of_date=as_of_date)
     if not surface_opts:
         # Default: gated off, hermetic. No live send, ledger untouched.
         return surface_to_todoist(
@@ -428,6 +429,7 @@ def _surface_due_items_step(
             build_surface_items(conn, as_of_date=as_of_date),
             as_of_date,
             write_enabled=False,
+            retire_keys=retire_keys,
         )
     if not isinstance(surface_opts, dict):
         surface_opts = {}
@@ -439,6 +441,7 @@ def _surface_due_items_step(
         token=surface_opts.get("token"),
         project_id=surface_opts.get("project_id"),
         env_path=surface_opts.get("env_path", opts.get("env_path")),
+        retire_keys=retire_keys,
     )
 
 

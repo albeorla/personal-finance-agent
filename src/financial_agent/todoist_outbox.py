@@ -601,6 +601,7 @@ def surface_to_todoist(
     env_path: str | None = None,
     send_func: Callable[..., dict[str, Any]] = _write_request,
     delete_func: Callable[..., bool] = _delete_request,
+    retire_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Push due items to Todoist with automatic de-duplication via the ledger.
 
@@ -619,6 +620,10 @@ def surface_to_todoist(
     made and the ledger is left untouched, so a later enabled run is a clean
     create. Returns a summary with per-item dispositions. Secrets are never
     logged or returned.
+
+    ``retire_keys``: surface_keys to flag for retire before the drain (the
+    read-only builder no longer writes the digest retire; it reports it here so
+    the mutation lives on the write path with the other ledger writes).
     """
 
     ensure_app_schema(conn)
@@ -657,6 +662,12 @@ def surface_to_todoist(
         for item in items:
             summary["items"].append({"surface_key": item.get("surface_key"), "action": "awaiting-integration"})
         return summary
+
+    # Apply retire intent reported by the read-only builder (e.g. the singleton
+    # onboarding-digest when its queue is empty). Flag the open rows here so the
+    # drain below removes them, keeping all ledger writes on the write path.
+    for key in retire_keys or ():
+        request_emission_retire(conn, key)
 
     # Drain retire tombstones first. A candidate/obligation decision may have
     # flagged open emissions for removal (retire_requested_at set). Delete each
