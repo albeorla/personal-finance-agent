@@ -103,6 +103,7 @@ from .follow_ups import (
 )
 from .surface_queue import (
     build_surface_items as build_surface_items_for_db,
+    build_surface_retire_keys as build_surface_retire_keys_for_db,
     build_sync_failed_item as build_sync_failed_item_for_db,
     get_surface_queue as get_surface_queue_for_db,
 )
@@ -878,10 +879,10 @@ def record_charge_onboarding_decision(
 ) -> dict:
     """Record a review decision against a charge-onboarding candidate.
 
-    Supported actions in this slice: defer, reject, needs_more_evidence,
-    in_review, reset. Applying a candidate into a canonical obligation
-    (accept/apply) or restructuring (merge/split) is a separate guarded slice
-    and is rejected here.
+    Supported decisions: defer, reject, park, needs_more_evidence, in_review,
+    accept, reset. The accept decision only marks a candidate ready; the
+    canonical write happens in apply_charge_onboarding_candidate, so apply is
+    rejected here. Restructuring (merge/split/edit) is also rejected.
     """
 
     import sqlite3
@@ -1279,11 +1280,12 @@ def surface_due_items_to_todoist(
     conn.row_factory = sqlite3.Row
     try:
         items = build_surface_items_for_db(conn, as_of_date=as_of_date)
+        retire_keys = build_surface_retire_keys_for_db(conn, as_of_date=as_of_date)
         if sync_failed:
             # Prepend the stale-data flag so it leads the push; the ledger dedupes
             # it on a same-day re-run.
             items = [build_sync_failed_item_for_db(as_of_date), *items]
-        result = surface_to_todoist_for_db(conn, items, as_of_date)
+        result = surface_to_todoist_for_db(conn, items, as_of_date, retire_keys=retire_keys)
         conn.commit()
         return result
     finally:

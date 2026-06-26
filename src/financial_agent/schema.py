@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
+# Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
+# a fresh DB ends at this version after ensure_app_schema runs. When adding a
+# migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
+LATEST_SCHEMA_VERSION = 1
 
-def ensure_app_schema(conn: sqlite3.Connection) -> None:
-    """Create local app-owned finance tables.
 
-    These tables are separate from legacy Todoist snapshots. They are the target
-    source for deterministic projections and later Todoist reflection.
+def _migrate_to_v1(conn: sqlite3.Connection) -> None:
+    """Baseline migration: the full create-if-missing + ALTER schema body.
+
+    This is the original ensure_app_schema body, kept idempotent (CREATE ...
+    IF NOT EXISTS plus _ensure_column guards) so existing local DBs at
+    user_version 0 converge cleanly without data loss.
     """
 
     conn.executescript(
@@ -520,6 +527,36 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
             ON obligation_instances(statement_target_obligation_id)
         """
     )
+
+
+# Ordered migration registry: (target version, idempotent apply function).
+# Append-only; never reorder or renumber existing entries.
+_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [(1, _migrate_to_v1)]
+
+
+def ensure_app_schema(conn: sqlite3.Connection) -> None:
+    """Create local app-owned finance tables.
+
+    These tables are separate from legacy Todoist snapshots. They are the target
+    source for deterministic projections and later Todoist reflection.
+
+    Applies the ordered migrations, tracked by PRAGMA user_version, running only
+    the steps newer than the DB's current version. Idempotent: re-running on an
+    up-to-date DB is a no-op.
+    """
+
+    current = get_schema_version(conn)
+    for version, apply in _MIGRATIONS:
+        if version > current:
+            apply(conn)
+            # PRAGMA cannot be parameterized; version is a trusted int literal
+            # from the hardcoded _MIGRATIONS list, never user input.
+            conn.execute(f"PRAGMA user_version = {version}")
+            current = version
+
+
+def get_schema_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
 def has_app_schema(conn: sqlite3.Connection) -> bool:

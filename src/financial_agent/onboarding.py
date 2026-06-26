@@ -9,7 +9,7 @@ Boundary: candidates are NOT cash-flow truth. They live in their own table
 (``charge_onboarding_candidates``) and never write ``obligation_instances``.
 Cash-flow projection only reads obligation instances, so an unapplied candidate
 cannot move the forecast. Promoting a candidate into a canonical obligation is a
-separate, guarded action that is intentionally out of scope for this slice.
+separate, guarded action (``apply_charge_onboarding_candidate``).
 
 State model (see CLAUDE_CODE_HANDOFF.md):
 
@@ -820,10 +820,11 @@ def record_charge_onboarding_decision(
 ) -> dict[str, Any]:
     """Record a review decision against a candidate.
 
-    Supported in this slice: ``defer``, ``reject``, ``needs_more_evidence``,
-    ``in_review``, and ``reset``. Applying a candidate into a canonical
-    obligation (``accept``/``apply``) and restructuring (``merge``/``split``)
-    belong to a later guarded slice and raise ``ValueError`` here.
+    Supported decisions: ``defer``, ``reject``, ``park``, ``needs_more_evidence``,
+    ``in_review``, ``accept``, and ``reset``. ``accept`` only marks a candidate
+    ready; the canonical write happens in ``apply_charge_onboarding_candidate``,
+    so passing ``apply`` here raises ``ValueError``. Restructuring
+    (``merge``/``split``/``edit``) is a separate guarded action and also raises.
     """
 
     ensure_app_schema(conn)

@@ -89,10 +89,13 @@ class _Delete:
 
 
 def _live(conn, items, send, delete):
+    from financial_agent.surface_queue import build_surface_retire_keys
+
+    retire_keys = build_surface_retire_keys(conn, as_of_date=AS_OF)
     return surface_to_todoist(
         conn, items, AS_OF,
         write_enabled=True, token="tok", project_id="proj",
-        send_func=send, delete_func=delete,
+        send_func=send, delete_func=delete, retire_keys=retire_keys,
     )
 
 
@@ -279,6 +282,10 @@ def test_digest_retire_when_zero(tmp_path):
     # An existing open digest task from a prior non-empty run.
     _seed_emission(conn, "onboarding-digest", "DIG1", status="open")
 
-    build_surface_items(conn, as_of_date=AS_OF)  # N == 0
+    # N == 0: the read-only builder writes nothing; the retire is applied by the
+    # write path, which reports the digest key via build_surface_retire_keys.
+    send, delete = _Send(), _Delete()
+    summary = _live(conn, build_surface_items(conn, as_of_date=AS_OF), send, delete)
 
-    assert _emission(conn, "onboarding-digest")["retire_requested_at"] is not None
+    assert summary["retired"] == 1
+    assert _emission(conn, "onboarding-digest")["status"] == "retired"

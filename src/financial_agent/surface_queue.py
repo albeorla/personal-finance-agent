@@ -40,7 +40,6 @@ from .obligations import list_obligation_review_candidates
 from .onboarding import list_charge_onboarding_queue
 from .reconciliation import list_reconciliation_review_items
 from .schema import ensure_app_schema
-from .todoist_outbox import request_emission_retire
 
 # A balance-only account whose latest snapshot is older than this is treated as
 # stale and surfaced for a manual refresh. No account carries a refresh-cadence
@@ -220,18 +219,40 @@ def build_surface_items(
     return items
 
 
+def build_surface_retire_keys(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: date | str,
+) -> list[str]:
+    """Read-only: surface_keys the write path should retire this run.
+
+    Currently just the singleton onboarding-digest when its queue is empty (a
+    stale digest task from a prior non-empty run must be removed). Mirrors the
+    old in-builder retire, but returns intent as DATA so the builder writes
+    nothing.
+    """
+
+    ensure_app_schema(conn)
+    _coerce_date(as_of_date)  # validate shape; the queue is not date-filtered
+    try:
+        candidates = list_charge_onboarding_queue(conn)
+    except sqlite3.OperationalError:
+        return []
+    return [] if candidates else [_ONBOARDING_DIGEST_KEY]
+
+
 def _onboarding_digest_surface_item(
     conn: sqlite3.Connection, as_of: date
 ) -> list[dict[str, Any]]:
     """ONE digest item for the active charge-onboarding queue, never one-per-candidate.
 
     Counts candidates still awaiting a human decision (status in
-    ``ACTIVE_STATUSES``). When the queue is empty we emit nothing AND request a
-    retire on the singleton ``onboarding-digest`` key, so a stale digest task left
-    over from a prior non-empty run is removed on the next live surface drain (and
-    recreated, not permanently suppressed, when candidates reappear). When the
-    queue is non-empty we emit a single item whose stable ``surface_key`` keeps the
-    emissions ledger updating one task in place as the count changes.
+    ``ACTIVE_STATUSES``). When the queue is empty we emit nothing; the retire of a
+    stale digest task left over from a prior non-empty run is reported as data by
+    ``build_surface_retire_keys`` and applied by the write path (``surface_to_todoist``),
+    so this builder writes nothing. When the queue is non-empty we emit a single item
+    whose stable ``surface_key`` keeps the emissions ledger updating one task in place
+    as the count changes.
 
     ``as_of`` is unused (the queue is not date-filtered) but kept for a uniform
     builder signature.
@@ -244,8 +265,6 @@ def _onboarding_digest_surface_item(
 
     count = len(candidates)
     if count == 0:
-        # No active candidates: retire any open digest task next live run.
-        request_emission_retire(conn, _ONBOARDING_DIGEST_KEY)
         return []
 
     # Queue is already ordered by priority_score DESC, so the head is highest.
