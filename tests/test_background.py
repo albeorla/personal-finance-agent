@@ -59,6 +59,7 @@ def _db(path):
 _EXPECTED_SEQUENCE = [
     "run_started", "scan_charge_candidates", "reconcile", "detect_drift",
     "suppress_dormant_estimates", "suppress_contradicted_estimates",
+    "verify",
     "surface_due_items",
     "run_finished",
 ]
@@ -78,6 +79,7 @@ def test_run_background_sync_records_run_and_ordered_events(tmp_path):
     assert set(result["result_summary"]) == {
         "scan_charge_candidates", "reconcile", "detect_drift",
         "suppress_dormant_estimates", "suppress_contradicted_estimates",
+        "verify",
         "surface_due_items",
     }
     assert result["result_summary"]["suppress_contradicted_estimates"]["mode"] == "enforce"
@@ -208,7 +210,8 @@ def test_get_background_run_unknown_returns_none(tmp_path):
 _EXPECTED_WITH_SYNC = [
     "run_started", "sync_simplefin", "scan_charge_candidates",
     "reconcile", "detect_drift", "suppress_dormant_estimates",
-    "suppress_contradicted_estimates", "surface_due_items", "run_finished",
+    "suppress_contradicted_estimates", "verify", "surface_due_items",
+    "run_finished",
 ]
 
 

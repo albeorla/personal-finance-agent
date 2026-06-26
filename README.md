@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 69 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 71 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -93,11 +93,11 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 ## Tool catalog
 
-The server registers 69 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 71 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
-- `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance. Also includes an obligation coverage summary (how much of what you owe is modeled vs silent autopay vs unmodeled discovered charges) and a trough-sensitivity line that shows how much the projected low point swings on its estimated outflows, so a precise-looking low point is not read as fact.
+- `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance. Also includes an obligation coverage summary (how much of what you owe is modeled vs silent autopay vs unmodeled discovered charges) and a trough-sensitivity line that shows how much the projected low point swings on its estimated outflows, so a precise-looking low point is not read as fact. Also carries a read-only `verification` block (ok flag plus per-severity finding counts and details) from the deterministic verification phase, so a digest that reads clean while its source rows disagree shows up immediately.
 - `summarize_spending` — outflow spending by category / merchant / month with totals, a month-over-month trend, and the transaction ids behind each bucket (rules-based, no LLM).
 - `verify_grounding` — the "is the agent allowed to say this number" gate: confirms each headline figure traces to a source row.
 
@@ -144,8 +144,12 @@ The server registers 69 MCP tools. They group by area as follows. (Names are exa
 - `reconcile_todoist_project` — server-side LIST + classify of the whole Finance project, cleaning drift via a safe three-rule deletion model (ritual/manual tasks are never deleted). `list_todoist_project` — the read-only counterpart (LIST + classify, no delete path), so the agent's board read goes through the server, never raw HTTP. Each task entry includes its `due_date` and `description`, so a due-date audit can run through the MCP without touching the raw Todoist API.
 - `create_todoist_task`, `execute_action_outbox`, `list_action_outbox` — create a one-off reminder and process the durable outbox; nothing is sent externally unless write-back is explicitly enabled.
 
+**Verification** (deterministic row-tie checks; no LLM)
+- `run_verification` — runs the verification phase: four pure-SQL/Python checks that prove the source rows tie together — projection identity (each window's ending balance equals its start plus its signed events), duplicate instances (no two projectable instances share an obligation and due date), statement identity (a cycle's denormalized input_sum/input_count matches its input rows), and instance sign sanity (no projectable instance has a negative stored amount). Persists each finding by default; `persist=False` is read-only.
+- `list_verification_findings` — read the recorded verification findings (open by default), newest first, optionally filtered by `check_id`.
+
 **Background runner and job health**
-- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues.
+- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> verify -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues. The `verify` step persists its findings tagged with the run id.
 - `get_background_run`, `list_background_runs`, `get_job_health`
 
 **Memory** (corrections, decisions, facts to recall)

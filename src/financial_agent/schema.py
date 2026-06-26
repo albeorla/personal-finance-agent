@@ -8,7 +8,7 @@ from pathlib import Path
 # Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
 # a fresh DB ends at this version after ensure_app_schema runs. When adding a
 # migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
@@ -529,9 +529,47 @@ def _migrate_to_v1(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+    """Add verification_findings: the deterministic self-check ledger.
+
+    The grounding gate proves each headline number traces to a source row; a
+    verification run proves the rows tie together (the projection equals its own
+    events, no obligation has duplicate dated instances, a statement rollup
+    matches its inputs, amounts carry a sane sign). Each failed check writes one
+    row here so the engine's own composition errors become legible to the human
+    verifier instead of passing silently. Idempotent (CREATE ... IF NOT EXISTS).
+    """
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS verification_findings (
+            id TEXT PRIMARY KEY,
+            run_id TEXT,
+            check_id TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            title TEXT NOT NULL,
+            detail TEXT,
+            evidence_json TEXT,
+            as_of_date TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_verification_findings_run
+            ON verification_findings(run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_verification_findings_status
+            ON verification_findings(status, check_id);
+        """
+    )
+
+
 # Ordered migration registry: (target version, idempotent apply function).
 # Append-only; never reorder or renumber existing entries.
-_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [(1, _migrate_to_v1)]
+_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
+    (1, _migrate_to_v1),
+    (2, _migrate_to_v2),
+]
 
 
 def ensure_app_schema(conn: sqlite3.Connection) -> None:
