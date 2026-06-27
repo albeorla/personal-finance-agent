@@ -1,8 +1,9 @@
 """Tests for the charge-onboarding candidate scanner and review queue.
 
 These exercise deterministic discovery of charge-pattern candidates from copied
-transaction evidence. The acceptance cases use the real merchant amounts and
-account placements observed in ``data/transactions.source-copy.sqlite``:
+transaction evidence. The acceptance cases use real merchant amounts and account
+placements observed in a historical transaction snapshot (the data lives in the
+operator's own working repo, not here):
 
 - Gault Energy fills land on the Amex Platinum card -> card statement input.
 - Eversource electric is paid from checking 4321 -> direct checking, seasonal.
