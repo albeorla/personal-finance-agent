@@ -30,6 +30,7 @@ from .onboarding import (
     scan_charge_onboarding_candidates as scan_charge_onboarding_candidates_for_db,
 )
 from . import build_info
+from .adversarial import run_adversarial_review as run_adversarial_review_for_db
 from .background import (
     get_background_run as get_background_run_for_db,
     get_job_health as get_job_health_for_db,
@@ -1599,15 +1600,19 @@ def run_verification(
 def list_verification_findings(
     status: str | None = "open",
     check_id: str | None = None,
+    source: str | None = None,
     limit: int = 100,
     db_path: str | None = None,
 ) -> dict:
-    """List persisted verification findings (broken consistency checks), newest first.
+    """List persisted verification findings (consistency / review flags), newest first.
 
     Defaults to open findings; pass status=null for every status, or a check_id
     to filter to one check (projection_identity / duplicate_instances /
-    statement_identity / instance_sign_sanity). This is the read to confirm a
-    correction cleared a finding after re-running run_verification.
+    statement_identity / instance_sign_sanity, or an 'adversarial:<area>' check).
+    Filter by source to separate the two producers: 'deterministic' for the
+    pure-code identity checks, 'adversarial' for the spawned-reviewer's advisory
+    flags. This is the read to confirm a correction cleared a finding after
+    re-running run_verification.
     """
 
     import sqlite3
@@ -1618,9 +1623,50 @@ def list_verification_findings(
     try:
         return _list_result(
             list_verification_findings_for_db(
-                conn, status=status, check_id=check_id, limit=limit
+                conn, status=status, check_id=check_id, source=source, limit=limit
             )
         )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def run_adversarial_review(
+    as_of_date: str,
+    persist: bool = True,
+    model: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Spawn an independent Claude reviewer to sanity-check the riskiest model rows.
+
+    Advisory, attention-routing only - the findings are NOT verdicts. This spawns
+    the Claude Code CLI ('claude -p') as a read-only subprocess on the user's
+    Claude subscription (OAuth; no Anthropic API key is used) and asks it to try
+    to refute the highest-leverage parts of the forecast: the estimated,
+    low-confidence outflows on the projected low point; the large estimated
+    obligations that move the projection; and the freshly-classified
+    recurring-charge candidates and their evidence.
+
+    Fail-open: if the claude CLI is missing, errors, times out, or returns
+    unparseable output, this returns available=False and writes nothing. With
+    persist=True (default) the reviewer's flags are reconciled into
+    verification_findings tagged source='adversarial' (resolve-on-clear, scoped
+    so it never touches the deterministic checks) and surface in the daily digest.
+    This runs automatically inside run_background_sync only when
+    FINANCE_AGENT_ADVERSARIAL is enabled; call it directly to review on demand.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = run_adversarial_review_for_db(
+            conn, as_of_date=as_of_date, persist=persist, model=model
+        )
+        conn.commit()
+        return result
     finally:
         conn.close()
 

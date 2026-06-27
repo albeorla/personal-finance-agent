@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "case \"$FINANCE_AGENT_ADVERSARIAL\" in 1|true|yes|on) cd \"$CLAUDE_PROJECT_DIR\" && uv run python -m financial_agent.adversarial --as-of \"$(date +%F)\" || true ;; *) true ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

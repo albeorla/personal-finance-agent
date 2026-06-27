@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from . import build_info
+from .adversarial import adversarial_review_enabled, run_adversarial_review
 from .config import get_finance_config
 from .drift import detect_drift
 from .obligations import suppress_contradicted_estimates, suppress_dormant_avg_estimates
@@ -110,6 +111,25 @@ def run_background_sync(
     scan_opts = dict(opts.get("scan") or {})
     scan_opts.setdefault("auto_triage", {"mode": "enforce"})
 
+    # Adversarial review is ALWAYS-ON for the real daily run but capability-gated
+    # so it is inert offline and in tests: it only appends when
+    # FINANCE_AGENT_ADVERSARIAL is truthy AND the claude CLI is on PATH. A test
+    # (or an explicit caller) can force it on with ``options["adversarial"] =
+    # {"enabled": True, "runner": <fake>}`` so no real subprocess is spawned. When
+    # off, no 'adversarial_review' event appears and the default sequence is
+    # unchanged.
+    adversarial_opts = opts.get("adversarial")
+    adversarial_steps: list[tuple[str, Callable[[], dict[str, Any]]]] = []
+    if _should_run_adversarial(adversarial_opts):
+        adv_runner = adversarial_opts.get("runner") if isinstance(adversarial_opts, dict) else None
+        adv_model = adversarial_opts.get("model") if isinstance(adversarial_opts, dict) else None
+        adversarial_steps = [
+            ("adversarial_review", lambda: _summarize_adversarial(
+                run_adversarial_review(
+                    conn, as_of_date=as_of_date, run_id=run_id,
+                    runner=adv_runner, model=adv_model))),
+        ]
+
     steps: list[tuple[str, Callable[[], dict[str, Any]]]] = [
         *sync_steps,
         ("scan_charge_candidates", lambda: _summarize_scan(
@@ -128,6 +148,9 @@ def run_background_sync(
         # and feed the daily digest's verification block.
         ("verify", lambda: _summarize_verification(
             run_verification(conn, as_of_date=as_of_date, run_id=run_id))),
+        # Gated adversarial review: an independent reviewer sanity-checks the
+        # riskiest rows before they are surfaced. Empty (no event) unless enabled.
+        *adversarial_steps,
         ("surface_due_items", lambda: _summarize_surface(_surface_due_items_step(
             conn, as_of_date, opts))),
     ]
@@ -461,6 +484,35 @@ def _summarize_verification(result: dict[str, Any]) -> dict[str, Any]:
         "checks_total": result.get("checks_total"),
         "findings_total": result.get("findings_total"),
         "by_severity": result.get("by_severity"),
+    }
+
+
+def _should_run_adversarial(adversarial_opts: Any) -> bool:
+    """Decide whether to append the gated adversarial step.
+
+    An explicit ``options["adversarial"]["enabled"]`` wins (this is how a test or
+    an on-demand caller forces the step on with an injected fake runner, with no
+    env flag and no claude binary required). Otherwise fall back to the
+    capability gate (env flag truthy AND claude on PATH), which is what makes it
+    always-on for the real daily run yet inert offline and in tests.
+    """
+
+    if isinstance(adversarial_opts, dict) and "enabled" in adversarial_opts:
+        return bool(adversarial_opts["enabled"])
+    return adversarial_review_enabled()
+
+
+def _summarize_adversarial(result: dict[str, Any]) -> dict[str, Any]:
+    # Counts only in the run summary; the per-finding detail lives in
+    # verification_findings (source='adversarial'), queryable via
+    # list_verification_findings, and surfaces in the daily digest.
+    return {
+        "available": result.get("available"),
+        "ok": result.get("ok"),
+        "reviewed_count": result.get("reviewed_count"),
+        "findings_total": result.get("findings_total"),
+        "by_severity": result.get("by_severity"),
+        "skipped": result.get("skipped"),
     }
 
 

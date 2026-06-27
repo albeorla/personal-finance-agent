@@ -19,3 +19,22 @@ def _working_account_hint(monkeypatch, tmp_path):
     monkeypatch.setenv("FINANCE_AGENT_ENV", str(tmp_path / "nonexistent.env"))
     monkeypatch.setenv("WORKING_ACCOUNT_HINT", WORKING_ACCOUNT_HINT)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _adversarial_gate_off(monkeypatch):
+    """Pin the non-deterministic adversarial gate OFF for the whole suite.
+
+    The gate is env-driven (``FINANCE_AGENT_ADVERSARIAL`` truthy AND the
+    ``claude`` CLI on PATH). If a developer exports the flag to enable the daily
+    feature and then runs the suite, the default background sequence would gain
+    an ``adversarial_review`` event and a real ``claude`` subprocess could be
+    spawned mid-test. Clearing the env here makes the deterministic default
+    independent of the developer's shell; tests opt in explicitly via
+    ``options["adversarial"]`` with an injected fake runner.
+    """
+
+    monkeypatch.delenv("FINANCE_AGENT_ADVERSARIAL", raising=False)
+    monkeypatch.delenv("FINANCE_AGENT_ADVERSARIAL_MODEL", raising=False)
+    monkeypatch.delenv("FINANCE_AGENT_ADVERSARIAL_TIMEOUT", raising=False)
+    yield

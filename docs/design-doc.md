@@ -220,7 +220,9 @@ The primary interface is the MCP tool catalog registered by
   `list_todoist_project`, `reconcile_todoist_project`.
 - Operations: `run_background_sync`, `get_background_run`,
   `list_background_runs`, `get_job_health`.
-- Verification: `run_verification`, `list_verification_findings`.
+- Verification: `run_verification`, `list_verification_findings` (filter by
+  `source` to separate deterministic checks from adversarial flags).
+- Adversarial review: `run_adversarial_review` (see below).
 - Cutover support: `run_live_validation`, `compare_to_legacy`.
 
 The command-line entry points are:
@@ -228,6 +230,44 @@ The command-line entry points are:
 - `uv run financial-agent-mcp`
 - `uv run financial-agent-daily`
 - `uv run financial-agent-ui`
+- `python -m financial_agent.adversarial --as-of <YYYY-MM-DD>` — runs the
+  adversarial review outside any MCP call (used by the Claude Code Stop hook).
+  Safe with the gate off: it prints a disabled note and exits 0.
+
+## Adversarial Review
+
+The deterministic verification phase proves the model ties out internally with
+pure code, so a finding is a genuinely broken identity. The adversarial review
+adds a second, non-deterministic opinion that code cannot give: it hands an
+independent reviewer the highest-leverage rows — the estimated, low-confidence
+outflows on the projected low point, the large estimated obligations that move
+the forecast, and the freshly-classified recurring-charge candidates with their
+evidence — and asks it to point at whatever looks wrong.
+
+Findings are attention-routing ("look here, this looks off"), never verdicts.
+The reviewer is a language model and can be wrong, so its flags are stored
+advisory-labeled, never move the projection, and never resolve a deterministic
+check. They persist into `verification_findings` tagged `source='adversarial'`
+and surface alongside the deterministic checks in `get_daily_digest`.
+
+The reviewer is the Claude Code CLI (`claude -p`) spawned as a read-only
+subprocess on the user's Claude subscription via OAuth; `ANTHROPIC_API_KEY` is
+removed from the child environment so no metered API key is ever used. The phase
+is capability-gated: it runs only when `FINANCE_AGENT_ADVERSARIAL` is truthy and
+the `claude` binary is on `PATH`, so it stays inert offline and in tests. It is
+fail-open — a missing CLI, error, timeout, or unparseable reply writes nothing
+and the run continues.
+
+Three enforcement layers reach the same review, so a material change cannot end
+a session unreviewed regardless of how the work happened:
+
+1. Daily run (code): a gated `adversarial_review` step in `run_background_sync`,
+   between `verify` and `surface_due_items`.
+2. Inside an MCP call (surfaced reads): the `run_adversarial_review` tool runs it
+   on demand; `get_daily_digest` surfaces the persisted flags as a pure read.
+3. Outside the MCP call: a `Stop` hook in `.claude/settings.json` runs the module
+   entry point once per turn. `PostToolUse`-on-mutations is a stricter
+   alternative; Stop-once-per-turn is the cost-sane default.
 
 ## Dependencies and Infrastructure
 
@@ -254,6 +294,12 @@ keeps the riskiest writes behind configuration gates:
   `has_simplefin` and `has_todoist` are surfaced.
 - The server should be registered only in trusted local MCP clients because tool
   results can contain personal financial data.
+- The adversarial reviewer subprocess gets no tools and is isolated from this MCP
+  server (`--strict-mcp-config` plus an empty `--mcp-config`), so it cannot
+  recurse or reach the filesystem. Every row it judges is embedded inline in the
+  prompt and treated as untrusted text, closing the prompt-injection to file-read
+  path. Its environment has `ANTHROPIC_API_KEY` removed so it can only use the
+  user's subscription OAuth, never a metered API key.
 
 ## Privacy
 

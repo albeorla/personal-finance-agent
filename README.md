@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 71 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 72 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -93,11 +93,11 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 ## Tool catalog
 
-The server registers 71 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 72 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
-- `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance. Also includes an obligation coverage summary (how much of what you owe is modeled vs silent autopay vs unmodeled discovered charges) and a trough-sensitivity line that shows how much the projected low point swings on its estimated outflows, so a precise-looking low point is not read as fact. Also carries a read-only `verification` block (ok flag plus per-severity finding counts and details) from the deterministic verification phase, so a digest that reads clean while its source rows disagree shows up immediately.
+- `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance. Also includes an obligation coverage summary (how much of what you owe is modeled vs silent autopay vs unmodeled discovered charges) and a trough-sensitivity line that shows how much the projected low point swings on its estimated outflows, so a precise-looking low point is not read as fact. Also carries a read-only `verification` block (ok flag plus per-severity finding counts and details) from the deterministic verification phase, so a digest that reads clean while its source rows disagree shows up immediately. When the adversarial reviewer has run, it also carries an `adversarial_review` block: the persisted advisory flags from an independent reviewer, clearly labeled attention-routing (look here, this looks off), never a verdict. The digest only reads these persisted rows; it never spawns the reviewer.
 - `summarize_spending` — outflow spending by category / merchant / month with totals, a month-over-month trend, and the transaction ids behind each bucket (rules-based, no LLM).
 - `verify_grounding` — the "is the agent allowed to say this number" gate: confirms each headline figure traces to a source row.
 
@@ -146,10 +146,13 @@ The server registers 71 MCP tools. They group by area as follows. (Names are exa
 
 **Verification** (deterministic row-tie checks; no LLM)
 - `run_verification` — runs the verification phase: four pure-SQL/Python checks that prove the source rows tie together — projection identity (each window's ending balance equals its start plus its signed events), duplicate instances (no two projectable instances share an obligation and due date), statement identity (a cycle's denormalized input_sum/input_count matches its input rows), and instance sign sanity (no projectable instance has a negative stored amount). Persists each finding by default; `persist=False` is read-only.
-- `list_verification_findings` — read the recorded verification findings (open by default), newest first, optionally filtered by `check_id`.
+- `list_verification_findings` — read the recorded verification findings (open by default), newest first, optionally filtered by `check_id` or by `source` (`deterministic` for the pure-code identity checks, `adversarial` for the spawned-reviewer's advisory flags).
+
+**Adversarial review** (non-deterministic; an independent reviewer, advisory only)
+- `run_adversarial_review` — spawn the Claude Code CLI (`claude -p`) as a read-only subprocess on the user's Claude subscription (OAuth; no Anthropic API key) and ask it to try to refute the riskiest part of the forecast: the estimated, low-confidence outflows that land on the projected low point, the large estimated obligations that move the projection, and the freshly-classified recurring-charge candidates with their evidence. Each flag persists into `verification_findings` tagged `source='adversarial'` and surfaces alongside the deterministic checks. Findings are ATTENTION-ROUTING ("look here, this looks off"), never verdicts — the reviewer is a language model and can be wrong. Fail-open: a missing CLI, error, timeout, or unparseable reply returns `available=False` and writes nothing, so a broken reviewer never breaks the run. Runs automatically inside the daily `run_background_sync` only when enabled (see Adversarial review enforcement, below); call it directly to review on demand.
 
 **Background runner and job health**
-- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> verify -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues. The `verify` step persists its findings tagged with the run id.
+- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> verify -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues. The `verify` step persists its findings tagged with the run id. When the adversarial reviewer is enabled, an extra `adversarial_review` step runs between `verify` and `surface_due_items`; with the gate off the step does not appear and the default sequence is unchanged.
 - `get_background_run`, `list_background_runs`, `get_job_health`
 
 **Memory** (corrections, decisions, facts to recall)
@@ -159,6 +162,28 @@ The server registers 71 MCP tools. They group by area as follows. (Names are exa
 - `apply_obligation_migration` — seed a fresh DB from legacy files once (not an ongoing input).
 - `run_live_validation` — prove the pipeline on live data against a throwaway copy without touching the committed snapshot.
 - `compare_to_legacy` — diff a legacy cash-flow file against the new digest and report differences with a severity each.
+
+---
+
+## Adversarial review: an independent reviewer for the riskiest numbers
+
+The deterministic verification phase proves the model ties out internally — pure code, so a finding is a genuinely broken identity. The adversarial review answers a softer question that code cannot: does the riskiest part of the forecast *look wrong* to a fresh pair of eyes? It hands an independent reviewer the highest-leverage rows (the estimated, low-confidence outflows sitting on the projected low point; the large estimated obligations that move the forecast; the freshly-classified recurring-charge candidates and their evidence) and asks it to point at whatever looks off.
+
+**Honest framing, baked in.** An adversarial finding is attention-routing ("look here, this looks off"), never a verdict. The reviewer is a non-deterministic language model: it can be wrong, miss things, or invent concerns. Findings are stored advisory-labeled and a human decides. They never move the projection and never auto-resolve a deterministic check.
+
+**Subscription auth, no API key.** The real reviewer spawns the Claude Code CLI (`claude -p`) as a read-only subprocess using your Claude subscription via OAuth. The child environment has `ANTHROPIC_API_KEY` removed so it can never silently fall back to a metered API key. The subprocess gets no tools and is isolated from this MCP server (so it cannot recurse); every row it judges is embedded inline in the prompt as untrusted text.
+
+**Enable it.** The phase is off by default and inert offline and in tests. It runs only when both are true: the environment flag `FINANCE_AGENT_ADVERSARIAL` is truthy (`1`/`true`/`yes`/`on`) AND the `claude` binary resolves on `PATH`. Optional tuning: `FINANCE_AGENT_ADVERSARIAL_MODEL` (default `sonnet`) and `FINANCE_AGENT_ADVERSARIAL_TIMEOUT` (seconds, default 120).
+
+### Three enforcement layers
+
+The same review is reachable three ways, so a material change cannot slip past review regardless of how the work happens:
+
+1. **Daily run (code).** When the gate is on, `run_background_sync` appends a gated `adversarial_review` step between `verify` and `surface_due_items`. This is the scheduled, always-on path.
+2. **Inside an MCP call (surfaced reads).** The `run_adversarial_review` tool runs the reviewer on demand, and `get_daily_digest` surfaces the persisted advisory flags (a pure read — the digest never spawns the reviewer). An agent working in the model can both trigger a review and see prior flags.
+3. **Outside the MCP call (Claude Code Stop hook).** A `Stop` hook in `.claude/settings.json` runs `python -m financial_agent.adversarial --as-of <today>` once when the agent finishes a turn, so no session ends on an un-reviewed material change. It is debounced by nature (one spawn per turn, not per mutation) and short-circuits instantly when the gate is off. `PostToolUse`-on-mutations is a stricter alternative; Stop-once-per-turn is the cost-sane default.
+
+The module entry point (`python -m financial_agent.adversarial --as-of <YYYY-MM-DD> [--db <path>] [--model <model>]`) is safe to run with the gate off — it prints `adversarial review disabled` and exits 0 without spawning anything.
 
 ---
 

@@ -101,13 +101,15 @@ def list_verification_findings(
     *,
     status: str | None = "open",
     check_id: str | None = None,
+    source: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """List persisted verification findings, newest first.
 
     Defaults to ``status='open'`` (pass ``None`` for every status). Optionally
-    filter to one ``check_id``. This is the read the agent calls after a
-    correction to confirm the consistency checks now pass.
+    filter to one ``check_id`` or one ``source`` ('deterministic' for the
+    pure-code checks, 'adversarial' for the spawned reviewer). This is the read
+    the agent calls after a correction to confirm the checks now pass.
     """
 
     ensure_app_schema(conn)
@@ -119,9 +121,12 @@ def list_verification_findings(
     if check_id is not None:
         where.append("check_id = ?")
         params.append(check_id)
+    if source is not None:
+        where.append("source = ?")
+        params.append(source)
     query = (
         "SELECT id, run_id, check_id, severity, title, detail, evidence_json, "
-        "as_of_date, status, created_at FROM verification_findings"
+        "as_of_date, status, source, created_at FROM verification_findings"
     )
     if where:
         query += " WHERE " + " AND ".join(where)
@@ -141,6 +146,7 @@ def list_verification_findings(
             "evidence": json.loads(r["evidence_json"]) if r["evidence_json"] else None,
             "as_of_date": r["as_of_date"],
             "status": r["status"],
+            "source": r["source"],
             "created_at": r["created_at"],
         }
         for r in rows
@@ -403,7 +409,10 @@ def _reconcile_and_persist(
 
     existing: dict[str, list[str]] = {}
     for row in conn.execute(
-        "SELECT id, check_id, evidence_json FROM verification_findings WHERE status = 'open'"
+        # Scope to this producer only: the deterministic reconciler must never
+        # resolve an adversarial-review finding (and vice versa).
+        "SELECT id, check_id, evidence_json FROM verification_findings "
+        "WHERE status = 'open' AND source = 'deterministic'"
     ).fetchall():
         existing.setdefault(_row_key(row["check_id"], row["evidence_json"]), []).append(row["id"])
 
