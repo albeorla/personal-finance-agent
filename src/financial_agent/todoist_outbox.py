@@ -286,6 +286,245 @@ def create_todoist_task(
     }
 
 
+def update_todoist_task(
+    task_id: str,
+    *,
+    content: str | None = None,
+    due_string: str | None = None,
+    due_date: str | None = None,
+    description: str | None = None,
+    priority: int | None = None,
+    project_id: str | None = None,
+    write_enabled: bool | None = None,
+    token: str | None = None,
+    env_path: str | None = None,
+    send_func: Callable[..., dict[str, Any]] = _write_request,
+) -> dict[str, Any]:
+    """Update an existing Todoist task in place. Live write is GATED OFF by default.
+
+    Edits ONLY the fields that are passed; any argument left ``None`` is omitted
+    from the request body, so a partial update never clears an untouched field.
+    ``description`` and ``project_id`` are sent whenever not ``None`` (so passing
+    ``project_id`` moves the task to another project). ``due_date`` (ISO yyyy-mm-dd)
+    wins over ``due_string`` when both are supplied, matching ``create_todoist_task``.
+
+    Targets a task by id (Todoist POST ``/tasks/<id>``), so the gate needs only a
+    token, not a configured project (mirrors ``reconcile_todoist_completions``).
+    The live write fires ONLY when ``write_enabled`` is true (resolved from
+    TODOIST_WRITE_ENABLED in the finances .env when not passed) AND a token is
+    available. Otherwise this makes NO external HTTP call and returns
+    ``{"status": "awaiting-integration", "sent": False, "reason": ...}``. Secrets
+    are never logged or returned.
+
+    Returns on success: ``{"status": "updated", "sent": True, "task_id", "url"}``.
+    """
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return {"status": "awaiting-integration", "sent": False, "reason": "task_id is required"}
+
+    body: dict[str, Any] = {}
+    if content is not None:
+        body["content"] = content
+    if description is not None:
+        body["description"] = description
+    if priority is not None:
+        body["priority"] = priority
+    if project_id is not None:
+        body["project_id"] = project_id
+    # due_date (ISO) wins over due_string when both are supplied.
+    if due_date:
+        body["due_date"] = due_date
+    elif due_string:
+        body["due_string"] = due_string
+    if not body:
+        return {"status": "awaiting-integration", "sent": False, "reason": "no fields to update"}
+
+    # Resolve the gate. When write_enabled is explicitly False, do NOT read config
+    # so tests stay hermetic and can never fire a live send. Config only fills gaps.
+    if write_enabled is None:
+        cfg = get_finance_config(env_path=env_path)
+        write_enabled = cfg["todoist_write_enabled"]
+        token = token if token is not None else cfg["todoist_api_token"]
+    elif write_enabled and token is None:
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+
+    if not write_enabled:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist write-back disabled (TODOIST_WRITE_ENABLED off)"}
+    if not token:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist token not configured"}
+
+    try:
+        updated = send_func(token, f"/tasks/{task_id}", body)
+    except Exception as exc:  # noqa: BLE001 - surface a clean failure, never crash the tool
+        return {"status": "failed", "sent": False,
+                "reason": f"update failed: {type(exc).__name__}: {exc}"[:300]}
+
+    return {"status": "updated", "sent": True, "task_id": task_id, "url": updated.get("url")}
+
+
+def complete_todoist_task(
+    task_id: str,
+    *,
+    write_enabled: bool | None = None,
+    token: str | None = None,
+    env_path: str | None = None,
+    send_func: Callable[..., dict[str, Any]] = _write_request,
+) -> dict[str, Any]:
+    """Complete (close) an existing Todoist task. Live write is GATED OFF by default.
+
+    Closes the task by id (Todoist POST ``/tasks/<id>/close``), which returns 204
+    No Content on success; the empty body is handled cleanly. Targets a task by id,
+    so the gate needs only a token, not a configured project (mirrors
+    ``reconcile_todoist_completions``). The live write fires ONLY when
+    ``write_enabled`` is true (resolved from TODOIST_WRITE_ENABLED in the finances
+    .env when not passed) AND a token is available. Otherwise this makes NO
+    external HTTP call and returns ``{"status": "awaiting-integration", "sent":
+    False, "reason": ...}``. Secrets are never logged or returned.
+
+    Returns on success: ``{"status": "completed", "sent": True, "task_id"}``.
+    """
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return {"status": "awaiting-integration", "sent": False, "reason": "task_id is required"}
+
+    # Resolve the gate. When write_enabled is explicitly False, do NOT read config
+    # so tests stay hermetic and can never fire a live send. Config only fills gaps.
+    if write_enabled is None:
+        cfg = get_finance_config(env_path=env_path)
+        write_enabled = cfg["todoist_write_enabled"]
+        token = token if token is not None else cfg["todoist_api_token"]
+    elif write_enabled and token is None:
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+
+    if not write_enabled:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist write-back disabled (TODOIST_WRITE_ENABLED off)"}
+    if not token:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist token not configured"}
+
+    try:
+        # Close returns 204 No Content; _write_request returns {} for an empty body.
+        send_func(token, f"/tasks/{task_id}/close", {})
+    except Exception as exc:  # noqa: BLE001 - surface a clean failure, never crash the tool
+        return {"status": "failed", "sent": False,
+                "reason": f"complete failed: {type(exc).__name__}: {exc}"[:300]}
+
+    return {"status": "completed", "sent": True, "task_id": task_id}
+
+
+def reopen_todoist_task(
+    task_id: str,
+    *,
+    write_enabled: bool | None = None,
+    token: str | None = None,
+    env_path: str | None = None,
+    send_func: Callable[..., dict[str, Any]] = _write_request,
+) -> dict[str, Any]:
+    """Reopen (un-complete) an existing Todoist task. Live write is GATED OFF by default.
+
+    Reopens the task by id (Todoist POST ``/tasks/<id>/reopen``), which returns 204
+    No Content on success; the empty body is handled cleanly. Targets a task by id,
+    so the gate needs only a token, not a configured project (mirrors
+    ``reconcile_todoist_completions``). The live write fires ONLY when
+    ``write_enabled`` is true (resolved from TODOIST_WRITE_ENABLED in the finances
+    .env when not passed) AND a token is available. Otherwise this makes NO
+    external HTTP call and returns ``{"status": "awaiting-integration", "sent":
+    False, "reason": ...}``. Secrets are never logged or returned.
+
+    Returns on success: ``{"status": "reopened", "sent": True, "task_id"}``.
+    """
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return {"status": "awaiting-integration", "sent": False, "reason": "task_id is required"}
+
+    # Resolve the gate. When write_enabled is explicitly False, do NOT read config
+    # so tests stay hermetic and can never fire a live send. Config only fills gaps.
+    if write_enabled is None:
+        cfg = get_finance_config(env_path=env_path)
+        write_enabled = cfg["todoist_write_enabled"]
+        token = token if token is not None else cfg["todoist_api_token"]
+    elif write_enabled and token is None:
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+
+    if not write_enabled:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist write-back disabled (TODOIST_WRITE_ENABLED off)"}
+    if not token:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist token not configured"}
+
+    try:
+        # Reopen returns 204 No Content; _write_request returns {} for an empty body.
+        send_func(token, f"/tasks/{task_id}/reopen", {})
+    except Exception as exc:  # noqa: BLE001 - surface a clean failure, never crash the tool
+        return {"status": "failed", "sent": False,
+                "reason": f"reopen failed: {type(exc).__name__}: {exc}"[:300]}
+
+    return {"status": "reopened", "sent": True, "task_id": task_id}
+
+
+def delete_todoist_task(
+    task_id: str,
+    *,
+    write_enabled: bool | None = None,
+    token: str | None = None,
+    env_path: str | None = None,
+    delete_func: Callable[..., bool] = _delete_request,
+) -> dict[str, Any]:
+    """Delete an existing Todoist task. Live write is GATED OFF by default.
+
+    Hard-deletes the task by id (Todoist DELETE ``/tasks/<id>``), which returns 204
+    No Content on success. Reuses ``_delete_request`` (the existing DELETE helper),
+    so a 404 is treated as already-gone (idempotent) and a 429 is retried. Targets
+    a task by id, so the gate needs only a token, not a configured project (mirrors
+    ``reconcile_todoist_completions``). The live delete fires ONLY when
+    ``write_enabled`` is true (resolved from TODOIST_WRITE_ENABLED in the finances
+    .env when not passed) AND a token is available. Otherwise this makes NO
+    external HTTP call and returns ``{"status": "awaiting-integration", "sent":
+    False, "reason": ...}``. Secrets are never logged or returned.
+
+    Returns on success: ``{"status": "deleted", "sent": True, "task_id"}``.
+    """
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return {"status": "awaiting-integration", "sent": False, "reason": "task_id is required"}
+
+    # Resolve the gate. When write_enabled is explicitly False, do NOT read config
+    # so tests stay hermetic and can never fire a live delete. Config only fills gaps.
+    if write_enabled is None:
+        cfg = get_finance_config(env_path=env_path)
+        write_enabled = cfg["todoist_write_enabled"]
+        token = token if token is not None else cfg["todoist_api_token"]
+    elif write_enabled and token is None:
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+
+    if not write_enabled:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist write-back disabled (TODOIST_WRITE_ENABLED off)"}
+    if not token:
+        return {"status": "awaiting-integration", "sent": False,
+                "reason": "Todoist token not configured"}
+
+    try:
+        delete_func(token, task_id)
+    except Exception as exc:  # noqa: BLE001 - surface a clean failure, never crash the tool
+        return {"status": "failed", "sent": False,
+                "reason": f"delete failed: {type(exc).__name__}: {exc}"[:300]}
+
+    return {"status": "deleted", "sent": True, "task_id": task_id}
+
+
 # --- idempotent surfacing ledger -------------------------------------------
 # The daily job pushes due items (follow-ups, behind goals, estimate reviews,
 # stale snapshots) to Todoist and MUST NEVER duplicate them: not across days,

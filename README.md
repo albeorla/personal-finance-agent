@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 72 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 76 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -93,7 +93,7 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 
 ## Tool catalog
 
-The server registers 72 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 76 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Status, projection, and digest**
 - `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
@@ -143,6 +143,7 @@ The server registers 72 MCP tools. They group by area as follows. (Names are exa
 - `reconcile_todoist_emission`, `reconcile_todoist_completions` — adopt pre-existing tasks; absorb user completions of tasks we pushed.
 - `reconcile_todoist_project` — server-side LIST + classify of the whole Finance project, cleaning drift via a safe three-rule deletion model (ritual/manual tasks are never deleted). `list_todoist_project` — the read-only counterpart (LIST + classify, no delete path), so the agent's board read goes through the server, never raw HTTP. Each task entry includes its `due_date` and `description`, so a due-date audit can run through the MCP without touching the raw Todoist API.
 - `create_todoist_task`, `execute_action_outbox`, `list_action_outbox` — create a one-off reminder and process the durable outbox; nothing is sent externally unless write-back is explicitly enabled.
+- `update_todoist_task`, `complete_todoist_task`, `reopen_todoist_task`, `delete_todoist_task` — edit, close, reopen, or delete an existing task by id for routine board maintenance; gated the same way (no external call unless write-back is enabled).
 
 **Verification** (deterministic row-tie checks; no LLM)
 - `run_verification` — runs the verification phase: four pure-SQL/Python checks that prove the source rows tie together — projection identity (each window's ending balance equals its start plus its signed events), duplicate instances (no two projectable instances share an obligation and due date), statement identity (a cycle's denormalized input_sum/input_count matches its input rows), and instance sign sanity (no projectable instance has a negative stored amount). Persists each finding by default; `persist=False` is read-only.

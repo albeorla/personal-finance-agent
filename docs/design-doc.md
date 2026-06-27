@@ -218,6 +218,9 @@ The primary interface is the MCP tool catalog registered by
   reconciliation, drift detection, guardrails, and statement-cycle tools.
 - Surfacing: `get_surface_queue`, `surface_due_items_to_todoist`,
   `list_todoist_project`, `reconcile_todoist_project`.
+- Todoist task edits (board maintenance): `create_todoist_task`,
+  `update_todoist_task`, `complete_todoist_task`, `reopen_todoist_task`,
+  `delete_todoist_task` (all write-gated; no external call unless enabled).
 - Operations: `run_background_sync`, `get_background_run`,
   `list_background_runs`, `get_job_health`.
 - Verification: `run_verification`, `list_verification_findings` (filter by

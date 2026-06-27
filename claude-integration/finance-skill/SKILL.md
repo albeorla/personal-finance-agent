@@ -61,6 +61,9 @@ decide when the new system is trustworthy enough to rely on alone.
 - `surface_due_items_to_todoist` pushes the day's due items idempotently via the
   emissions ledger; `reconcile_todoist_completions` absorbs user completions of
   those tasks; `create_todoist_task` makes a one-off reminder.
+- `update_todoist_task`, `complete_todoist_task`, `reopen_todoist_task`, and
+  `delete_todoist_task` edit, close, reopen, or delete an existing task by id for
+  routine board maintenance (write-gated like every other Todoist write).
 - All writing is **gated off** unless the user has explicitly enabled it.
   `execute_action_outbox` only sends when live Todoist integration is turned on.
   Do not enable or send without explicit user instruction.
