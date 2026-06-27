@@ -97,6 +97,34 @@ def _clean_runner(*, targets, model):
     return {"ok": True, "error": None, "findings": [], "reviewed_count": 1, "model": model}
 
 
+def _two_concerns_same_subject_runner(*, targets, model):
+    # Two DISTINCT concerns about the same (area, subject), different severities.
+    return {
+        "ok": True,
+        "error": None,
+        "findings": [
+            {
+                "area": "recurring_candidate",
+                "subject": "acme",
+                "severity": "high",
+                "title": "Classification looks wrong",
+                "why": "Evidence count is low.",
+                "what_to_check": "Confirm it recurs.",
+            },
+            {
+                "area": "recurring_candidate",
+                "subject": "acme",
+                "severity": "low",
+                "title": "Display name differs from merchant key",
+                "why": "Cosmetic mismatch.",
+                "what_to_check": "Normalize the label.",
+            },
+        ],
+        "reviewed_count": 1,
+        "model": model,
+    }
+
+
 # --- gating / injected-runner path (the determinism guarantee) -------------
 
 
@@ -187,6 +215,31 @@ def test_high_finding_persists_as_error_and_isolates_deterministic(tmp_path):
     det = list_verification_findings(conn, source="deterministic", status="open")
     assert len(det) == 1
     assert det[0]["check_id"] == "det_check"
+
+
+def test_distinct_concerns_same_subject_persist_separately(tmp_path):
+    conn = _minimal_db(tmp_path / "m.sqlite")
+    _seed_candidate(conn)
+
+    # Two concerns about the same subject must NOT collapse, and the high-severity
+    # one must not be masked by the warn.
+    result = run_adversarial_review(
+        conn, as_of_date="2026-06-30", runner=_two_concerns_same_subject_runner
+    )
+    conn.commit()
+    assert result["findings_total"] == 2
+
+    rows = list_verification_findings(conn, source="adversarial", status="open")
+    assert len(rows) == 2
+    sevs = sorted(r["severity"] for r in rows)
+    assert sevs == [SEVERITY_ERROR, SEVERITY_WARN]  # both preserved, neither masked
+
+    # Re-running the same two concerns is stable: no duplicate rows.
+    run_adversarial_review(
+        conn, as_of_date="2026-07-01", runner=_two_concerns_same_subject_runner
+    )
+    conn.commit()
+    assert len(list_verification_findings(conn, source="adversarial", status="open")) == 2
 
 
 def test_clean_review_resolves_only_adversarial_rows(tmp_path):
