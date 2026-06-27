@@ -18,10 +18,26 @@ DEFAULT_FRESHNESS_HOURS = 24
 
 
 def default_db_path() -> Path:
+    """Resolve the finance DB path from FINANCE_AGENT_DB_PATH, bootstrapping its dir.
+
+    The server repo holds code only - it ships no database and does NOT fall back
+    to an in-repo file (a silent fallback would let the engine quietly read a
+    stale local copy). The caller points FINANCE_AGENT_DB_PATH at the DB in their
+    own working directory; we create that directory if it is missing, and sqlite
+    plus ensure_app_schema then create the file and app tables on first use - so
+    pointing at a fresh path in a chosen directory bootstraps cleanly.
+    """
+
     configured = os.environ.get("FINANCE_AGENT_DB_PATH")
-    if configured:
-        return Path(configured).expanduser()
-    return Path(__file__).resolve().parents[2] / "data" / "transactions.source-copy.sqlite"
+    if not configured:
+        raise RuntimeError(
+            "FINANCE_AGENT_DB_PATH is not set. The MCP server ships no built-in "
+            "database; set FINANCE_AGENT_DB_PATH to your finance DB path (it is "
+            "created, with its parent directory, if it does not yet exist)."
+        )
+    path = Path(configured).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def get_finance_status(

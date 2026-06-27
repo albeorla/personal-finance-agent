@@ -18,6 +18,10 @@ WORKING_ACCOUNT_HINT = "4321"
 def _working_account_hint(monkeypatch, tmp_path):
     monkeypatch.setenv("FINANCE_AGENT_ENV", str(tmp_path / "nonexistent.env"))
     monkeypatch.setenv("WORKING_ACCOUNT_HINT", WORKING_ACCOUNT_HINT)
+    # default_db_path() now requires FINANCE_AGENT_DB_PATH (no in-repo fallback);
+    # give every test a clean per-test path so anything resolving the default DB
+    # gets a tmp DB instead of erroring or touching a real file.
+    monkeypatch.setenv("FINANCE_AGENT_DB_PATH", str(tmp_path / "finance-agent.sqlite"))
     yield
 
 
