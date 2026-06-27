@@ -80,15 +80,19 @@ from .statements import (
     recompute_statement_estimates as recompute_statement_estimates_for_db,
 )
 from .todoist_outbox import (
+    complete_todoist_task as complete_todoist_task_impl,
     create_todoist_task as create_todoist_task_impl,
+    delete_todoist_task as delete_todoist_task_impl,
     execute_action_outbox as execute_action_outbox_for_db,
     list_action_outbox as list_action_outbox_for_db,
     reconcile_emission as reconcile_emission_for_db,
     reconcile_todoist_completions as reconcile_todoist_completions_for_db,
     list_todoist_project_for_db,
     reconcile_todoist_project_for_db,
+    reopen_todoist_task as reopen_todoist_task_impl,
     request_emission_retire_prefix,
     surface_to_todoist as surface_to_todoist_for_db,
+    update_todoist_task as update_todoist_task_impl,
 )
 from .status import default_db_path
 from .status import get_finance_status as build_finance_status
@@ -1246,6 +1250,105 @@ def create_todoist_task(
         priority=priority,
         project_id=project_id,
     )
+
+
+@mcp.tool()
+def update_todoist_task(
+    task_id: str,
+    content: str | None = None,
+    due_string: str | None = None,
+    due_date: str | None = None,
+    description: str | None = None,
+    priority: int | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Update an existing Todoist task in place, editing only the provided fields.
+
+    Live Todoist write-back is gated OFF by default. The task is updated ONLY when
+    TODOIST_WRITE_ENABLED is set in the finances .env AND a token is configured;
+    otherwise this makes no external call and returns
+    {"status": "awaiting-integration", "sent": false, "reason": ...}.
+
+    Any argument left unset is omitted from the request, so a partial update never
+    clears an untouched field. The task is addressed by id, so no project id is
+    needed unless you pass `project_id` to move the task to another project.
+
+    Args:
+        task_id: Id of the task to update (required).
+        content: New task title.
+        due_string: Natural-language due date (e.g. "today", "Jul 28").
+        due_date: ISO yyyy-mm-dd due date; wins over due_string when both are given.
+        description: New task body (pass "" to clear it).
+        priority: Todoist priority 1-4.
+        project_id: Move the task to this project.
+
+    Returns on success: {"status": "updated", "sent": true, "task_id", "url"}.
+    """
+
+    return update_todoist_task_impl(
+        task_id,
+        content=content,
+        due_string=due_string,
+        due_date=due_date,
+        description=description,
+        priority=priority,
+        project_id=project_id,
+    )
+
+
+@mcp.tool()
+def complete_todoist_task(task_id: str) -> dict:
+    """Complete (close) an existing Todoist task by id.
+
+    Live Todoist write-back is gated OFF by default. The task is closed ONLY when
+    TODOIST_WRITE_ENABLED is set in the finances .env AND a token is configured;
+    otherwise this makes no external call and returns
+    {"status": "awaiting-integration", "sent": false, "reason": ...}.
+
+    Args:
+        task_id: Id of the task to complete (required).
+
+    Returns on success: {"status": "completed", "sent": true, "task_id"}.
+    """
+
+    return complete_todoist_task_impl(task_id)
+
+
+@mcp.tool()
+def reopen_todoist_task(task_id: str) -> dict:
+    """Reopen (un-complete) an existing Todoist task by id.
+
+    Live Todoist write-back is gated OFF by default. The task is reopened ONLY when
+    TODOIST_WRITE_ENABLED is set in the finances .env AND a token is configured;
+    otherwise this makes no external call and returns
+    {"status": "awaiting-integration", "sent": false, "reason": ...}.
+
+    Args:
+        task_id: Id of the task to reopen (required).
+
+    Returns on success: {"status": "reopened", "sent": true, "task_id"}.
+    """
+
+    return reopen_todoist_task_impl(task_id)
+
+
+@mcp.tool()
+def delete_todoist_task(task_id: str) -> dict:
+    """Delete an existing Todoist task by id.
+
+    Live Todoist write-back is gated OFF by default. The task is deleted ONLY when
+    TODOIST_WRITE_ENABLED is set in the finances .env AND a token is configured;
+    otherwise this makes no external call and returns
+    {"status": "awaiting-integration", "sent": false, "reason": ...}. A task that
+    is already gone (404) is treated as success, so the delete is idempotent.
+
+    Args:
+        task_id: Id of the task to delete (required).
+
+    Returns on success: {"status": "deleted", "sent": true, "task_id"}.
+    """
+
+    return delete_todoist_task_impl(task_id)
 
 
 @mcp.tool()
