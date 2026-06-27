@@ -602,14 +602,16 @@ def _reconcile_and_persist(
     now = _now()
     current: dict[str, dict[str, Any]] = {}
     for finding in findings:
-        current[_finding_key(finding["check_id"], finding["evidence"])] = finding
+        current[_finding_key(finding["check_id"], finding["evidence"], finding["title"])] = finding
 
     existing: dict[str, list[str]] = {}
     for row in conn.execute(
-        "SELECT id, check_id, evidence_json FROM verification_findings "
+        "SELECT id, check_id, evidence_json, title FROM verification_findings "
         "WHERE status = 'open' AND source = 'adversarial'"
     ).fetchall():
-        existing.setdefault(_row_key(row["check_id"], row["evidence_json"]), []).append(row["id"])
+        existing.setdefault(
+            _row_key(row["check_id"], row["evidence_json"], row["title"]), []
+        ).append(row["id"])
 
     # Resolve adversarial findings the reviewer no longer raises.
     for key, ids in existing.items():
@@ -646,12 +648,16 @@ def _reconcile_and_persist(
         )
 
 
-def _finding_key(check_id: str, evidence: dict[str, Any]) -> str:
-    return check_id + "|" + json.dumps(evidence, sort_keys=True)
+def _finding_key(check_id: str, evidence: dict[str, Any], title: str) -> str:
+    # Key includes the title so two DISTINCT concerns about the same subject
+    # persist as their own rows - a high-severity flag is never collapsed into
+    # (and masked by) a warn on the same subject. Trade-off: a reworded concern
+    # resolves + reopens across runs, which is acceptable for an advisory router.
+    return check_id + "|" + json.dumps(evidence, sort_keys=True) + "|" + (title or "")
 
 
-def _row_key(check_id: str, evidence_json: str | None) -> str:
-    return check_id + "|" + (evidence_json or "null")
+def _row_key(check_id: str, evidence_json: str | None, title: str | None) -> str:
+    return check_id + "|" + (evidence_json or "null") + "|" + (title or "")
 
 
 # --- result shapes ---------------------------------------------------------
