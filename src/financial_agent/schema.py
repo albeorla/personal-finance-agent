@@ -8,7 +8,7 @@ from pathlib import Path
 # Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
 # a fresh DB ends at this version after ensure_app_schema runs. When adding a
 # migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
@@ -564,11 +564,33 @@ def _migrate_to_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    """Tag verification_findings with the producer of the finding.
+
+    The deterministic verify phase and the (non-deterministic) adversarial review
+    share this table. ``source`` distinguishes them: 'deterministic' for the
+    pure-code identity checks, 'adversarial' for the spawned-reviewer findings.
+    Each reconciler scopes itself to its own source so one never resolves the
+    other's open rows. Existing rows default to 'deterministic'. Idempotent.
+    """
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(verification_findings)").fetchall()}
+    if "source" not in columns:
+        conn.execute(
+            "ALTER TABLE verification_findings ADD COLUMN source TEXT NOT NULL DEFAULT 'deterministic'"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verification_findings_source "
+        "ON verification_findings(source, status)"
+    )
+
+
 # Ordered migration registry: (target version, idempotent apply function).
 # Append-only; never reorder or renumber existing entries.
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _migrate_to_v1),
     (2, _migrate_to_v2),
+    (3, _migrate_to_v3),
 ]
 
 

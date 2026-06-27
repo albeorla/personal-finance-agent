@@ -6,7 +6,7 @@ Durable Mermaid diagrams for the local finance MCP server. These diagrams descri
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 71 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 72 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"read-only sync"| Server
     Portals["Bank/card portals<br/>manual balances and one-off facts"] -->|"manual inputs"| Server
@@ -47,6 +47,7 @@ flowchart LR
         Guardrails["evaluate_guardrails<br/>cash floor, drift threshold, debt order"]
         Projection["get_finance_status / get_daily_digest<br/>project cash flow from obligation_instances"]
         Verify["run_verification<br/>prove source rows tie together, persist findings"]
+        Adversarial["run_adversarial_review<br/>gated (FINANCE_AGENT_ADVERSARIAL + claude CLI)<br/>independent reviewer flags the riskiest rows, advisory only"]
     end
 
     subgraph Surface["3. SURFACE"]
@@ -70,6 +71,7 @@ sequenceDiagram
     participant SF as SimpleFIN
     participant TD as Todoist
     participant DB as SQLite
+    participant Claude as Adversarial reviewer (claude -p, gated)
 
     User->>Agent: Start daily finance loop
     Agent->>MCP: run_background_sync(sync=true, as_of_date)
@@ -80,6 +82,11 @@ sequenceDiagram
     MCP->>DB: Reconcile obligation_instances to transactions
     MCP->>DB: Detect drift and evaluate guardrails
     MCP->>DB: Verify row-tie identities and persist findings
+    opt FINANCE_AGENT_ADVERSARIAL on and claude CLI present
+        MCP->>Claude: Spawn claude -p reviewer on the Max subscription (read-only, no API key)
+        Claude-->>MCP: Advisory flags on the riskiest rows (attention-routing, not verdicts)
+        MCP->>DB: Reconcile findings tagged source=adversarial
+    end
     MCP-->>Agent: Run summary and trace_id
 
     Agent->>MCP: get_daily_digest(as_of_date)
@@ -429,6 +436,7 @@ flowchart TB
         Drift["Drift detection<br/>creates/updates active drift_findings<br/>marks disappeared findings resolved<br/>(detect_drift persist=true)"]
         Guardrails["Guardrail evaluation<br/>creates guardrail_rules if missing<br/>optionally inserts guardrail_evaluations<br/>(evaluate_guardrails persist=true)"]
         Verify["Row-tie verification<br/>runs four deterministic checks that prove source rows agree<br/>inserts verification_findings when persist=true<br/>(run_verification)"]
+        Adversarial["Adversarial review (gated, non-deterministic)<br/>spawns claude -p reviewer on the Max subscription<br/>reconciles advisory flags into verification_findings source=adversarial<br/>(run_adversarial_review)"]
     end
 
     subgraph SurfaceAndTelemetry["5. Surfacing and run telemetry"]
@@ -456,6 +464,7 @@ flowchart TB
     Background -. wraps daily steps .-> Reconcile
     Background -. wraps daily steps .-> Drift
     Background -. wraps daily steps .-> Verify
+    Background -. "wraps daily steps (when gated on)" .-> Adversarial
     Background -. wraps daily steps .-> Queue
     Background -. wraps daily steps .-> Todoist
 
@@ -473,6 +482,7 @@ flowchart TB
     Reconcile --> Queue
     Drift --> Queue
     Guardrails --> Verify --> Queue
+    Verify -. "gated on" .-> Adversarial --> Queue
     GoalsDebtsFollowups --> Queue
     Queue --> Todoist
 
@@ -484,7 +494,7 @@ flowchart TB
     class Sync,ManualBalance,CardPaste,Calendar ingest
     class Obligations,Income,IncomeInstances,Statements,GoalsDebtsFollowups model
     class Scan,Decide,Apply review
-    class Reconcile,Drift,Guardrails,Verify risk
+    class Reconcile,Drift,Guardrails,Verify,Adversarial risk
     class Queue,Todoist,Outbox,Background,Schema surface
 ```
 

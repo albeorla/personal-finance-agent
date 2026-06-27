@@ -161,7 +161,38 @@ def build_daily_digest(
     # a row; this proves the rows add up. A compact summary plus any open
     # findings so a broken identity is visible alongside the numbers it affects.
     digest["verification"] = _verification_block(resolved_db_path, as_of)
+    # Advisory adversarial review: persisted findings from the independent
+    # reviewer, read-only here (no subprocess is ever spawned in the digest, so
+    # this stays hermetic). Clearly labeled attention-routing, not verdicts, and
+    # surfaced alongside the deterministic verification block.
+    digest["adversarial_review"] = _adversarial_review_block(resolved_db_path)
     return digest
+
+
+def _adversarial_review_block(db_path: str) -> dict[str, Any]:
+    """Read persisted open adversarial-review findings (no spawn, pure read)."""
+
+    import sqlite3
+
+    from .verification import list_verification_findings
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        findings = list_verification_findings(conn, source="adversarial", status="open")
+    finally:
+        conn.close()
+    by_severity: dict[str, int] = {}
+    for f in findings:
+        by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
+    return {
+        "ok": len(findings) == 0,
+        "advisory": True,
+        "note": "Independent reviewer flags - advisory attention-routing, not verdicts.",
+        "findings_total": len(findings),
+        "by_severity": by_severity,
+        "findings": findings,
+    }
 
 
 def _verification_block(db_path: str, as_of_date: str) -> dict[str, Any]:
