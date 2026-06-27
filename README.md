@@ -202,7 +202,7 @@ The module entry point (`python -m financial_agent.adversarial --as-of <YYYY-MM-
 uv run financial-agent-mcp
 ```
 
-By default the server reads `data/transactions.source-copy.sqlite` (relative to the package). Override the path with the `FINANCE_AGENT_DB_PATH` environment variable.
+`FINANCE_AGENT_DB_PATH` is **required** — the server repo holds code only and ships no database, so it never reads an in-repo file. Point it at the SQLite DB in your own working directory; the server creates the file (and its parent directory) and the app schema on first use, so a fresh path in a chosen directory bootstraps cleanly. Source tables (accounts, balances, transactions) are created on the first `sync_simplefin` run.
 
 ### Register it as an MCP server
 
@@ -223,7 +223,7 @@ Add an entry to your MCP client's config (for Claude Code, the workspace `.mcp.j
 }
 ```
 
-- `FINANCE_AGENT_DB_PATH` points the server at your local SQLite database.
+- `FINANCE_AGENT_DB_PATH` (required) points the server at your local SQLite database; it is created with its parent directory if it does not exist.
 - `FINANCE_AGENT_ENV` points at the `.env` holding your credentials (defaults to `~/dev/areas/finances/.env`). Setting it lets a registered server read a sandbox `.env` without touching any other workspace.
 
 ### Credentials (`.env`)
