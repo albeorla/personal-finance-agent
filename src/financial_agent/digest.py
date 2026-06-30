@@ -102,7 +102,13 @@ def build_daily_digest(
             "net_across_accounts": status["balances"]["total_balance"],
             "liquid_available": deposit_liquid,
             "accounts": [
-                {"name": a["account_name"], "org": a.get("org"), "balance": a["balance"], "available": a["available"]}
+                {
+                    "name": a["account_name"],
+                    "org": a.get("org"),
+                    "balance": a["balance"],
+                    "available": a["available"],
+                    "recorded_at": a.get("recorded_at"),
+                }
                 for a in status["balances"]["accounts"]
             ],
         },
@@ -252,7 +258,10 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
         bal_v, avail_v = a.get("balance"), a.get("available")
         if bal_v is not None and avail_v is not None and bal_v >= 0 and abs(avail_v - bal_v) > 0.01:
             note = f" (avail ${_money(avail_v)})"
-        lines.append(f"- {_account_label(a)}: ${_money(bal_v)}{note}")
+        # Freshness: how old this balance is, so a stale balance-only feed (e.g. an
+        # "Updated Monthly" card weeks out of date) is visibly stale, not implied live.
+        fresh = f" _(as of {_relative_time(a.get('recorded_at'))})_" if a.get("recorded_at") else ""
+        lines.append(f"- {_account_label(a)}: ${_money(bal_v)}{note}{fresh}")
     lines.append("")
 
     lines.append("## Cash-Flow Projection")
