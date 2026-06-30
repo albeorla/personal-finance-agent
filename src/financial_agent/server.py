@@ -1040,13 +1040,17 @@ def preview_charge_onboarding_apply(
     through_date: str | None = None,
     horizon_days: int = 180,
     obligation_id: str | None = None,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Preview the canonical obligation and dated instances that applying would create.
 
     Read-only and writes nothing. Use this to show a reviewer exactly what would
     land in the cash-flow model (obligation, instances, schedule summary, and
-    warnings) before committing to apply.
+    warnings) before committing to apply. Pass amount_override and/or
+    cadence_override (e.g. 'monthly') to preview a corrected figure when the
+    detector misread the amount or cadence.
     """
 
     import sqlite3
@@ -1062,6 +1066,8 @@ def preview_charge_onboarding_apply(
             through_date=through_date,
             horizon_days=horizon_days,
             obligation_id=obligation_id,
+            amount_override=amount_override,
+            cadence_override=cadence_override,
         )
     finally:
         conn.close()
@@ -1075,6 +1081,8 @@ def apply_charge_onboarding_candidate(
     horizon_days: int = 180,
     obligation_id: str | None = None,
     require_accepted: bool = True,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Promote an accepted candidate into a canonical obligation plus dated instances.
@@ -1082,7 +1090,9 @@ def apply_charge_onboarding_candidate(
     This is the guarded write that turns a reviewed candidate into cash-flow
     truth. By default the candidate must already be accepted (record an accept
     decision first). Writing is idempotent: re-applying the same window updates
-    instances in place instead of duplicating them.
+    instances in place instead of duplicating them. Pass amount_override and/or
+    cadence_override to correct a detector misread in this one call instead of
+    rejecting and re-modeling.
     """
 
     import sqlite3
@@ -1099,6 +1109,8 @@ def apply_charge_onboarding_candidate(
             horizon_days=horizon_days,
             obligation_id=obligation_id,
             require_accepted=require_accepted,
+            amount_override=amount_override,
+            cadence_override=cadence_override,
         )
         conn.commit()
         return result

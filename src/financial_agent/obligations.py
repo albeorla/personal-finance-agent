@@ -1247,7 +1247,7 @@ def _instances_for_obligation(conn: sqlite3.Connection, obligation_id: str) -> l
             cash_flow_treatment, statement_target_obligation_id
         FROM obligation_instances
         WHERE obligation_id = ?
-          AND status != 'deleted'
+          AND status NOT IN ('deleted', 'canceled')
         ORDER BY due_date, id
         """,
         (obligation_id,),

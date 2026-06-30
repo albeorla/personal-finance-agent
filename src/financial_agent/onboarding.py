@@ -895,12 +895,15 @@ def preview_charge_onboarding_apply(
     through_date: date | str | None = None,
     horizon_days: int = DEFAULT_APPLY_HORIZON_DAYS,
     obligation_id: str | None = None,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
 ) -> dict[str, Any]:
     """Return the obligation and dated instances that applying would create.
 
     Read-only: this never writes. It is the guarded preview half of the
     onboarding apply step, so a reviewer can see exactly what would land in the
-    cash-flow model before committing to it.
+    cash-flow model before committing to it. Pass amount_override/cadence_override
+    to preview a corrected amount or cadence when the detector misread it.
     """
 
     ensure_app_schema(conn)
@@ -911,6 +914,8 @@ def preview_charge_onboarding_apply(
         through_date=through_date,
         horizon_days=horizon_days,
         obligation_id=obligation_id,
+        amount_override=amount_override,
+        cadence_override=cadence_override,
     )
 
 
@@ -923,13 +928,17 @@ def apply_charge_onboarding_candidate(
     horizon_days: int = DEFAULT_APPLY_HORIZON_DAYS,
     obligation_id: str | None = None,
     require_accepted: bool = True,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
 ) -> dict[str, Any]:
     """Promote an accepted candidate into a canonical obligation plus instances.
 
     This is the only place a candidate becomes cash-flow truth. It is guarded:
     by default the candidate must already be ``accepted`` (record an accept
     decision first). Writing is idempotent because instances use deterministic
-    ids, so re-applying the same window updates rather than duplicates.
+    ids, so re-applying the same window updates rather than duplicates. Pass
+    amount_override/cadence_override to correct a detector misread in this one
+    call instead of rejecting and re-modeling.
     """
 
     ensure_app_schema(conn)
@@ -947,6 +956,8 @@ def apply_charge_onboarding_candidate(
         through_date=through_date,
         horizon_days=horizon_days,
         obligation_id=obligation_id,
+        amount_override=amount_override,
+        cadence_override=cadence_override,
     )
     write = apply_obligation_instances(
         conn, obligation=plan["obligation"], instances=plan["instances"]
@@ -992,8 +1003,16 @@ def _build_apply_plan(
     through_date: date | str | None,
     horizon_days: int,
     obligation_id: str | None,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
 ) -> dict[str, Any]:
-    schedule = candidate.get("proposed_schedule_policy") or {}
+    # A detector mis-classification (wrong cadence, e.g. weekly-should-be-monthly,
+    # or a wrong amount) is corrected here in one apply call - the reviewer passes
+    # the override instead of reject-then-rescan-then-remodel.
+    schedule = {
+        **(candidate.get("proposed_schedule_policy") or {}),
+        **({"cadence": cadence_override} if cadence_override else {}),
+    }
     amount_policy = candidate.get("proposed_amount_policy") or {}
     cash_impact = candidate.get("proposed_cash_impact_policy") or {}
     direction = candidate["direction"]
@@ -1003,7 +1022,9 @@ def _build_apply_plan(
     through = _coerce_apply_date(through_date) if through_date else anchor + timedelta(days=horizon_days)
     due_dates = _generate_due_dates(schedule, anchor, through)
 
-    amount = round(float(amount_policy.get("amount") or 0.0), 2)
+    amount = round(
+        float(amount_override if amount_override is not None else (amount_policy.get("amount") or 0.0)), 2
+    )
     instance_treatment = _instance_cash_flow_treatment(treatment)
     statement_target = cash_impact.get("statement_target_obligation_id")
     resolved_obligation_id = obligation_id or f"onboarded_{candidate['merchant_key']}_{candidate['account_class']}"
