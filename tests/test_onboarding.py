@@ -301,6 +301,30 @@ def test_get_next_skips_resolved_candidates(tmp_path):
     assert second["merchant_key"] == "eversource_energy"
 
 
+def test_decision_accepts_intuitive_shapes(tmp_path):
+    # The first call to this tool commonly names the action under the tool's own
+    # param name ("decision") or passes a bare action string; both must work,
+    # not just the canonical {"action": ...} dict.
+    conn = _seed_source_db(
+        tmp_path / "src.sqlite",
+        accounts=[AMEX, CHECKING],
+        transactions=GAULT_AMEX_ROWS + EVERSOURCE_CHECKING_ROWS,
+    )
+    scan_charge_onboarding_candidates(conn)
+
+    first = get_next_charge_onboarding_candidate(conn)
+    # "decision" key is accepted as an alias for "action"; the candidate resolves
+    # so get_next advances past it.
+    record_charge_onboarding_decision(conn, first["id"], {"decision": "defer"})
+    second = get_next_charge_onboarding_candidate(conn)
+    assert second["id"] != first["id"]
+
+    # a bare action string is accepted too
+    record_charge_onboarding_decision(conn, second["id"], "reject")
+    after = get_next_charge_onboarding_candidate(conn)
+    assert after is None or after["id"] not in {first["id"], second["id"]}
+
+
 # ---------------------------------------------------------------------------
 # Acceptance: candidates are not cash-flow truth
 # ---------------------------------------------------------------------------

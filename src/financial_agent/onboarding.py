@@ -828,7 +828,13 @@ def record_charge_onboarding_decision(
     """
 
     ensure_app_schema(conn)
-    action = (decision or {}).get("action")
+    # Accept the intuitive shapes, not just {"action": ...}: a bare action string,
+    # or a dict that names the action under "decision" (the tool's own param name)
+    # instead of "action". This is the most common first-call mistake.
+    if isinstance(decision, str):
+        decision = {"action": decision}
+    decision = decision or {}
+    action = decision.get("action") or decision.get("decision")
     row = conn.execute(
         "SELECT status FROM charge_onboarding_candidates WHERE id = ?", (candidate_id,)
     ).fetchone()
@@ -858,7 +864,9 @@ def record_charge_onboarding_decision(
         "decided_at": now,
         "decided_by": decision.get("decided_by", "review"),
     }
-    extra = {k: v for k, v in decision.items() if k not in {"action", "notes", "decided_by"}}
+    extra = {
+        k: v for k, v in decision.items() if k not in {"action", "decision", "notes", "decided_by"}
+    }
     if extra:
         decision_record["extra"] = extra
 

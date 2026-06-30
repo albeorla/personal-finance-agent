@@ -883,7 +883,7 @@ def get_next_charge_onboarding_candidate(db_path: str | None = None) -> dict | N
 @mcp.tool()
 def record_charge_onboarding_decision(
     candidate_id: str,
-    decision: dict,
+    decision: dict | str,
     db_path: str | None = None,
 ) -> dict:
     """Record a review decision against a charge-onboarding candidate.
@@ -1641,7 +1641,7 @@ def get_version() -> dict:
 
 @mcp.tool()
 def get_job_health(
-    as_of_date: str,
+    as_of_date: str | None = None,
     stale_threshold_hours: int = 26,
     db_path: str | None = None,
 ) -> dict:
@@ -1650,17 +1650,20 @@ def get_job_health(
     A silently-stopped scheduler is invisible - nothing fails, the data just ages.
     This turns the absence of a recent successful daily run into a visible signal:
     when the last completed run is older than ``stale_threshold_hours`` (default 26h)
-    the job is flagged stale. Read-only.
+    the job is flagged stale. ``as_of_date`` defaults to today, so the daily
+    health-check can call this with no arguments. Read-only.
     """
 
+    import datetime as _dt
     import sqlite3
 
+    resolved_as_of = as_of_date or _dt.date.today().isoformat()
     resolved_db_path = db_path or str(default_db_path())
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
         return get_job_health_for_db(
-            conn, as_of_date=as_of_date, stale_threshold_hours=stale_threshold_hours
+            conn, as_of_date=resolved_as_of, stale_threshold_hours=stale_threshold_hours
         )
     finally:
         conn.close()
