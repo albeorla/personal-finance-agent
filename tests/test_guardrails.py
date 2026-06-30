@@ -41,6 +41,32 @@ def test_cash_floor_pass_when_above(tmp_path):
     assert [f for f in res["findings"] if f["rule_type"] == "cash_floor"] == []
 
 
+def test_future_date_does_not_false_breach_when_income_lands_first(tmp_path):
+    # Snapshot is 2026-06-20 with $1,000 (below the $2,500 floor). A $5,000
+    # paycheck lands 2026-07-01. Evaluating the floor as-of a FUTURE date must
+    # roll that paycheck into the starting balance, not start from the stale
+    # pre-paycheck $1,000 and report a phantom breach.
+    conn = _db(tmp_path / "g.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "paycheck", "name": "Paycheck", "kind": "income",
+                    "cadence": "monthly", "status": "active", "source": "seed"},
+        instances=[{"id": "paycheck:2026-07-01", "due_date": "2026-07-01",
+                    "amount": 5000.0, "direction": "inflow", "status": "expected",
+                    "source": "seed"}],
+    )
+    res = evaluate_guardrails(conn, as_of_date="2026-07-15", accounts=_accounts(1000.0), drift_findings=[])
+    assert [f for f in res["findings"] if f["rule_type"] == "cash_floor"] == []
+
+
+def test_future_date_still_breaches_when_genuinely_short(tmp_path):
+    # Same future as-of, but no income before it: the breach is real and must
+    # still fire (the roll-forward fix must not mask genuine shortfalls).
+    conn = _db(tmp_path / "g.sqlite")
+    res = evaluate_guardrails(conn, as_of_date="2026-07-15", accounts=_accounts(1000.0), drift_findings=[])
+    assert [f for f in res["findings"] if f["rule_type"] == "cash_floor"]
+
+
 def test_drift_threshold_exceeded(tmp_path):
     conn = _db(tmp_path / "g.sqlite")
     drift = [{"finding_type": "missing_expected", "id": "d1", "cash_flow_impact": -3000.0}]
