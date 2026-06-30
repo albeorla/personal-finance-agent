@@ -180,6 +180,23 @@ def test_apply_obligation_instances_normalizes_signed_outflows(tmp_path):
     ]
 
 
+def test_server_apply_requires_autopay_classification(tmp_path):
+    import pytest
+
+    pytest.importorskip("mcp", reason="MCP server deps not installed")
+    from financial_agent import server
+
+    db = tmp_path / "fa.sqlite"
+    inst = [{"due_date": "2026-07-01", "amount": -10.0, "source": "seed"}]
+    no_autopay = {"id": "x", "name": "X", "kind": "bill", "source": "seed"}
+    # creating a bill without classifying autopay is rejected (so it can't silently go quiet)
+    with pytest.raises(ValueError, match="autopay"):
+        server.apply_obligation_instances(no_autopay, inst, db_path=str(db))
+    # with an explicit classification it applies
+    res = server.apply_obligation_instances({**no_autopay, "autopay": False}, inst, db_path=str(db))
+    assert res["obligation_id"] == "x"
+
+
 def test_set_obligation_end_excludes_instances_past_end(tmp_path):
     from datetime import date
 

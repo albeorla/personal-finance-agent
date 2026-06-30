@@ -652,10 +652,11 @@ def apply_obligation_instances(
 ) -> dict:
     """Create or update an obligation and its dated instances.
 
-    obligation keys: id (req), name (req), kind (req), source (req); cadence
-    (e.g. 'monthly'), status (default 'active'), autopay (default True - set False
-    to surface as a manual-due reminder), amount_discretionary (default False -
-    True when the modeled amount is only a floor, e.g. a card minimum).
+    obligation keys: id (req), name (req), kind (req), source (req), autopay
+    (REQUIRED here: true = the bill auto-pays itself; false = you pay it manually,
+    so it surfaces as a due reminder); cadence (e.g. 'monthly'), status (default
+    'active'), active_until (ISO date the bill stops projecting), amount_discretionary
+    (default False - True when the modeled amount is only a floor, e.g. a card minimum).
 
     Each instances item: due_date (req), amount (req; negative => outflow when
     direction is omitted, stored as magnitude with the sign carried by direction),
@@ -671,6 +672,17 @@ def apply_obligation_instances(
     """
 
     import sqlite3
+
+    # Require an explicit autopay decision when a bill is created conversationally.
+    # The backing function defaults autopay=True (quiet) for the auto-detectors, but
+    # a hand-added bill with no decision would then silently never surface as a
+    # reminder. Forcing the choice here closes that trap at the one user-facing path.
+    if "autopay" not in obligation:
+        raise ValueError(
+            "obligation must set 'autopay': true (the bill auto-pays itself) or "
+            "false (you pay it manually, so it surfaces as a due reminder). This is "
+            "required so a manual bill can never silently fail to surface."
+        )
 
     resolved_db_path = db_path or str(default_db_path())
     conn = sqlite3.connect(resolved_db_path)
