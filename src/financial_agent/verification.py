@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .schema import ensure_app_schema, has_app_schema
@@ -41,6 +41,12 @@ _PROJECTABLE_STATUSES = ("expected", "needs_review", "partially_paid")
 
 SEVERITY_ERROR = "error"
 SEVERITY_WARN = "warn"
+
+# A recurring obligation should have modeled instances out to this horizon; when
+# its last projectable instance falls short, the long-window projection is silently
+# rosy (the later cycles are simply absent). Tunable knob.
+COVERAGE_HORIZON_DAYS = 90
+_RECURRING_CADENCES = ("monthly", "weekly", "biweekly", "quarterly", "semimonthly")
 
 
 def run_verification(
@@ -68,6 +74,7 @@ def run_verification(
         ("duplicate_instances", _check_duplicate_instances),
         ("statement_identity", _check_statement_identity),
         ("instance_sign_sanity", _check_instance_sign_sanity),
+        ("coverage_horizon", _check_coverage_horizon),
     ]
     findings: list[dict[str, Any]] = []
     checks_run: list[str] = []
@@ -363,6 +370,57 @@ def _check_instance_sign_sanity(conn: sqlite3.Connection, as_of_date: str) -> li
 
 
 # --- internals -------------------------------------------------------------
+
+
+def _check_coverage_horizon(conn: sqlite3.Connection, as_of_date: str) -> list[dict[str, Any]]:
+    """A recurring obligation should be modeled out to the projection horizon.
+
+    When an active recurring obligation has future instances that stop short of
+    ``as_of + COVERAGE_HORIZON_DAYS``, the long-window runway omits its later
+    cycles and reads rosier than reality. WARN (not an error): the model is
+    incomplete, not wrong. Obligations already fully in the past are left to the
+    drift/missing checks; this only flags ones that run out mid-horizon.
+    """
+
+    as_of = date.fromisoformat(as_of_date[:10])
+    horizon = (as_of + timedelta(days=COVERAGE_HORIZON_DAYS)).isoformat()
+    rows = conn.execute(
+        f"""
+        SELECT ob.id, ob.name, ob.cadence, MAX(oi.due_date) AS last_due
+        FROM obligations ob
+        JOIN obligation_instances oi ON oi.obligation_id = ob.id
+        WHERE ob.status = 'active'
+          AND ob.cadence IN ({",".join("?" for _ in _RECURRING_CADENCES)})
+          AND oi.status IN ({_status_placeholders()})
+        GROUP BY ob.id
+        HAVING MAX(oi.due_date) >= ? AND MAX(oi.due_date) < ?
+        ORDER BY ob.id
+        """,
+        (*_RECURRING_CADENCES, *_PROJECTABLE_STATUSES, as_of.isoformat(), horizon),
+    ).fetchall()
+    findings: list[dict[str, Any]] = []
+    for r in rows:
+        findings.append(
+            _finding(
+                check_id="coverage_horizon",
+                severity=SEVERITY_WARN,
+                title=f"{r['name']} has no modeled instances past {r['last_due']}",
+                detail=(
+                    f"{r['name']} is a recurring ({r['cadence']}) obligation, but its last "
+                    f"projectable instance is {r['last_due']} - short of the "
+                    f"{COVERAGE_HORIZON_DAYS}-day horizon ({horizon}). The long-window "
+                    f"projection omits its later cycles, so the runway past {r['last_due']} "
+                    "is rosier than reality. Backfill/extend its instances."
+                ),
+                evidence={
+                    "obligation_id": r["id"],
+                    "cadence": r["cadence"],
+                    "last_due": r["last_due"],
+                    "horizon": horizon,
+                },
+            )
+        )
+    return findings
 
 
 def _status_placeholders() -> str:
