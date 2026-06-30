@@ -43,6 +43,7 @@ from .verification import (
     list_verification_findings as list_verification_findings_for_db,
     run_verification as run_verification_for_db,
 )
+from .analytics import list_transactions as list_transactions_for_db
 from .analytics import render_spending_markdown as render_spending_markdown_for_db
 from .backfill import backfill_recurring_instances as backfill_recurring_instances_for_db
 from .onboarding import auto_model_high_confidence_recurring as auto_model_high_confidence_recurring_for_db
@@ -2155,6 +2156,47 @@ def summarize_spending(
     if render_markdown:
         report["markdown"] = render_spending_markdown_for_db(report)
     return report
+
+
+@mcp.tool()
+def list_transactions(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    query: str | None = None,
+    min_amount: float | None = None,
+    account_id: str | None = None,
+    include_pending: bool = True,
+    limit: int = 50,
+    db_path: str | None = None,
+) -> dict:
+    """List individual transactions, newest first, so you can quote an EXACT
+    charge amount (for reconciliation or "what was that $X charge?") instead of
+    only the aggregates from summarize_spending. Read-only.
+
+    Optional filters: start_date / end_date (YYYY-MM-DD, inclusive, on posted
+    date), query (case-insensitive substring over payee + description),
+    min_amount (absolute-value floor), account_id, include_pending. limit is
+    capped at 500; the 'truncated' flag signals more rows matched.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list_transactions_for_db(
+            conn,
+            start_date=start_date,
+            end_date=end_date,
+            query=query,
+            min_amount=min_amount,
+            account_id=account_id,
+            include_pending=include_pending,
+            limit=limit,
+        )
+    finally:
+        conn.close()
 
 
 @mcp.tool()
