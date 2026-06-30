@@ -356,8 +356,10 @@ def _render_coverage(cov: dict[str, Any] | None, lines: list[str]) -> None:
             for status, n in cov["onboarding_by_status"].items()
             if n
         )
+        n_active = cov["onboarding_active"]
+        noun = "charge" if n_active == 1 else "charges"
         lines.append(
-            f"Not yet modeled: {cov['onboarding_active']} charges awaiting review "
+            f"Not yet modeled: {n_active} {noun} awaiting review "
             f"({parts}) - these are NOT in the runway."
         )
     else:

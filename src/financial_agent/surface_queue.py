@@ -281,11 +281,12 @@ def _onboarding_digest_surface_item(
             preposition="in",
         )
     )
-    description = f"{count} charge(s) awaiting review. Top: {top}{more}. {action}"
+    noun = "charge" if count == 1 else "charges"
+    description = f"{count} {noun} awaiting review. Top: {top}{more}. {action}"
     return [
         {
             "surface_key": _ONBOARDING_DIGEST_KEY,
-            "content": f"{count} charges to review",
+            "content": f"{count} {noun} to review",
             "description": description,
             "due_date": by,
         }

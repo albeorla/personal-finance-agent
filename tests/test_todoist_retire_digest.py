@@ -252,6 +252,17 @@ def test_digest_single_item_for_many_candidates(tmp_path):
     assert digest[0]["content"] == "56 charges to review"
 
 
+def test_digest_uses_singular_for_one_candidate(tmp_path):
+    conn = _db(tmp_path / "f.db")
+    _seed_candidate(conn, "cand:1", "Youtube TV", priority=1.0)
+
+    items = build_surface_items(conn, as_of_date=AS_OF)
+
+    digest = [it for it in items if it["surface_key"] == "onboarding-digest"]
+    assert digest[0]["content"] == "1 charge to review"
+    assert digest[0]["description"].startswith("1 charge awaiting review.")
+
+
 def test_digest_absent_when_zero(tmp_path):
     conn = _db(tmp_path / "f.db")
 
