@@ -57,6 +57,48 @@ def build_cash_flow_projections(
     ]
 
 
+def _date_part(value: str | None) -> date | None:
+    """Date portion of a snapshot ``recorded_at`` (which may carry a time)."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _roll_forward_to_start(
+    conn: sqlite3.Connection, *, snapshot_date: date, start_date: date
+) -> float:
+    """Net signed amount of instances dated between the balance snapshot and the
+    projection start, used to carry the snapshot balance forward to ``start_date``.
+
+    The balance snapshot is only true as of ``recorded_at``. When a projection
+    starts later than that (e.g. a what-if query for a future date), every
+    instance dated in between - paychecks included - falls outside the window's
+    ``due_date >= start_date`` filter and silently vanishes, so the run starts
+    from today's cash with no upcoming income and trips a false cash-floor breach.
+    Netting that gap back into the starting balance is the fix.
+    """
+    total = 0.0
+    for r in conn.execute(
+        """
+        SELECT oi.amount, oi.direction
+        FROM obligation_instances oi
+        JOIN obligations o ON o.id = oi.obligation_id
+        WHERE oi.due_date > ?
+          AND oi.due_date < ?
+          AND oi.status IN ('expected', 'needs_review', 'partially_paid')
+          AND o.status = 'active'
+          AND (o.active_until IS NULL OR oi.due_date <= o.active_until)
+          AND COALESCE(oi.cash_flow_treatment, 'direct_checking') = 'direct_checking'
+        """,
+        (snapshot_date.isoformat(), start_date.isoformat()),
+    ).fetchall():
+        total += _signed_amount(float(r["amount"]), r["direction"])
+    return round(total, 2)
+
+
 def _build_window_projection(
     conn: sqlite3.Connection,
     *,
@@ -66,6 +108,19 @@ def _build_window_projection(
     working_account: dict[str, Any],
 ) -> dict[str, Any]:
     end_date_exclusive = start_date + timedelta(days=window_days)
+
+    # Carry the balance snapshot forward to start_date when the snapshot predates
+    # it, so a future-dated projection includes the income/bills between then and
+    # now instead of starting from a stale pre-paycheck balance (false floor breach).
+    snapshot_balance = round(float(starting_balance), 2)
+    snapshot_date = _date_part(working_account.get("recorded_at"))
+    rolled_forward = 0.0
+    if snapshot_date is not None and snapshot_date < start_date:
+        rolled_forward = _roll_forward_to_start(
+            conn, snapshot_date=snapshot_date, start_date=start_date
+        )
+    starting_balance = round(snapshot_balance + rolled_forward, 2)
+
     rows = conn.execute(
         """
         SELECT
@@ -95,6 +150,7 @@ def _build_window_projection(
           AND oi.due_date < ?
           AND oi.status IN ('expected', 'needs_review', 'partially_paid')
           AND o.status = 'active'
+          AND (o.active_until IS NULL OR oi.due_date <= o.active_until)
           AND COALESCE(oi.cash_flow_treatment, 'direct_checking') = 'direct_checking'
         ORDER BY oi.due_date, oi.id
         """,
@@ -150,6 +206,8 @@ def _build_window_projection(
             "recorded_at": working_account["recorded_at"],
         },
         "starting_balance": round(float(starting_balance), 2),
+        "snapshot_balance": snapshot_balance,
+        "rolled_forward_to_start": rolled_forward,
         "ending_balance": running_balance,
         "lowest_balance": round(lowest_balance, 2),
         "lowest_balance_date": lowest_balance_date,

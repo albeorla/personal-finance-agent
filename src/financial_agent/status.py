@@ -10,6 +10,7 @@ from typing import Any
 from .cashflow import build_cash_flow_projections
 from .drift import detect_drift
 from .guardrails import evaluate_guardrails
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 
 
 SCHEMA_VERSION = "finance_status.v1"
@@ -163,13 +164,8 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 # it -- so the next day's feed sync cannot shadow it. When NO manual snapshot
 # exists, the latest feed snapshot wins. Every consumer that needs "the current
 # balance for an account" (status, the debts layer, the avalanche, etc.) MUST
-# order by this so they agree.
-_BALANCE_PRECEDENCE_ORDER_BY = """
-    ORDER BY
-        CASE WHEN {alias}.source = 'manual' THEN 0 ELSE 1 END,
-        {alias}.recorded_at DESC,
-        {alias}.id DESC
-"""
+# order by this so they agree. Defined once in manual_balance and shared here.
+_BALANCE_PRECEDENCE_ORDER_BY = BALANCE_PRECEDENCE_ORDER_BY
 
 
 def resolve_account_balance(

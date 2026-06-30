@@ -124,6 +124,81 @@ def summarize_spending(
     }
 
 
+def list_transactions(
+    conn: sqlite3.Connection,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    query: str | None = None,
+    min_amount: float | None = None,
+    account_id: str | None = None,
+    include_pending: bool = True,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """List individual transactions, newest first. Read-only.
+
+    Fills the gap where only aggregate ``summarize_spending`` existed: this is how
+    you quote an EXACT charge amount for reconciliation or "what was that $X?".
+    Filters (all optional): ``start_date``/``end_date`` (YYYY-MM-DD, inclusive, on
+    the posted date), ``query`` (case-insensitive substring over payee+description),
+    ``min_amount`` (absolute-value floor), ``account_id``, and ``include_pending``.
+    ``limit`` is capped at 500; ``truncated`` flags when more rows matched.
+    """
+
+    limit = max(1, min(int(limit), 500))
+    where = ["1=1"]
+    params: list[Any] = []
+    if start_date:
+        where.append("substr(t.posted,1,10) >= ?")
+        params.append(start_date)
+    if end_date:
+        where.append("substr(t.posted,1,10) <= ?")
+        params.append(end_date)
+    if account_id:
+        where.append("t.account_id = ?")
+        params.append(account_id)
+    if min_amount is not None:
+        where.append("ABS(t.amount) >= ?")
+        params.append(abs(float(min_amount)))
+    if query:
+        where.append("LOWER(COALESCE(t.payee,'') || ' ' || COALESCE(t.description,'')) LIKE ?")
+        params.append(f"%{query.lower()}%")
+    if not include_pending:
+        where.append("t.pending = 0")
+
+    sql = (
+        "SELECT t.id, t.account_id, a.name AS account_name, t.posted, t.amount, "
+        "t.payee, t.description, t.pending, t.source "
+        "FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY t.posted DESC, t.id DESC LIMIT ?"
+    )
+    try:
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
+    except sqlite3.OperationalError:
+        # No transaction history table yet (never synced): return an empty,
+        # well-formed result rather than raising.
+        return {"count": 0, "truncated": False, "limit": limit, "transactions": []}
+
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    txns = [
+        {
+            "id": r["id"],
+            "account_id": r["account_id"],
+            "account_name": r["account_name"],
+            "posted": r["posted"],
+            "amount": round(float(r["amount"]), 2),
+            "payee": r["payee"],
+            "description": r["description"],
+            "pending": bool(r["pending"]),
+            "source": r["source"],
+        }
+        for r in rows
+    ]
+    return {"count": len(txns), "truncated": truncated, "limit": limit, "transactions": txns}
+
+
 def render_spending_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Spending {report['start_date']} -> {report['end_date']} (by {report['group_by']})",

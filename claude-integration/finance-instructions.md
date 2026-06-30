@@ -28,6 +28,10 @@ memory, from a file you read earlier, or by estimation.
   integration. Do not execute the action outbox otherwise.
 - If you do not have a tool result for a figure, say so and call the tool. Show
   provenance and any `needs_review` / estimate flags the tools return.
+- If an attached image, infographic, or statement renders as an empty/placeholder
+  icon with no visible content, do NOT build income-split or payoff math on it.
+  Treat any number read off an infographic or statement image as approximate until
+  cross-checked against a tool result, and ask for a re-send before analyzing.
 
 The legacy `just`-based ritual is being retired in favor of these tools; prefer
 the MCP server over the old commands.

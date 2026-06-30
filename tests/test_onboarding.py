@@ -301,6 +301,30 @@ def test_get_next_skips_resolved_candidates(tmp_path):
     assert second["merchant_key"] == "eversource_energy"
 
 
+def test_decision_accepts_intuitive_shapes(tmp_path):
+    # The first call to this tool commonly names the action under the tool's own
+    # param name ("decision") or passes a bare action string; both must work,
+    # not just the canonical {"action": ...} dict.
+    conn = _seed_source_db(
+        tmp_path / "src.sqlite",
+        accounts=[AMEX, CHECKING],
+        transactions=GAULT_AMEX_ROWS + EVERSOURCE_CHECKING_ROWS,
+    )
+    scan_charge_onboarding_candidates(conn)
+
+    first = get_next_charge_onboarding_candidate(conn)
+    # "decision" key is accepted as an alias for "action"; the candidate resolves
+    # so get_next advances past it.
+    record_charge_onboarding_decision(conn, first["id"], {"decision": "defer"})
+    second = get_next_charge_onboarding_candidate(conn)
+    assert second["id"] != first["id"]
+
+    # a bare action string is accepted too
+    record_charge_onboarding_decision(conn, second["id"], "reject")
+    after = get_next_charge_onboarding_candidate(conn)
+    assert after is None or after["id"] not in {first["id"], second["id"]}
+
+
 # ---------------------------------------------------------------------------
 # Acceptance: candidates are not cash-flow truth
 # ---------------------------------------------------------------------------
@@ -669,6 +693,25 @@ def test_preview_apply_does_not_write(tmp_path):
     assert plan["obligation"]["id"] == "onboarded_eversource_energy_checking"
     assert [i["due_date"] for i in plan["instances"]] == ["2026-07-28", "2026-08-28", "2026-09-28"]
     assert all(i["amount"] == 115.87 for i in plan["instances"])
+
+
+def test_apply_overrides_correct_a_detector_misread(tmp_path):
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[CHECKING], transactions=EVERSOURCE_CHECKING_ROWS)
+    scan_charge_onboarding_candidates(conn)
+    cid = _accept(conn, "eversource_energy")
+
+    # amount_override flows into every generated instance (detector amount was wrong)
+    plan = preview_charge_onboarding_apply(
+        conn, cid, start_date="2026-07-01", through_date="2026-09-30", amount_override=200.0
+    )
+    assert all(i["amount"] == 200.0 for i in plan["instances"])
+
+    # cadence_override changes the schedule -> more due dates than the monthly default
+    monthly = preview_charge_onboarding_apply(conn, cid, start_date="2026-07-01", through_date="2026-07-31")
+    weekly = preview_charge_onboarding_apply(
+        conn, cid, start_date="2026-07-01", through_date="2026-07-31", cadence_override="weekly"
+    )
+    assert len(weekly["instances"]) > len(monthly["instances"])
 
 
 def test_apply_creates_obligation_and_dated_instances(tmp_path):

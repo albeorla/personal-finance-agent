@@ -151,6 +151,54 @@ def resolve_followup(
     return {"id": followup_id, "resolved": cur.rowcount > 0}
 
 
+def update_followup(
+    conn: sqlite3.Connection,
+    followup_id: str,
+    *,
+    text: str | None = None,
+    surface_when: str | None = None,
+    priority: str | None = None,
+    linked_obligation_id: str | None = None,
+) -> dict[str, Any]:
+    """Edit a follow-up in place by id (reschedule, reword, re-prioritize, relink).
+
+    Only the fields you pass change; the id stays stable. This is the edit path:
+    re-running capture_followup with new text would mint a NEW row (the capture id
+    is content-derived), so use this to change an existing reminder.
+    """
+
+    ensure_app_schema(conn)
+    fields: list[str] = []
+    params: list[Any] = []
+    if text is not None:
+        if not text.strip():
+            raise ValueError("Follow-up text must be non-empty.")
+        fields.append("text = ?")
+        params.append(text.strip())
+    if surface_when is not None:
+        if not surface_when.strip():
+            raise ValueError("Follow-up surface_when must be non-empty.")
+        fields.append("surface_when = ?")
+        params.append(_coerce_date(surface_when))
+    if priority is not None:
+        fields.append("priority = ?")
+        params.append(priority)
+    if linked_obligation_id is not None:
+        fields.append("linked_obligation_id = ?")
+        params.append(linked_obligation_id)
+    if not fields:
+        raise ValueError("update_followup needs at least one field to change.")
+
+    fields.append("updated_at = ?")
+    params.append(_now())
+    params.append(followup_id)
+    cur = conn.execute(f"UPDATE follow_ups SET {', '.join(fields)} WHERE id = ?", params)
+    if cur.rowcount == 0:
+        return {"id": followup_id, "updated": False}
+    row = conn.execute("SELECT * FROM follow_ups WHERE id = ?", (followup_id,)).fetchone()
+    return {"id": followup_id, "updated": True, "followup": _row_to_dict(row)}
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],

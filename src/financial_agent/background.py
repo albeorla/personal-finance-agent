@@ -521,7 +521,7 @@ def _summarize_surface(result: dict[str, Any]) -> dict[str, Any]:
     # keep the event log compact; the ledger holds the durable per-key state.
     return {
         k: result[k]
-        for k in ("status", "integration_enabled", "created", "updated", "skipped", "resolved", "failed")
+        for k in ("status", "integration_enabled", "created", "updated", "skipped", "resolved", "retired", "failed")
         if k in result
     }
 

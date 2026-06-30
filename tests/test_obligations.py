@@ -180,6 +180,99 @@ def test_apply_obligation_instances_normalizes_signed_outflows(tmp_path):
     ]
 
 
+def test_server_apply_requires_autopay_classification(tmp_path):
+    import pytest
+
+    pytest.importorskip("mcp", reason="MCP server deps not installed")
+    from financial_agent import server
+
+    db = tmp_path / "fa.sqlite"
+    inst = [{"due_date": "2026-07-01", "amount": -10.0, "source": "seed"}]
+    no_autopay = {"id": "x", "name": "X", "kind": "bill", "source": "seed"}
+    # creating a bill without classifying autopay is rejected (so it can't silently go quiet)
+    with pytest.raises(ValueError, match="autopay"):
+        server.apply_obligation_instances(no_autopay, inst, db_path=str(db))
+    # with an explicit classification it applies
+    res = server.apply_obligation_instances({**no_autopay, "autopay": False}, inst, db_path=str(db))
+    assert res["obligation_id"] == "x"
+
+
+def test_deactivate_obligation_removes_from_runway(tmp_path):
+    from financial_agent.obligations import deactivate_obligation
+
+    conn = _db(tmp_path / "o.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "oldcar", "name": "Old car lease", "kind": "auto", "status": "active", "source": "seed"},
+        instances=[
+            {"id": "oldcar:2026-08-01", "due_date": "2026-08-01", "amount": -500.0, "source": "seed"},
+            {"id": "oldcar:2026-09-01", "due_date": "2026-09-01", "amount": -500.0, "source": "seed"},
+        ],
+    )
+    res = deactivate_obligation(conn, "oldcar")
+    assert res["deactivated"] is True
+    assert res["projectable_instances_removed"] == 2
+    assert conn.execute("SELECT status FROM obligations WHERE id='oldcar'").fetchone()[0] == "inactive"
+    # idempotent + not-found are reported, not raised
+    assert deactivate_obligation(conn, "oldcar")["reason"] == "already_inactive"
+    assert deactivate_obligation(conn, "nope")["deactivated"] is False
+
+
+def test_set_obligation_end_excludes_instances_past_end(tmp_path):
+    from datetime import date
+
+    from financial_agent.cashflow import build_cash_flow_projections
+    from financial_agent.obligations import set_obligation_end
+
+    conn = _db(tmp_path / "o.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "newcar", "name": "New car lease", "kind": "auto",
+                    "cadence": "monthly", "status": "active", "source": "seed"},
+        instances=[
+            {"id": "newcar:2026-08-08", "due_date": "2026-08-08", "amount": -500.0, "source": "seed"},
+            {"id": "newcar:2029-09-08", "due_date": "2029-09-08", "amount": -500.0, "source": "seed"},
+        ],
+    )
+    accounts = [{"account_id": "chk", "account_name": "Checking", "kind": "checking",
+                 "available": 10000.0, "recorded_at": "2026-08-01T00:00:00+00:00"}]
+
+    res = set_obligation_end(conn, "newcar", "2029-08-31")
+    assert res["updated"] and res["active_until"] == "2029-08-31"
+
+    projs, _ = build_cash_flow_projections(conn, accounts=accounts, windows=[2000], start_date=date(2026, 8, 1))
+    dates = [e["due_date"] for e in projs[0]["events"]]
+    assert "2026-08-08" in dates  # before the end -> projected
+    assert "2029-09-08" not in dates  # past active_until -> excluded
+
+    # clearing the end date brings the later instance back (open-ended again)
+    set_obligation_end(conn, "newcar", None)
+    projs2, _ = build_cash_flow_projections(conn, accounts=accounts, windows=[2000], start_date=date(2026, 8, 1))
+    assert "2029-09-08" in [e["due_date"] for e in projs2[0]["events"]]
+
+    assert set_obligation_end(conn, "nope", "2030-01-01")["updated"] is False
+
+
+def test_list_obligations_by_id_returns_one_any_status(tmp_path):
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "rent", "name": "Rent", "kind": "housing", "status": "active", "source": "seed"},
+        instances=[{"due_date": "2026-07-03", "amount": -3000.0, "source": "seed"}],
+    )
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "old_car", "name": "Old car", "kind": "auto", "status": "inactive", "source": "seed"},
+        instances=[{"due_date": "2026-05-01", "amount": -500.0, "source": "seed"}],
+    )
+    # by-id returns exactly that obligation...
+    one = list_obligations(conn, obligation_id="rent")
+    assert [o["id"] for o in one] == ["rent"]
+    # ...even when it is not active (status default 'active' is bypassed for id lookups)
+    inactive = list_obligations(conn, obligation_id="old_car")
+    assert [o["id"] for o in inactive] == ["old_car"]
+
+
 def test_list_obligations_includes_instances(tmp_path):
     conn = _db(tmp_path / "obligations.sqlite")
     apply_obligation_instances(

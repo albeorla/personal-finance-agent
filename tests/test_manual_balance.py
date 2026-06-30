@@ -67,20 +67,22 @@ def test_set_manual_balance_exact_match_updates_status(tmp_path):
     _build_db(
         db_path,
         accounts=[("apple-1", "Apple Card", "Goldman Sachs")],
-        snapshots=[("apple-1", -5949.0, "2026-06-01T10:00:00+00:00")],
+        snapshots=[("apple-1", -1100.0, "2026-06-01T10:00:00+00:00")],
     )
 
     conn = _connect(db_path)
-    result = set_manual_balance(conn, "apple", 6122.0, "2026-06-20", note="Updated via portal")
+    # Card balance is a liability -> stored negative, matching the feed's sign.
+    result = set_manual_balance(conn, "apple", -1200.0, "2026-06-20", note="Updated via portal")
     conn.commit()
     conn.close()
 
     assert result["status"] == "ok"
     assert result["account_id"] == "apple-1"
-    assert result["balance"] == 6122.0
-    assert result["available"] == 6122.0
+    assert result["balance"] == -1200.0
+    assert result["available"] == -1200.0
     assert result["source"] == "manual"
     assert result["note"] == "Updated via portal"
+    assert result["sign_corrected"] is False  # already the right sign
 
     # Snapshot row recorded through the shared insert.
     conn = _connect(db_path)
@@ -90,16 +92,57 @@ def test_set_manual_balance_exact_match_updates_status(tmp_path):
         ("apple-1",),
     ).fetchone()
     conn.close()
-    assert row["balance"] == 6122.0
-    assert row["available"] == 6122.0
+    assert row["balance"] == -1200.0
+    assert row["available"] == -1200.0
     assert row["source"] == "manual"
     assert row["manual_note"] == "Updated via portal"
 
-    assert _latest_balance(db_path, "apple-1") == 6122.0
+    assert _latest_balance(db_path, "apple-1") == -1200.0
 
     digest = build_daily_digest(db_path=str(db_path), as_of_date="2026-06-20")
     apple = next(a for a in digest["balances"]["accounts"] if a["name"] == "Apple Card")
-    assert apple["balance"] == 6122.0
+    assert apple["balance"] == -1200.0
+
+
+def test_set_manual_balance_corrects_fat_fingered_sign(tmp_path):
+    # The Apple Card feed reads -1100 (owed). Entering +1200 (a dropped minus) must
+    # be auto-corrected to -1200 so a positive value can't silently flip net worth.
+    db_path = tmp_path / "t.sqlite"
+    _build_db(
+        db_path,
+        accounts=[("apple-1", "Apple Card", "Goldman Sachs")],
+        snapshots=[("apple-1", -1100.0, "2026-06-01T10:00:00+00:00")],
+    )
+    conn = _connect(db_path)
+    result = set_manual_balance(conn, "apple", 1200.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+
+    assert result["sign_corrected"] is True
+    assert result["entered_balance"] == 1200.0
+    assert result["balance"] == -1200.0
+    assert _latest_balance(db_path, "apple-1") == -1200.0
+
+
+def test_set_manual_balance_does_not_flip_positive_account_or_wild_magnitude(tmp_path):
+    db_path = tmp_path / "t.sqlite"
+    _build_db(
+        db_path,
+        accounts=[("chk-1", "Checking", "Chase"), ("card-1", "Apple Card", "Goldman Sachs")],
+        snapshots=[
+            ("chk-1", 9000.0, "2026-06-01T10:00:00+00:00"),
+            ("card-1", -1100.0, "2026-06-01T10:00:00+00:00"),
+        ],
+    )
+    conn = _connect(db_path)
+    # Positive feed + positive manual -> no flip.
+    r1 = set_manual_balance(conn, "Checking", 9500.0, "2026-06-20")
+    # Opposite sign but implausibly different magnitude -> conservative: no flip.
+    r2 = set_manual_balance(conn, "Apple Card", 50.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+    assert r1["sign_corrected"] is False and r1["balance"] == 9500.0
+    assert r2["sign_corrected"] is False and r2["balance"] == 50.0
 
 
 def test_set_manual_balance_ambiguous_returns_candidates(tmp_path):
@@ -220,16 +263,16 @@ def test_set_manual_balance_newer_manual_snapshot_wins_over_older_simplefin(tmp_
     _build_db(
         db_path,
         accounts=[("chase-1", "Chase Checking", "Chase")],
-        snapshots=[("chase-1", 5949.0, "2026-06-20T10:00:00+00:00")],
+        snapshots=[("chase-1", 1100.0, "2026-06-20T10:00:00+00:00")],
     )
 
     conn = _connect(db_path)
-    result = set_manual_balance(conn, "chase", 6122.0, "2026-06-20", note="Apple portal")
+    result = set_manual_balance(conn, "chase", 1200.0, "2026-06-20", note="Apple portal")
     conn.commit()
     conn.close()
 
     assert result["recorded_at"] == "2026-06-20T12:00:00+00:00"
-    assert _latest_balance(db_path, "chase-1") == 6122.0
+    assert _latest_balance(db_path, "chase-1") == 1200.0
 
 
 def test_same_day_simplefin_after_manual_does_not_override(tmp_path):
@@ -248,10 +291,10 @@ def test_same_day_simplefin_after_manual_does_not_override(tmp_path):
     _build_db(db_path, accounts=[("chase-1", "Chase Checking", "Chase")])
 
     conn = _connect(db_path)
-    set_manual_balance(conn, "chase", 6122.0, "2026-06-20")
+    set_manual_balance(conn, "chase", 1200.0, "2026-06-20")
     conn.commit()
     conn.close()
-    assert _latest_balance(db_path, "chase-1") == 6122.0
+    assert _latest_balance(db_path, "chase-1") == 1200.0
 
     # A same-day SimpleFIN snapshot recorded LATER in the day must not shadow the
     # manual correction.
@@ -259,7 +302,7 @@ def test_same_day_simplefin_after_manual_does_not_override(tmp_path):
     _add_snapshot(conn, "chase-1", 6100.0, "2026-06-20T14:00:00+00:00")
     conn.commit()
     conn.close()
-    assert _latest_balance(db_path, "chase-1") == 6122.0
+    assert _latest_balance(db_path, "chase-1") == 1200.0
 
 
 def test_same_day_simplefin_before_manual_does_not_override(tmp_path):
@@ -279,10 +322,10 @@ def test_same_day_simplefin_before_manual_does_not_override(tmp_path):
     assert _latest_balance(db_path, "chase-1") == 6100.0
 
     conn = _connect(db_path)
-    set_manual_balance(conn, "chase", 6122.0, "2026-06-20")
+    set_manual_balance(conn, "chase", 1200.0, "2026-06-20")
     conn.commit()
     conn.close()
-    assert _latest_balance(db_path, "chase-1") == 6122.0
+    assert _latest_balance(db_path, "chase-1") == 1200.0
 
 
 def test_next_day_simplefin_does_not_supersede_manual(tmp_path):
@@ -300,10 +343,10 @@ def test_next_day_simplefin_does_not_supersede_manual(tmp_path):
     _build_db(db_path, accounts=[("chase-1", "Chase Checking", "Chase")])
 
     conn = _connect(db_path)
-    set_manual_balance(conn, "chase", 6122.0, "2026-06-20")
+    set_manual_balance(conn, "chase", 1200.0, "2026-06-20")
     conn.commit()
     conn.close()
-    assert _latest_balance(db_path, "chase-1") == 6122.0
+    assert _latest_balance(db_path, "chase-1") == 1200.0
 
     # A later-day SimpleFIN snapshot must NOT shadow the sticky manual.
     conn = _connect(db_path)
@@ -311,7 +354,7 @@ def test_next_day_simplefin_does_not_supersede_manual(tmp_path):
     conn.commit()
     conn.close()
     now = datetime(2026, 6, 21, 18, 0, tzinfo=UTC)
-    assert _latest_balance(db_path, "chase-1", now=now) == 6122.0
+    assert _latest_balance(db_path, "chase-1", now=now) == 1200.0
 
 
 def test_newer_manual_replaces_older_manual_across_days(tmp_path):
@@ -325,10 +368,10 @@ def test_newer_manual_replaces_older_manual_across_days(tmp_path):
     _build_db(db_path, accounts=[("chase-1", "Chase Checking", "Chase")])
 
     conn = _connect(db_path)
-    set_manual_balance(conn, "chase", 6122.0, "2026-06-20")
+    set_manual_balance(conn, "chase", 1200.0, "2026-06-20")
     conn.commit()
     conn.close()
-    assert _latest_balance(db_path, "chase-1") == 6122.0
+    assert _latest_balance(db_path, "chase-1") == 1200.0
 
     conn = _connect(db_path)
     set_manual_balance(conn, "chase", 5800.0, "2026-06-22")
@@ -361,8 +404,8 @@ def test_set_manual_balance_negative_correction_wins_over_same_day_later_simplef
     same-day SimpleFIN snapshot recorded later in the day.
 
     Reproduces the live bug where the Apple Card (a liability stored negative)
-    was corrected to -6122.03 but get_finance_status kept showing the stale
-    -5949.32 feed value, because the manual row was stamped noon UTC while the
+    was corrected to -1200.03 but get_finance_status kept showing the stale
+    -1100.32 feed value, because the manual row was stamped noon UTC while the
     SimpleFIN snapshot was recorded at 14:56 (and carried no timezone offset, so
     string ordering put it ahead). The fix stamps the manual row strictly after
     the latest existing snapshot and preserves the caller's sign.
@@ -375,36 +418,36 @@ def test_set_manual_balance_negative_correction_wins_over_same_day_later_simplef
     # Same-day SimpleFIN snapshot, recorded after noon, stored with no tz offset
     # (exactly how SimpleFIN writes it) and negative (liability).
     _add_snapshot(
-        conn, "apple-1", -5949.32, "2026-06-24T14:56:45", available=-7917.48
+        conn, "apple-1", -1100.32, "2026-06-24T14:56:45", available=-7917.48
     )
     conn.commit()
     conn.close()
 
     conn = _connect(db_path)
-    result = set_manual_balance(conn, "Apple Card", -6122.03, "2026-06-24", note="Portal")
+    result = set_manual_balance(conn, "Apple Card", -1200.03, "2026-06-24", note="Portal")
     conn.commit()
     conn.close()
 
     assert result["status"] == "ok"
     assert result["account_id"] == "apple-1"
     # Sign preserved: the card correction stays negative.
-    assert result["balance"] == -6122.03
-    assert result["available"] == -6122.03
+    assert result["balance"] == -1200.03
+    assert result["available"] == -1200.03
 
     # Manual snapshot stamped strictly after the 14:56 feed snapshot.
     assert result["recorded_at"] > "2026-06-24T14:56:45"
 
     # get_finance_status reflects the manual correction, not the stale feed value.
     now = datetime(2026, 6, 24, 18, 0, tzinfo=UTC)
-    assert _latest_balance(db_path, "apple-1", now=now) == -6122.03
+    assert _latest_balance(db_path, "apple-1", now=now) == -1200.03
 
 
 def test_set_manual_balance_deletes_superseded_same_day_manual_row(tmp_path):
     """A wrong-sign manual row must not linger as a landmine.
 
     Reproduces the live Apple Card history: a first manual correction stored the
-    wrong sign (+6122.03 at noon UTC). A second, correct manual correction
-    (-6122.03) on the same as-of date must both win resolution AND delete the
+    wrong sign (+1200.03 at noon UTC). A second, correct manual correction
+    (-1200.03) on the same as-of date must both win resolution AND delete the
     stale wrong-sign manual row, so it can never re-win if a future same-day
     correction ever lands at or before its timestamp. Feed snapshots are
     untouched.
@@ -415,25 +458,25 @@ def test_set_manual_balance_deletes_superseded_same_day_manual_row(tmp_path):
 
     conn = _connect(db_path)
     # Same-day SimpleFIN feed snapshot (negative liability, no tz offset).
-    _add_snapshot(conn, "apple-1", -5949.32, "2026-06-24T14:56:45", available=-7917.48)
+    _add_snapshot(conn, "apple-1", -1100.32, "2026-06-24T14:56:45", available=-7917.48)
     conn.commit()
     conn.close()
 
     # First manual correction stores the WRONG sign (the original live bug).
     conn = _connect(db_path)
-    first = set_manual_balance(conn, "Apple Card", 6122.03, "2026-06-24", note="wrong sign")
+    first = set_manual_balance(conn, "Apple Card", 1200.03, "2026-06-24", note="wrong sign")
     conn.commit()
     conn.close()
     assert first["status"] == "ok"
 
     # Correct manual correction, same as-of date, right (negative) sign.
     conn = _connect(db_path)
-    second = set_manual_balance(conn, "Apple Card", -6122.03, "2026-06-24", note="fixed")
+    second = set_manual_balance(conn, "Apple Card", -1200.03, "2026-06-24", note="fixed")
     conn.commit()
     conn.close()
 
     assert second["status"] == "ok"
-    assert second["balance"] == -6122.03
+    assert second["balance"] == -1200.03
     assert second["superseded_manual_snapshots"] == 1
 
     conn = _connect(db_path)
@@ -449,13 +492,13 @@ def test_set_manual_balance_deletes_superseded_same_day_manual_row(tmp_path):
 
     # Exactly one manual row remains (the correct one); the wrong-sign row is gone.
     assert len(manual_rows) == 1
-    assert manual_rows[0]["balance"] == -6122.03
+    assert manual_rows[0]["balance"] == -1200.03
     # Feed history is preserved.
     assert len(feed_rows) == 1
-    assert feed_rows[0]["balance"] == -5949.32
+    assert feed_rows[0]["balance"] == -1100.32
 
     now = datetime(2026, 6, 24, 18, 0, tzinfo=UTC)
-    assert _latest_balance(db_path, "apple-1", now=now) == -6122.03
+    assert _latest_balance(db_path, "apple-1", now=now) == -1200.03
 
 
 def test_set_manual_balance_keeps_manual_rows_from_other_dates(tmp_path):
@@ -470,7 +513,7 @@ def test_set_manual_balance_keeps_manual_rows_from_other_dates(tmp_path):
     conn.close()
 
     conn = _connect(db_path)
-    result = set_manual_balance(conn, "apple", -6122.03, "2026-06-24")
+    result = set_manual_balance(conn, "apple", -1200.03, "2026-06-24")
     conn.commit()
     conn.close()
 

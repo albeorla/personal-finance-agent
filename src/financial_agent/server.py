@@ -13,7 +13,9 @@ from .income import (
 )
 from .obligations import (
     apply_obligation_instances as apply_obligation_instances_for_db,
+    deactivate_obligation as deactivate_obligation_for_db,
     delete_obligation_instance as delete_obligation_instance_for_db,
+    set_obligation_end as set_obligation_end_for_db,
     list_obligation_review_candidates as list_obligation_review_candidates_for_db,
     list_obligations as list_obligations_for_db,
     list_statement_input_estimates as list_statement_input_estimates_for_db,
@@ -43,6 +45,7 @@ from .verification import (
     list_verification_findings as list_verification_findings_for_db,
     run_verification as run_verification_for_db,
 )
+from .analytics import list_transactions as list_transactions_for_db
 from .analytics import render_spending_markdown as render_spending_markdown_for_db
 from .backfill import backfill_recurring_instances as backfill_recurring_instances_for_db
 from .onboarding import auto_model_high_confidence_recurring as auto_model_high_confidence_recurring_for_db
@@ -109,6 +112,7 @@ from .follow_ups import (
     capture_followup as capture_followup_for_db,
     list_due_followups as list_due_followups_for_db,
     resolve_followup as resolve_followup_for_db,
+    update_followup as update_followup_for_db,
 )
 from .surface_queue import (
     build_surface_items as build_surface_items_for_db,
@@ -369,6 +373,41 @@ def resolve_followup(followup_id: str, db_path: str | None = None) -> dict:
 
 
 @mcp.tool()
+def update_followup(
+    followup_id: str,
+    text: str | None = None,
+    surface_when: str | None = None,
+    priority: str | None = None,
+    linked_obligation_id: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Edit a dated follow-up reminder in place by id - reschedule (surface_when),
+    reword (text), re-prioritize (priority), or relink (linked_obligation_id).
+    Only the fields you pass change. Use this instead of re-capturing, which would
+    create a new row because the capture id is derived from content.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = update_followup_for_db(
+            conn,
+            followup_id,
+            text=text,
+            surface_when=surface_when,
+            priority=priority,
+            linked_obligation_id=linked_obligation_id,
+        )
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def get_surface_queue(
     as_of_date: str,
     limit: int = 30,
@@ -612,9 +651,39 @@ def apply_obligation_instances(
     instances: list[dict],
     db_path: str | None = None,
 ) -> dict:
-    """Create or update an obligation and exact dated instances."""
+    """Create or update an obligation and its dated instances.
+
+    obligation keys: id (req), name (req), kind (req), source (req), autopay
+    (REQUIRED here: true = the bill auto-pays itself; false = you pay it manually,
+    so it surfaces as a due reminder); cadence (e.g. 'monthly'), status (default
+    'active'), active_until (ISO date the bill stops projecting), amount_discretionary
+    (default False - True when the modeled amount is only a floor, e.g. a card minimum).
+
+    Each instances item: due_date (req), amount (req; negative => outflow when
+    direction is omitted, stored as magnitude with the sign carried by direction),
+    source (req); optional id (defaults to '<obligation_id>:<due_date>',
+    auto-suffixed ':1'/':2' for multiple instances sharing a date so they never
+    overwrite each other), direction ('inflow'/'outflow'), status (default
+    'expected'), confidence, notes, amount_status, amount_source,
+    amount_observed_at, statement_close_date, review_after, estimation_method,
+    estimation_inputs (dict), cash_flow_treatment, statement_target_obligation_id.
+
+    Returns {obligation_id, created, updated, instance_ids} so the caller can tell
+    new inserts from re-applied upserts (never a silent no-op).
+    """
 
     import sqlite3
+
+    # Require an explicit autopay decision when a bill is created conversationally.
+    # The backing function defaults autopay=True (quiet) for the auto-detectors, but
+    # a hand-added bill with no decision would then silently never surface as a
+    # reminder. Forcing the choice here closes that trap at the one user-facing path.
+    if "autopay" not in obligation:
+        raise ValueError(
+            "obligation must set 'autopay': true (the bill auto-pays itself) or "
+            "false (you pay it manually, so it surfaces as a due reminder). This is "
+            "required so a manual bill can never silently fail to surface."
+        )
 
     resolved_db_path = db_path or str(default_db_path())
     conn = sqlite3.connect(resolved_db_path)
@@ -650,6 +719,58 @@ def delete_obligation_instance(
     conn.row_factory = sqlite3.Row
     try:
         result = delete_obligation_instance_for_db(conn, instance_id)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def set_obligation_end(
+    obligation_id: str,
+    active_until: str | None,
+    db_path: str | None = None,
+) -> dict:
+    """Set (or clear) the date a recurring bill stops projecting.
+
+    A bill with a known end - a lease, a loan payoff, a subscription being
+    cancelled - otherwise keeps filling the runway forever. Pass active_until
+    (YYYY-MM-DD) to hard-stop its instances from the cash-flow projection on and
+    after that date; pass null to clear it (open-ended again). Reversible: no
+    instances are deleted, they are just excluded past the end date.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = set_obligation_end_for_db(conn, obligation_id, active_until)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def deactivate_obligation(
+    obligation_id: str,
+    db_path: str | None = None,
+) -> dict:
+    """Retire a whole obligation (status -> inactive) so all its instances drop out
+    of the projection, listings, reconciliation, and drift. Rows are preserved for
+    audit; idempotent. Returns projectable_instances_removed so you can see how many
+    upcoming bills this pulls from the runway before relying on it.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = deactivate_obligation_for_db(conn, obligation_id)
         conn.commit()
         return result
     finally:
@@ -699,6 +820,7 @@ def suppress_contradicted_estimates(
 
 @mcp.tool()
 def list_obligations(
+    obligation_id: str | None = None,
     kind: str | None = None,
     status: str | None = "active",
     include_instances: bool = True,
@@ -707,8 +829,10 @@ def list_obligations(
 ) -> dict:
     """List local canonical obligations and optionally their dated instances.
 
-    Set compact=True to replace each obligation's instances array with an
-    instance_count, keeping the response small enough for the model context
+    Pass obligation_id to fetch just one obligation (any status) instead of the
+    whole roster - the laziest way to inspect/edit a single bill without dumping
+    everything. Set compact=True to replace each obligation's instances array with
+    an instance_count, keeping the response small enough for the model context
     while preserving obligation metadata.
     """
 
@@ -720,6 +844,7 @@ def list_obligations(
     try:
         return _list_result(list_obligations_for_db(
             conn,
+            obligation_id=obligation_id,
             kind=kind,
             status=status,
             include_instances=include_instances,
@@ -880,10 +1005,34 @@ def get_next_charge_onboarding_candidate(db_path: str | None = None) -> dict | N
         conn.close()
 
 
+def _record_onboarding_decision(conn, candidate_id: str, decision: dict | str) -> dict:
+    """Record one decision + the surfaced-reminder cleanup hook. Caller commits.
+
+    Auto-cleanup (spec section 2): a rejected/deferred candidate flags its linked
+    obligation's surfaced due-date reminders for removal on the next live surface
+    run; an accepted/reset one clears any earlier tombstone so a re-surfaced item
+    is not immediately retired again.
+    """
+    result = record_charge_onboarding_decision_for_db(conn, candidate_id, decision)
+    existing_obligation_id = result.get("existing_obligation_id")
+    if existing_obligation_id:
+        status = result.get("status")
+        prefix = f"obligation-due:{existing_obligation_id}:"
+        if status in ("rejected", "deferred"):
+            request_emission_retire_prefix(conn, prefix)
+        elif status in ("proposed", "accepted"):
+            conn.execute(
+                "UPDATE todoist_emissions SET retire_requested_at = NULL "
+                "WHERE surface_key LIKE ? || '%' AND status = 'open'",
+                (prefix,),
+            )
+    return result
+
+
 @mcp.tool()
 def record_charge_onboarding_decision(
     candidate_id: str,
-    decision: dict,
+    decision: dict | str,
     db_path: str | None = None,
 ) -> dict:
     """Record a review decision against a charge-onboarding candidate.
@@ -900,26 +1049,52 @@ def record_charge_onboarding_decision(
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
-        result = record_charge_onboarding_decision_for_db(conn, candidate_id, decision)
-        # Auto-cleanup hook (spec section 2): when a candidate is rejected or
-        # deferred, the surfaced cash-flow reminders for its linked obligation are
-        # no longer wanted - flag every due-date instance for removal on the next
-        # live surface run. When it is accepted or un-decided (reset), clear any
-        # earlier tombstone so a re-surfaced item is not immediately retired again.
-        existing_obligation_id = result.get("existing_obligation_id")
-        if existing_obligation_id:
-            status = result.get("status")
-            prefix = f"obligation-due:{existing_obligation_id}:"
-            if status in ("rejected", "deferred"):
-                request_emission_retire_prefix(conn, prefix)
-            elif status in ("proposed", "accepted"):
-                conn.execute(
-                    "UPDATE todoist_emissions SET retire_requested_at = NULL "
-                    "WHERE surface_key LIKE ? || '%' AND status = 'open'",
-                    (prefix,),
-                )
+        result = _record_onboarding_decision(conn, candidate_id, decision)
         conn.commit()
         return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def record_charge_onboarding_decisions(
+    decisions: list[dict],
+    db_path: str | None = None,
+) -> dict:
+    """Record review decisions for MANY charge-onboarding candidates in one call.
+
+    Each item is {"candidate_id": str, "decision": <str|dict>} where decision is an
+    action string ("defer"/"reject"/...) or {"action": ...}, same as the single
+    record_charge_onboarding_decision. This clears the one-at-a-time grind on a big
+    queue. Items are applied independently in one transaction; a bad item is
+    reported as an error and does NOT abort the rest. Returns
+    {total, applied, failed, results:[{candidate_id, ok, status|error}]}.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    results: list[dict] = []
+    applied = failed = 0
+    try:
+        for item in decisions or []:
+            cid = (item or {}).get("candidate_id")
+            dec = (item or {}).get("decision")
+            if not cid:
+                failed += 1
+                results.append({"candidate_id": cid, "ok": False, "error": "missing candidate_id"})
+                continue
+            try:
+                res = _record_onboarding_decision(conn, cid, dec)
+                applied += 1
+                results.append({"candidate_id": cid, "ok": True, "status": res.get("status")})
+            except Exception as exc:  # noqa: BLE001 - record per item, never abort the batch
+                failed += 1
+                results.append({"candidate_id": cid, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+        conn.commit()
+        return {"total": len(decisions or []), "applied": applied, "failed": failed, "results": results}
     finally:
         conn.close()
 
@@ -931,13 +1106,17 @@ def preview_charge_onboarding_apply(
     through_date: str | None = None,
     horizon_days: int = 180,
     obligation_id: str | None = None,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Preview the canonical obligation and dated instances that applying would create.
 
     Read-only and writes nothing. Use this to show a reviewer exactly what would
     land in the cash-flow model (obligation, instances, schedule summary, and
-    warnings) before committing to apply.
+    warnings) before committing to apply. Pass amount_override and/or
+    cadence_override (e.g. 'monthly') to preview a corrected figure when the
+    detector misread the amount or cadence.
     """
 
     import sqlite3
@@ -953,6 +1132,8 @@ def preview_charge_onboarding_apply(
             through_date=through_date,
             horizon_days=horizon_days,
             obligation_id=obligation_id,
+            amount_override=amount_override,
+            cadence_override=cadence_override,
         )
     finally:
         conn.close()
@@ -966,6 +1147,8 @@ def apply_charge_onboarding_candidate(
     horizon_days: int = 180,
     obligation_id: str | None = None,
     require_accepted: bool = True,
+    amount_override: float | None = None,
+    cadence_override: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Promote an accepted candidate into a canonical obligation plus dated instances.
@@ -973,7 +1156,9 @@ def apply_charge_onboarding_candidate(
     This is the guarded write that turns a reviewed candidate into cash-flow
     truth. By default the candidate must already be accepted (record an accept
     decision first). Writing is idempotent: re-applying the same window updates
-    instances in place instead of duplicating them.
+    instances in place instead of duplicating them. Pass amount_override and/or
+    cadence_override to correct a detector misread in this one call instead of
+    rejecting and re-modeling.
     """
 
     import sqlite3
@@ -990,6 +1175,8 @@ def apply_charge_onboarding_candidate(
             horizon_days=horizon_days,
             obligation_id=obligation_id,
             require_accepted=require_accepted,
+            amount_override=amount_override,
+            cadence_override=cadence_override,
         )
         conn.commit()
         return result
@@ -1641,7 +1828,7 @@ def get_version() -> dict:
 
 @mcp.tool()
 def get_job_health(
-    as_of_date: str,
+    as_of_date: str | None = None,
     stale_threshold_hours: int = 26,
     db_path: str | None = None,
 ) -> dict:
@@ -1650,17 +1837,20 @@ def get_job_health(
     A silently-stopped scheduler is invisible - nothing fails, the data just ages.
     This turns the absence of a recent successful daily run into a visible signal:
     when the last completed run is older than ``stale_threshold_hours`` (default 26h)
-    the job is flagged stale. Read-only.
+    the job is flagged stale. ``as_of_date`` defaults to today, so the daily
+    health-check can call this with no arguments. Read-only.
     """
 
+    import datetime as _dt
     import sqlite3
 
+    resolved_as_of = as_of_date or _dt.date.today().isoformat()
     resolved_db_path = db_path or str(default_db_path())
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
         return get_job_health_for_db(
-            conn, as_of_date=as_of_date, stale_threshold_hours=stale_threshold_hours
+            conn, as_of_date=resolved_as_of, stale_threshold_hours=stale_threshold_hours
         )
     finally:
         conn.close()
@@ -2152,6 +2342,47 @@ def summarize_spending(
     if render_markdown:
         report["markdown"] = render_spending_markdown_for_db(report)
     return report
+
+
+@mcp.tool()
+def list_transactions(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    query: str | None = None,
+    min_amount: float | None = None,
+    account_id: str | None = None,
+    include_pending: bool = True,
+    limit: int = 50,
+    db_path: str | None = None,
+) -> dict:
+    """List individual transactions, newest first, so you can quote an EXACT
+    charge amount (for reconciliation or "what was that $X charge?") instead of
+    only the aggregates from summarize_spending. Read-only.
+
+    Optional filters: start_date / end_date (YYYY-MM-DD, inclusive, on posted
+    date), query (case-insensitive substring over payee + description),
+    min_amount (absolute-value floor), account_id, include_pending. limit is
+    capped at 500; the 'truncated' flag signals more rows matched.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list_transactions_for_db(
+            conn,
+            start_date=start_date,
+            end_date=end_date,
+            query=query,
+            min_amount=min_amount,
+            account_id=account_id,
+            include_pending=include_pending,
+            limit=limit,
+        )
+    finally:
+        conn.close()
 
 
 @mcp.tool()

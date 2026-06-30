@@ -73,6 +73,23 @@ def _health_conn():
     return conn
 
 
+def test_server_job_health_defaults_as_of_to_today(tmp_path):
+    """The MCP get_job_health tool defaults as_of_date to today, so the daily
+    health-check can call it with no arguments instead of failing validation."""
+
+    import datetime as _dt
+
+    pytest.importorskip("mcp", reason="MCP server deps not installed")
+    from financial_agent import server
+
+    db = tmp_path / "fa.sqlite"
+    ensure_app_schema(sqlite3.connect(str(db)))
+
+    health = server.get_job_health(db_path=str(db))
+    assert health["as_of_date"] == _dt.date.today().isoformat()
+    assert health["is_stale"] is True  # no completed runs in a fresh db
+
+
 def test_job_health_code_stale_when_running_behind_repo(monkeypatch):
     """Running commit differs from live repo HEAD: code_stale True + reload message."""
 

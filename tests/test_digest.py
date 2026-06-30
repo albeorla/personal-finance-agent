@@ -130,6 +130,26 @@ def test_status_color_red_when_below_cash_floor(tmp_path):
     digest = build_daily_digest(db, as_of_date="2026-06-20")
     assert any(g["rule_type"] == "cash_floor" for g in digest["guardrails"])
     assert digest["status_color"] == "RED"
+    # the color now carries a human reason naming the cause (a cash danger here)
+    assert digest["status_reason"]
+    assert "drift to reconcile" not in digest["status_reason"]  # not mislabeled as a chore
+
+
+def test_status_reason_present_and_db_file_in_provenance(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0)
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+    assert digest["status_reason"]  # always populated alongside the color
+    assert digest["provenance"]["db_file"] == str(db)  # numbers traceable to a file
+    assert "enabled" in digest["adversarial_review"]  # gate state visible
+
+
+def test_balance_freshness_stamp_renders(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0)
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+    # each account carries its snapshot recorded_at (structured)...
+    assert all("recorded_at" in a for a in digest["balances"]["accounts"])
+    # ...and the markdown stamps how old each balance is, so a stale feed is visible
+    assert "as of" in render_digest_markdown(digest)
 
 
 def test_status_color_green_when_healthy(tmp_path):
