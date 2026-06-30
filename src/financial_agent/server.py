@@ -613,7 +613,25 @@ def apply_obligation_instances(
     instances: list[dict],
     db_path: str | None = None,
 ) -> dict:
-    """Create or update an obligation and exact dated instances."""
+    """Create or update an obligation and its dated instances.
+
+    obligation keys: id (req), name (req), kind (req), source (req); cadence
+    (e.g. 'monthly'), status (default 'active'), autopay (default True - set False
+    to surface as a manual-due reminder), amount_discretionary (default False -
+    True when the modeled amount is only a floor, e.g. a card minimum).
+
+    Each instances item: due_date (req), amount (req; negative => outflow when
+    direction is omitted, stored as magnitude with the sign carried by direction),
+    source (req); optional id (defaults to '<obligation_id>:<due_date>',
+    auto-suffixed ':1'/':2' for multiple instances sharing a date so they never
+    overwrite each other), direction ('inflow'/'outflow'), status (default
+    'expected'), confidence, notes, amount_status, amount_source,
+    amount_observed_at, statement_close_date, review_after, estimation_method,
+    estimation_inputs (dict), cash_flow_treatment, statement_target_obligation_id.
+
+    Returns {obligation_id, created, updated, instance_ids} so the caller can tell
+    new inserts from re-applied upserts (never a silent no-op).
+    """
 
     import sqlite3
 
@@ -700,6 +718,7 @@ def suppress_contradicted_estimates(
 
 @mcp.tool()
 def list_obligations(
+    obligation_id: str | None = None,
     kind: str | None = None,
     status: str | None = "active",
     include_instances: bool = True,
@@ -708,8 +727,10 @@ def list_obligations(
 ) -> dict:
     """List local canonical obligations and optionally their dated instances.
 
-    Set compact=True to replace each obligation's instances array with an
-    instance_count, keeping the response small enough for the model context
+    Pass obligation_id to fetch just one obligation (any status) instead of the
+    whole roster - the laziest way to inspect/edit a single bill without dumping
+    everything. Set compact=True to replace each obligation's instances array with
+    an instance_count, keeping the response small enough for the model context
     while preserving obligation metadata.
     """
 
@@ -721,6 +742,7 @@ def list_obligations(
     try:
         return _list_result(list_obligations_for_db(
             conn,
+            obligation_id=obligation_id,
             kind=kind,
             status=status,
             include_instances=include_instances,

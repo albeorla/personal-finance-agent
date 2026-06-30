@@ -180,6 +180,26 @@ def test_apply_obligation_instances_normalizes_signed_outflows(tmp_path):
     ]
 
 
+def test_list_obligations_by_id_returns_one_any_status(tmp_path):
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "rent", "name": "Rent", "kind": "housing", "status": "active", "source": "seed"},
+        instances=[{"due_date": "2026-07-03", "amount": -3000.0, "source": "seed"}],
+    )
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "old_car", "name": "Volvo", "kind": "auto", "status": "inactive", "source": "seed"},
+        instances=[{"due_date": "2026-05-01", "amount": -580.0, "source": "seed"}],
+    )
+    # by-id returns exactly that obligation...
+    one = list_obligations(conn, obligation_id="rent")
+    assert [o["id"] for o in one] == ["rent"]
+    # ...even when it is not active (status default 'active' is bypassed for id lookups)
+    inactive = list_obligations(conn, obligation_id="old_car")
+    assert [o["id"] for o in inactive] == ["old_car"]
+
+
 def test_list_obligations_includes_instances(tmp_path):
     conn = _db(tmp_path / "obligations.sqlite")
     apply_obligation_instances(

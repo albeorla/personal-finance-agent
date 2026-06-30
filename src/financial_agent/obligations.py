@@ -201,6 +201,7 @@ def _compact_obligation(obligation: dict[str, Any]) -> dict[str, Any]:
 def list_obligations(
     conn: sqlite3.Connection,
     *,
+    obligation_id: str | None = None,
     kind: str | None = None,
     status: str | None = "active",
     include_instances: bool = True,
@@ -209,10 +210,15 @@ def list_obligations(
     ensure_app_schema(conn)
     where = []
     params: list[Any] = []
+    if obligation_id is not None:
+        # A by-id lookup returns that obligation regardless of status (so you can
+        # pull one inactive/superseded row without dumping the whole roster).
+        where.append("id = ?")
+        params.append(obligation_id)
     if kind is not None:
         where.append("kind = ?")
         params.append(kind)
-    if status is not None:
+    if status is not None and obligation_id is None:
         where.append("status = ?")
         params.append(status)
 

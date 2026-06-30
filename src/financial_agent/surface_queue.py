@@ -151,6 +151,12 @@ def get_surface_queue(
     return {
         "as_of_date": as_of.isoformat(),
         "trace_id": f"surfq_{uuid.uuid4().hex[:12]}",
+        "source": "computed_would_surface",
+        "source_note": (
+            "Computed list of items that WOULD be surfaced to Todoist from local "
+            "finance data - NOT a read of the live Todoist board. For actual board "
+            "contents call list_todoist_project."
+        ),
         "total_items": total,
         "returned_items": len(items),
         "items": items,
