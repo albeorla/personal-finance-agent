@@ -180,6 +180,41 @@ def test_apply_obligation_instances_normalizes_signed_outflows(tmp_path):
     ]
 
 
+def test_set_obligation_end_excludes_instances_past_end(tmp_path):
+    from datetime import date
+
+    from financial_agent.cashflow import build_cash_flow_projections
+    from financial_agent.obligations import set_obligation_end
+
+    conn = _db(tmp_path / "o.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "audi", "name": "Audi lease", "kind": "auto",
+                    "cadence": "monthly", "status": "active", "source": "seed"},
+        instances=[
+            {"id": "audi:2026-08-08", "due_date": "2026-08-08", "amount": -596.0, "source": "seed"},
+            {"id": "audi:2029-09-08", "due_date": "2029-09-08", "amount": -596.0, "source": "seed"},
+        ],
+    )
+    accounts = [{"account_id": "chk", "account_name": "Checking", "kind": "checking",
+                 "available": 10000.0, "recorded_at": "2026-08-01T00:00:00+00:00"}]
+
+    res = set_obligation_end(conn, "audi", "2029-08-31")
+    assert res["updated"] and res["active_until"] == "2029-08-31"
+
+    projs, _ = build_cash_flow_projections(conn, accounts=accounts, windows=[2000], start_date=date(2026, 8, 1))
+    dates = [e["due_date"] for e in projs[0]["events"]]
+    assert "2026-08-08" in dates  # before the end -> projected
+    assert "2029-09-08" not in dates  # past active_until -> excluded
+
+    # clearing the end date brings the later instance back (open-ended again)
+    set_obligation_end(conn, "audi", None)
+    projs2, _ = build_cash_flow_projections(conn, accounts=accounts, windows=[2000], start_date=date(2026, 8, 1))
+    assert "2029-09-08" in [e["due_date"] for e in projs2[0]["events"]]
+
+    assert set_obligation_end(conn, "nope", "2030-01-01")["updated"] is False
+
+
 def test_list_obligations_by_id_returns_one_any_status(tmp_path):
     conn = _db(tmp_path / "obligations.sqlite")
     apply_obligation_instances(

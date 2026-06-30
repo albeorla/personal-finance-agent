@@ -198,6 +198,20 @@ def test_coverage_horizon_flags_recurring_that_runs_out(tmp_path):
                 if f["check_id"] == "coverage_horizon"]
 
 
+def test_coverage_horizon_ignores_obligation_with_active_until(tmp_path):
+    # A bill that ENDS before the horizon (active_until set) ran out on purpose -
+    # it must not be flagged as "runs out early".
+    conn = _clean_db(tmp_path / "cov.sqlite")
+    conn.execute(
+        "INSERT INTO obligations (id,name,kind,cadence,status,source,active_until,created_at,updated_at) "
+        "VALUES ('gym','Gym','fitness','monthly','active','seed','2026-07-31','t','t')"
+    )
+    _insert_instance(conn, iid="gym:2026-07-01", obligation_id="gym", due_date="2026-07-01", amount=3000.0)
+    conn.commit()
+    assert not [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+                if f["check_id"] == "coverage_horizon"]
+
+
 # --- persistence -----------------------------------------------------------
 
 

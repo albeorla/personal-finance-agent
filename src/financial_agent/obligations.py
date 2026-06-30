@@ -87,8 +87,8 @@ def apply_obligation_instances(
         """
         INSERT INTO obligations (
             id, name, kind, cadence, status, source, autopay,
-            amount_discretionary, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            amount_discretionary, active_until, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             kind = excluded.kind,
@@ -97,6 +97,7 @@ def apply_obligation_instances(
             source = excluded.source,
             autopay = excluded.autopay,
             amount_discretionary = excluded.amount_discretionary,
+            active_until = excluded.active_until,
             updated_at = excluded.updated_at
         """,
         (
@@ -108,6 +109,7 @@ def apply_obligation_instances(
             obligation["source"],
             autopay,
             amount_discretionary,
+            _optional_date(obligation.get("active_until")),
             now,
             now,
         ),
@@ -426,6 +428,42 @@ def delete_obligation_instance(
         "previous_status": row["status"],
         "status": "deleted",
         "updated_at": now,
+    }
+
+
+def set_obligation_end(
+    conn: sqlite3.Connection,
+    obligation_id: str,
+    active_until: str | None,
+) -> dict[str, Any]:
+    """Set (or clear) the date a bill stops projecting.
+
+    A bill with a known end - a lease, a loan payoff, a subscription being
+    cancelled - should not keep filling the runway forever. Setting ``active_until``
+    (ISO date) hard-stops its instances from the projection on and after that date;
+    passing None clears it (open-ended again). Reversible, no instances are
+    deleted - they are simply excluded past the end date.
+    """
+
+    ensure_app_schema(conn)
+    row = conn.execute(
+        "SELECT id, name, active_until FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()
+    if row is None:
+        return {"obligation_id": obligation_id, "updated": False, "reason": "not_found"}
+
+    end = _optional_date(active_until)
+    now = _now()
+    conn.execute(
+        "UPDATE obligations SET active_until = ?, updated_at = ? WHERE id = ?",
+        (end, now, obligation_id),
+    )
+    return {
+        "obligation_id": obligation_id,
+        "name": row["name"] if isinstance(row, sqlite3.Row) else row[1],
+        "updated": True,
+        "previous_active_until": row["active_until"] if isinstance(row, sqlite3.Row) else row[2],
+        "active_until": end,
     }
 
 

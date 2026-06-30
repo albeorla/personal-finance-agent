@@ -14,6 +14,7 @@ from .income import (
 from .obligations import (
     apply_obligation_instances as apply_obligation_instances_for_db,
     delete_obligation_instance as delete_obligation_instance_for_db,
+    set_obligation_end as set_obligation_end_for_db,
     list_obligation_review_candidates as list_obligation_review_candidates_for_db,
     list_obligations as list_obligations_for_db,
     list_statement_input_estimates as list_statement_input_estimates_for_db,
@@ -705,6 +706,34 @@ def delete_obligation_instance(
     conn.row_factory = sqlite3.Row
     try:
         result = delete_obligation_instance_for_db(conn, instance_id)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def set_obligation_end(
+    obligation_id: str,
+    active_until: str | None,
+    db_path: str | None = None,
+) -> dict:
+    """Set (or clear) the date a recurring bill stops projecting.
+
+    A bill with a known end - a lease, a loan payoff, a subscription being
+    cancelled - otherwise keeps filling the runway forever. Pass active_until
+    (YYYY-MM-DD) to hard-stop its instances from the cash-flow projection on and
+    after that date; pass null to clear it (open-ended again). Reversible: no
+    instances are deleted, they are just excluded past the end date.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = set_obligation_end_for_db(conn, obligation_id, active_until)
         conn.commit()
         return result
     finally:

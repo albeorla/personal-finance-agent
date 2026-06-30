@@ -392,11 +392,12 @@ def _check_coverage_horizon(conn: sqlite3.Connection, as_of_date: str) -> list[d
         WHERE ob.status = 'active'
           AND ob.cadence IN ({",".join("?" for _ in _RECURRING_CADENCES)})
           AND oi.status IN ({_status_placeholders()})
+          AND (ob.active_until IS NULL OR ob.active_until >= ?)
         GROUP BY ob.id
         HAVING MAX(oi.due_date) >= ? AND MAX(oi.due_date) < ?
         ORDER BY ob.id
         """,
-        (*_RECURRING_CADENCES, *_PROJECTABLE_STATUSES, as_of.isoformat(), horizon),
+        (*_RECURRING_CADENCES, *_PROJECTABLE_STATUSES, horizon, as_of.isoformat(), horizon),
     ).fetchall()
     findings: list[dict[str, Any]] = []
     for r in rows:

@@ -90,6 +90,7 @@ def _roll_forward_to_start(
           AND oi.due_date < ?
           AND oi.status IN ('expected', 'needs_review', 'partially_paid')
           AND o.status = 'active'
+          AND (o.active_until IS NULL OR oi.due_date <= o.active_until)
           AND COALESCE(oi.cash_flow_treatment, 'direct_checking') = 'direct_checking'
         """,
         (snapshot_date.isoformat(), start_date.isoformat()),
@@ -149,6 +150,7 @@ def _build_window_projection(
           AND oi.due_date < ?
           AND oi.status IN ('expected', 'needs_review', 'partially_paid')
           AND o.status = 'active'
+          AND (o.active_until IS NULL OR oi.due_date <= o.active_until)
           AND COALESCE(oi.cash_flow_treatment, 'direct_checking') = 'direct_checking'
         ORDER BY oi.due_date, oi.id
         """,
