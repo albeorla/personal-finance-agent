@@ -71,16 +71,18 @@ def test_set_manual_balance_exact_match_updates_status(tmp_path):
     )
 
     conn = _connect(db_path)
-    result = set_manual_balance(conn, "apple", 6122.0, "2026-06-20", note="Updated via portal")
+    # Card balance is a liability -> stored negative, matching the feed's sign.
+    result = set_manual_balance(conn, "apple", -6122.0, "2026-06-20", note="Updated via portal")
     conn.commit()
     conn.close()
 
     assert result["status"] == "ok"
     assert result["account_id"] == "apple-1"
-    assert result["balance"] == 6122.0
-    assert result["available"] == 6122.0
+    assert result["balance"] == -6122.0
+    assert result["available"] == -6122.0
     assert result["source"] == "manual"
     assert result["note"] == "Updated via portal"
+    assert result["sign_corrected"] is False  # already the right sign
 
     # Snapshot row recorded through the shared insert.
     conn = _connect(db_path)
@@ -90,16 +92,57 @@ def test_set_manual_balance_exact_match_updates_status(tmp_path):
         ("apple-1",),
     ).fetchone()
     conn.close()
-    assert row["balance"] == 6122.0
-    assert row["available"] == 6122.0
+    assert row["balance"] == -6122.0
+    assert row["available"] == -6122.0
     assert row["source"] == "manual"
     assert row["manual_note"] == "Updated via portal"
 
-    assert _latest_balance(db_path, "apple-1") == 6122.0
+    assert _latest_balance(db_path, "apple-1") == -6122.0
 
     digest = build_daily_digest(db_path=str(db_path), as_of_date="2026-06-20")
     apple = next(a for a in digest["balances"]["accounts"] if a["name"] == "Apple Card")
-    assert apple["balance"] == 6122.0
+    assert apple["balance"] == -6122.0
+
+
+def test_set_manual_balance_corrects_fat_fingered_sign(tmp_path):
+    # The Apple Card feed reads -5949 (owed). Entering +6122 (a dropped minus) must
+    # be auto-corrected to -6122 so a positive value can't silently flip net worth.
+    db_path = tmp_path / "t.sqlite"
+    _build_db(
+        db_path,
+        accounts=[("apple-1", "Apple Card", "Goldman Sachs")],
+        snapshots=[("apple-1", -5949.0, "2026-06-01T10:00:00+00:00")],
+    )
+    conn = _connect(db_path)
+    result = set_manual_balance(conn, "apple", 6122.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+
+    assert result["sign_corrected"] is True
+    assert result["entered_balance"] == 6122.0
+    assert result["balance"] == -6122.0
+    assert _latest_balance(db_path, "apple-1") == -6122.0
+
+
+def test_set_manual_balance_does_not_flip_positive_account_or_wild_magnitude(tmp_path):
+    db_path = tmp_path / "t.sqlite"
+    _build_db(
+        db_path,
+        accounts=[("chk-1", "Checking", "Chase"), ("card-1", "Apple Card", "Goldman Sachs")],
+        snapshots=[
+            ("chk-1", 9000.0, "2026-06-01T10:00:00+00:00"),
+            ("card-1", -5949.0, "2026-06-01T10:00:00+00:00"),
+        ],
+    )
+    conn = _connect(db_path)
+    # Positive feed + positive manual -> no flip.
+    r1 = set_manual_balance(conn, "Checking", 9500.0, "2026-06-20")
+    # Opposite sign but implausibly different magnitude -> conservative: no flip.
+    r2 = set_manual_balance(conn, "Apple Card", 50.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+    assert r1["sign_corrected"] is False and r1["balance"] == 9500.0
+    assert r2["sign_corrected"] is False and r2["balance"] == 50.0
 
 
 def test_set_manual_balance_ambiguous_returns_candidates(tmp_path):

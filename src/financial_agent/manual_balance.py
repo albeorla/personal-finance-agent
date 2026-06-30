@@ -275,6 +275,29 @@ def set_manual_balance(
     # resolution. Computed after _effective_recorded_at so the out-stamp still
     # accounts for the feed snapshot we are superseding.
     superseded = _delete_superseded_manual_snapshots(conn, top["account_id"], as_of_date)
+
+    # Sign sanity. A card/loan balance is stored negative (owed), a deposit
+    # positive. If the FEED's established sign for this account is the opposite of
+    # the entered value and the magnitude is plausibly the same balance (a
+    # fat-fingered sign, e.g. +6122 for a card that reads -5949), flip it - else a
+    # wrong-sign manual would beat the feed by precedence and silently flip net
+    # worth, hidden by abs() in the debt math. Non-silent: sign_corrected is
+    # returned, and entered_balance preserves what was typed.
+    sign_corrected = False
+    entered_balance = corrected
+    feed = conn.execute(
+        "SELECT balance FROM balance_snapshots WHERE account_id = ? AND source != 'manual' "
+        "AND balance != 0 ORDER BY recorded_at DESC, id DESC LIMIT 1",
+        (top["account_id"],),
+    ).fetchone()
+    if feed is not None and corrected != 0:
+        feed_balance = feed["balance"] if isinstance(feed, sqlite3.Row) else feed[0]
+        opposite_sign = feed_balance and (feed_balance < 0) != (corrected < 0)
+        plausible_magnitude = feed_balance and 0.25 <= abs(corrected) / abs(feed_balance) <= 4.0
+        if opposite_sign and plausible_magnitude:
+            corrected = -corrected
+            sign_corrected = True
+
     conn.execute(
         "INSERT INTO balance_snapshots (account_id, balance, available, recorded_at, source, manual_note) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -292,4 +315,6 @@ def set_manual_balance(
         "source": _MANUAL_SOURCE,
         "note": note,
         "superseded_manual_snapshots": superseded,
+        "sign_corrected": sign_corrected,
+        "entered_balance": round(entered_balance, 2),
     }
