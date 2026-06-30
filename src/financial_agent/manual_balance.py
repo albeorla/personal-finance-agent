@@ -22,13 +22,13 @@ load-bearing mechanism: the source-priority ordering is what guarantees the
 correction wins, so the result no longer depends on a fragile timestamp race.
 
 The caller's sign is preserved verbatim: a liability correction such as the
-Apple Card stays negative (e.g. ``-6122.03``), matching how SimpleFIN stores
+Apple Card stays negative (e.g. ``-1200.03``), matching how SimpleFIN stores
 card and loan balances.
 
 A fresh manual correction also *replaces* any earlier manual correction for the
 same account on the same as-of date: those superseded manual rows are deleted
 before the new one is inserted. Out-stamping alone left the old row in history as
-a latent landmine -- a wrong-sign manual row (e.g. ``+6122.03``) could re-win
+a latent landmine -- a wrong-sign manual row (e.g. ``+1200.03``) could re-win
 balance resolution if a future same-day correction ever landed at or before its
 timestamp. Deleting same-account, same-day manual rows removes that hazard while
 leaving the feed (``simplefin``) history untouched.
@@ -279,7 +279,7 @@ def set_manual_balance(
     # Sign sanity. A card/loan balance is stored negative (owed), a deposit
     # positive. If the FEED's established sign for this account is the opposite of
     # the entered value and the magnitude is plausibly the same balance (a
-    # fat-fingered sign, e.g. +6122 for a card that reads -5949), flip it - else a
+    # fat-fingered sign, e.g. +1200 for a card that reads -1100), flip it - else a
     # wrong-sign manual would beat the feed by precedence and silently flip net
     # worth, hidden by abs() in the debt math. Non-silent: sign_corrected is
     # returned, and entered_balance preserves what was typed.

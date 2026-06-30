@@ -203,18 +203,18 @@ def test_deactivate_obligation_removes_from_runway(tmp_path):
     conn = _db(tmp_path / "o.sqlite")
     apply_obligation_instances(
         conn,
-        obligation={"id": "volvo", "name": "Volvo lease", "kind": "auto", "status": "active", "source": "seed"},
+        obligation={"id": "oldcar", "name": "Old car lease", "kind": "auto", "status": "active", "source": "seed"},
         instances=[
-            {"id": "volvo:2026-08-01", "due_date": "2026-08-01", "amount": -580.0, "source": "seed"},
-            {"id": "volvo:2026-09-01", "due_date": "2026-09-01", "amount": -580.0, "source": "seed"},
+            {"id": "oldcar:2026-08-01", "due_date": "2026-08-01", "amount": -500.0, "source": "seed"},
+            {"id": "oldcar:2026-09-01", "due_date": "2026-09-01", "amount": -500.0, "source": "seed"},
         ],
     )
-    res = deactivate_obligation(conn, "volvo")
+    res = deactivate_obligation(conn, "oldcar")
     assert res["deactivated"] is True
     assert res["projectable_instances_removed"] == 2
-    assert conn.execute("SELECT status FROM obligations WHERE id='volvo'").fetchone()[0] == "inactive"
+    assert conn.execute("SELECT status FROM obligations WHERE id='oldcar'").fetchone()[0] == "inactive"
     # idempotent + not-found are reported, not raised
-    assert deactivate_obligation(conn, "volvo")["reason"] == "already_inactive"
+    assert deactivate_obligation(conn, "oldcar")["reason"] == "already_inactive"
     assert deactivate_obligation(conn, "nope")["deactivated"] is False
 
 
@@ -227,17 +227,17 @@ def test_set_obligation_end_excludes_instances_past_end(tmp_path):
     conn = _db(tmp_path / "o.sqlite")
     apply_obligation_instances(
         conn,
-        obligation={"id": "audi", "name": "Audi lease", "kind": "auto",
+        obligation={"id": "newcar", "name": "New car lease", "kind": "auto",
                     "cadence": "monthly", "status": "active", "source": "seed"},
         instances=[
-            {"id": "audi:2026-08-08", "due_date": "2026-08-08", "amount": -596.0, "source": "seed"},
-            {"id": "audi:2029-09-08", "due_date": "2029-09-08", "amount": -596.0, "source": "seed"},
+            {"id": "newcar:2026-08-08", "due_date": "2026-08-08", "amount": -500.0, "source": "seed"},
+            {"id": "newcar:2029-09-08", "due_date": "2029-09-08", "amount": -500.0, "source": "seed"},
         ],
     )
     accounts = [{"account_id": "chk", "account_name": "Checking", "kind": "checking",
                  "available": 10000.0, "recorded_at": "2026-08-01T00:00:00+00:00"}]
 
-    res = set_obligation_end(conn, "audi", "2029-08-31")
+    res = set_obligation_end(conn, "newcar", "2029-08-31")
     assert res["updated"] and res["active_until"] == "2029-08-31"
 
     projs, _ = build_cash_flow_projections(conn, accounts=accounts, windows=[2000], start_date=date(2026, 8, 1))
@@ -246,7 +246,7 @@ def test_set_obligation_end_excludes_instances_past_end(tmp_path):
     assert "2029-09-08" not in dates  # past active_until -> excluded
 
     # clearing the end date brings the later instance back (open-ended again)
-    set_obligation_end(conn, "audi", None)
+    set_obligation_end(conn, "newcar", None)
     projs2, _ = build_cash_flow_projections(conn, accounts=accounts, windows=[2000], start_date=date(2026, 8, 1))
     assert "2029-09-08" in [e["due_date"] for e in projs2[0]["events"]]
 
@@ -262,8 +262,8 @@ def test_list_obligations_by_id_returns_one_any_status(tmp_path):
     )
     apply_obligation_instances(
         conn,
-        obligation={"id": "old_car", "name": "Volvo", "kind": "auto", "status": "inactive", "source": "seed"},
-        instances=[{"due_date": "2026-05-01", "amount": -580.0, "source": "seed"}],
+        obligation={"id": "old_car", "name": "Old car", "kind": "auto", "status": "inactive", "source": "seed"},
+        instances=[{"due_date": "2026-05-01", "amount": -500.0, "source": "seed"}],
     )
     # by-id returns exactly that obligation...
     one = list_obligations(conn, obligation_id="rent")

@@ -37,7 +37,7 @@ def test_list_transactions_filters_and_orders(tmp_path):
         tmp_path / "f.db",
         [
             ("2026-06-01", -12.50, "Starbucks", "coffee"),
-            ("2026-06-15", -710.29, "DMV", "Volvo disposition"),
+            ("2026-06-15", -250.00, "DMV", "Auto payment"),
             ("2026-06-20", 5000.00, "Payroll", "direct deposit"),
         ],
     )
@@ -48,8 +48,8 @@ def test_list_transactions_filters_and_orders(tmp_path):
     assert res["transactions"][0]["account_name"] == "Checking 4321"
 
     # text search spans payee + description
-    hit = list_transactions(conn, query="volvo")
-    assert hit["count"] == 1 and hit["transactions"][0]["amount"] == -710.29
+    hit = list_transactions(conn, query="auto")
+    assert hit["count"] == 1 and hit["transactions"][0]["amount"] == -250.00
 
     # absolute-amount floor
     big = list_transactions(conn, min_amount=100)

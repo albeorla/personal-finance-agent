@@ -257,14 +257,14 @@ def test_cross_obligation_overlap_flags_likely_duplicate(tmp_path):
     conn = _clean_db(tmp_path / "ov.sqlite")
     # Two active 'auto' obligations with instances in the same month at comparable
     # amounts -> likely the same real bill (old lease replaced by new). Review flag.
-    for oid, name in [("volvo", "Volvo lease"), ("audi", "Audi lease")]:
+    for oid, name in [("oldcar", "Old car lease"), ("newcar", "New car lease")]:
         conn.execute(
             "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
             "VALUES (?,?,'auto','active','seed','t','t')",
             (oid, name),
         )
-    _insert_instance(conn, iid="volvo:2026-08-08", obligation_id="volvo", due_date="2026-08-08", amount=710.0)
-    _insert_instance(conn, iid="audi:2026-08-10", obligation_id="audi", due_date="2026-08-10", amount=596.0)
+    _insert_instance(conn, iid="oldcar:2026-08-08", obligation_id="oldcar", due_date="2026-08-08", amount=700.0)
+    _insert_instance(conn, iid="newcar:2026-08-10", obligation_id="newcar", due_date="2026-08-10", amount=600.0)
     conn.commit()
 
     ov = [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
@@ -281,7 +281,7 @@ def test_cross_obligation_overlap_flags_likely_duplicate(tmp_path):
     conn.commit()
     ov2 = [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
            if f["check_id"] == "cross_obligation_overlap"]
-    assert len(ov2) == 1  # still just volvo/audi
+    assert len(ov2) == 1  # still just the two car leases
 
 
 # --- pipeline integration --------------------------------------------------
