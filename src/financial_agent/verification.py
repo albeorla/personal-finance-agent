@@ -75,6 +75,7 @@ def run_verification(
         ("statement_identity", _check_statement_identity),
         ("instance_sign_sanity", _check_instance_sign_sanity),
         ("coverage_horizon", _check_coverage_horizon),
+        ("cross_obligation_overlap", _check_cross_obligation_overlap),
     ]
     findings: list[dict[str, Any]] = []
     checks_run: list[str] = []
@@ -421,6 +422,73 @@ def _check_coverage_horizon(conn: sqlite3.Connection, as_of_date: str) -> list[d
                 },
             )
         )
+    return findings
+
+
+def _check_cross_obligation_overlap(conn: sqlite3.Connection, as_of_date: str) -> list[dict[str, Any]]:
+    """Flag two DISTINCT active obligations that look like the same real bill.
+
+    The duplicate-instance check only catches one obligation listed twice. A
+    retired-then-replaced bill (an old lease and its replacement) lives as two
+    separate rows and double-counts. This surfaces pairs of same-kind active
+    obligations with projectable instances in a shared month at comparable amounts
+    for a human to confirm - WARN, review-only, never auto-deactivates (two
+    genuinely-distinct same-kind bills will false-positive).
+    """
+
+    rows = conn.execute(
+        f"""
+        SELECT ob.id, ob.name, ob.kind, substr(oi.due_date, 1, 7) AS month, oi.amount
+        FROM obligation_instances oi
+        JOIN obligations ob ON ob.id = oi.obligation_id
+        WHERE ob.status = 'active' AND oi.status IN ({_status_placeholders()})
+        """,
+        _PROJECTABLE_STATUSES,
+    ).fetchall()
+
+    obs: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        o = obs.setdefault(r["id"], {"name": r["name"], "kind": r["kind"], "months": set(), "amts": []})
+        o["months"].add(r["month"])
+        o["amts"].append(abs(float(r["amount"])))
+
+    ids = sorted(obs)
+    findings: list[dict[str, Any]] = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = obs[ids[i]], obs[ids[j]]
+            if a["kind"] != b["kind"]:
+                continue
+            shared = sorted(a["months"] & b["months"])
+            if not shared:
+                continue
+            amt_a = sorted(a["amts"])[len(a["amts"]) // 2]  # median
+            amt_b = sorted(b["amts"])[len(b["amts"]) // 2]
+            larger = max(amt_a, amt_b)
+            if larger == 0 or abs(amt_a - amt_b) > 0.6 * larger:  # not comparable amounts
+                continue
+            findings.append(
+                _finding(
+                    check_id="cross_obligation_overlap",
+                    severity=SEVERITY_WARN,
+                    title=f"Possible duplicate: '{a['name']}' and '{b['name']}'",
+                    detail=(
+                        f"Two active {a['kind']} obligations have projectable instances in the "
+                        f"same month(s) ({', '.join(shared)}) at comparable amounts "
+                        f"(~${amt_a:,.0f} vs ~${amt_b:,.0f}). Confirm one is not superseded by the "
+                        "other (e.g. an old lease replaced by a new one) and retire it with "
+                        "deactivate_obligation if so."
+                    ),
+                    evidence={
+                        "obligation_a": ids[i],
+                        "obligation_b": ids[j],
+                        "kind": a["kind"],
+                        "shared_months": shared,
+                        "amount_a": round(amt_a, 2),
+                        "amount_b": round(amt_b, 2),
+                    },
+                )
+            )
     return findings
 
 

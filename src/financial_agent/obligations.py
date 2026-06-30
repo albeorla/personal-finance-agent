@@ -467,6 +467,47 @@ def set_obligation_end(
     }
 
 
+def deactivate_obligation(
+    conn: sqlite3.Connection,
+    obligation_id: str,
+) -> dict[str, Any]:
+    """Retire a whole obligation by setting its status to 'inactive'.
+
+    Every instance drops out of the projection, listings, reconciliation, and
+    drift, while the rows stay for audit. Idempotent. Reports how many projectable
+    instances this pulls from the runway, so a bulk deactivation can't silently
+    drop a real upcoming bill without the count showing it.
+    """
+
+    ensure_app_schema(conn)
+    row = conn.execute(
+        "SELECT id, name, status FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()
+    if row is None:
+        return {"obligation_id": obligation_id, "deactivated": False, "reason": "not_found"}
+    status = row["status"] if isinstance(row, sqlite3.Row) else row[2]
+    if status == "inactive":
+        return {"obligation_id": obligation_id, "deactivated": False, "reason": "already_inactive"}
+
+    removed = conn.execute(
+        "SELECT COUNT(*) FROM obligation_instances WHERE obligation_id = ? "
+        "AND status IN ('expected', 'needs_review', 'partially_paid')",
+        (obligation_id,),
+    ).fetchone()[0]
+    now = _now()
+    conn.execute(
+        "UPDATE obligations SET status = 'inactive', updated_at = ? WHERE id = ?",
+        (now, obligation_id),
+    )
+    return {
+        "obligation_id": obligation_id,
+        "name": row["name"] if isinstance(row, sqlite3.Row) else row[1],
+        "deactivated": True,
+        "previous_status": status,
+        "projectable_instances_removed": removed,
+    }
+
+
 def suppress_dormant_avg_estimates(
     conn: sqlite3.Connection,
     *,

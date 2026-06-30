@@ -197,6 +197,27 @@ def test_server_apply_requires_autopay_classification(tmp_path):
     assert res["obligation_id"] == "x"
 
 
+def test_deactivate_obligation_removes_from_runway(tmp_path):
+    from financial_agent.obligations import deactivate_obligation
+
+    conn = _db(tmp_path / "o.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "volvo", "name": "Volvo lease", "kind": "auto", "status": "active", "source": "seed"},
+        instances=[
+            {"id": "volvo:2026-08-01", "due_date": "2026-08-01", "amount": -580.0, "source": "seed"},
+            {"id": "volvo:2026-09-01", "due_date": "2026-09-01", "amount": -580.0, "source": "seed"},
+        ],
+    )
+    res = deactivate_obligation(conn, "volvo")
+    assert res["deactivated"] is True
+    assert res["projectable_instances_removed"] == 2
+    assert conn.execute("SELECT status FROM obligations WHERE id='volvo'").fetchone()[0] == "inactive"
+    # idempotent + not-found are reported, not raised
+    assert deactivate_obligation(conn, "volvo")["reason"] == "already_inactive"
+    assert deactivate_obligation(conn, "nope")["deactivated"] is False
+
+
 def test_set_obligation_end_excludes_instances_past_end(tmp_path):
     from datetime import date
 

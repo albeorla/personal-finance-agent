@@ -13,6 +13,7 @@ from .income import (
 )
 from .obligations import (
     apply_obligation_instances as apply_obligation_instances_for_db,
+    deactivate_obligation as deactivate_obligation_for_db,
     delete_obligation_instance as delete_obligation_instance_for_db,
     set_obligation_end as set_obligation_end_for_db,
     list_obligation_review_candidates as list_obligation_review_candidates_for_db,
@@ -746,6 +747,30 @@ def set_obligation_end(
     conn.row_factory = sqlite3.Row
     try:
         result = set_obligation_end_for_db(conn, obligation_id, active_until)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def deactivate_obligation(
+    obligation_id: str,
+    db_path: str | None = None,
+) -> dict:
+    """Retire a whole obligation (status -> inactive) so all its instances drop out
+    of the projection, listings, reconciliation, and drift. Rows are preserved for
+    audit; idempotent. Returns projectable_instances_removed so you can see how many
+    upcoming bills this pulls from the runway before relying on it.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = deactivate_obligation_for_db(conn, obligation_id)
         conn.commit()
         return result
     finally:
