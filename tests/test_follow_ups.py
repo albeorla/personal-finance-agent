@@ -4,6 +4,7 @@ from financial_agent.follow_ups import (
     capture_followup,
     list_due_followups,
     resolve_followup,
+    update_followup,
 )
 from financial_agent.schema import ensure_app_schema
 
@@ -13,6 +14,24 @@ def _db(path):
     conn.row_factory = sqlite3.Row
     ensure_app_schema(conn)
     return conn
+
+
+def test_update_followup_edits_in_place(tmp_path):
+    conn = _db(tmp_path / "t.db")
+    created = capture_followup(conn, text="Call vet", surface_when="2026-07-01", priority="low")
+    fid = created["id"]
+
+    res = update_followup(conn, fid, surface_when="2026-07-10", priority="high", text="Call vet about bloodwork")
+    assert res["updated"] is True
+    row = conn.execute("SELECT * FROM follow_ups WHERE id = ?", (fid,)).fetchone()
+    assert row["surface_when"] == "2026-07-10"
+    assert row["priority"] == "high"
+    assert row["text"] == "Call vet about bloodwork"
+    # same id - it is an edit, not a new row
+    assert conn.execute("SELECT COUNT(*) FROM follow_ups").fetchone()[0] == 1
+
+    # unknown id reports not-found rather than raising
+    assert update_followup(conn, "fup_nope", priority="high") == {"id": "fup_nope", "updated": False}
 
 
 def test_capture_followup_writes_to_db_only(tmp_path):

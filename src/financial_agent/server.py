@@ -110,6 +110,7 @@ from .follow_ups import (
     capture_followup as capture_followup_for_db,
     list_due_followups as list_due_followups_for_db,
     resolve_followup as resolve_followup_for_db,
+    update_followup as update_followup_for_db,
 )
 from .surface_queue import (
     build_surface_items as build_surface_items_for_db,
@@ -363,6 +364,41 @@ def resolve_followup(followup_id: str, db_path: str | None = None) -> dict:
     conn.row_factory = sqlite3.Row
     try:
         result = resolve_followup_for_db(conn, followup_id=followup_id)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def update_followup(
+    followup_id: str,
+    text: str | None = None,
+    surface_when: str | None = None,
+    priority: str | None = None,
+    linked_obligation_id: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Edit a dated follow-up reminder in place by id - reschedule (surface_when),
+    reword (text), re-prioritize (priority), or relink (linked_obligation_id).
+    Only the fields you pass change. Use this instead of re-capturing, which would
+    create a new row because the capture id is derived from content.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = update_followup_for_db(
+            conn,
+            followup_id,
+            text=text,
+            surface_when=surface_when,
+            priority=priority,
+            linked_obligation_id=linked_obligation_id,
+        )
         conn.commit()
         return result
     finally:
