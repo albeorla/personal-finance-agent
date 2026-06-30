@@ -12,7 +12,10 @@ round-trip in ``test_digest_retire_then_resurface``.
 import sqlite3
 
 from financial_agent.schema import ensure_app_schema
-from financial_agent.server import record_charge_onboarding_decision
+from financial_agent.server import (
+    record_charge_onboarding_decision,
+    record_charge_onboarding_decisions,
+)
 from financial_agent.surface_queue import build_surface_items
 from financial_agent.todoist_outbox import (
     request_emission_retire,
@@ -238,6 +241,24 @@ def test_reset_clears_retire(tmp_path):
 
 
 # --- section 4: onboarding digest surface item ------------------------------
+
+
+def test_batch_decisions_apply_independently(tmp_path):
+    db = tmp_path / "f.db"
+    conn = _db(db)
+    _seed_candidate(conn, "c1", "Acme")
+    _seed_candidate(conn, "c2", "Beta")
+
+    res = record_charge_onboarding_decisions(
+        [
+            {"candidate_id": "c1", "decision": "defer"},
+            {"candidate_id": "c2", "decision": {"action": "reject"}},
+            {"candidate_id": "missing", "decision": "defer"},  # bad item must not abort the batch
+        ],
+        db_path=str(db),
+    )
+    assert res["total"] == 3 and res["applied"] == 2 and res["failed"] == 1
+    assert {r["candidate_id"]: r["ok"] for r in res["results"]} == {"c1": True, "c2": True, "missing": False}
 
 
 def test_digest_single_item_for_many_candidates(tmp_path):

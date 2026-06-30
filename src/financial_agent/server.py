@@ -939,6 +939,30 @@ def get_next_charge_onboarding_candidate(db_path: str | None = None) -> dict | N
         conn.close()
 
 
+def _record_onboarding_decision(conn, candidate_id: str, decision: dict | str) -> dict:
+    """Record one decision + the surfaced-reminder cleanup hook. Caller commits.
+
+    Auto-cleanup (spec section 2): a rejected/deferred candidate flags its linked
+    obligation's surfaced due-date reminders for removal on the next live surface
+    run; an accepted/reset one clears any earlier tombstone so a re-surfaced item
+    is not immediately retired again.
+    """
+    result = record_charge_onboarding_decision_for_db(conn, candidate_id, decision)
+    existing_obligation_id = result.get("existing_obligation_id")
+    if existing_obligation_id:
+        status = result.get("status")
+        prefix = f"obligation-due:{existing_obligation_id}:"
+        if status in ("rejected", "deferred"):
+            request_emission_retire_prefix(conn, prefix)
+        elif status in ("proposed", "accepted"):
+            conn.execute(
+                "UPDATE todoist_emissions SET retire_requested_at = NULL "
+                "WHERE surface_key LIKE ? || '%' AND status = 'open'",
+                (prefix,),
+            )
+    return result
+
+
 @mcp.tool()
 def record_charge_onboarding_decision(
     candidate_id: str,
@@ -959,26 +983,52 @@ def record_charge_onboarding_decision(
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
-        result = record_charge_onboarding_decision_for_db(conn, candidate_id, decision)
-        # Auto-cleanup hook (spec section 2): when a candidate is rejected or
-        # deferred, the surfaced cash-flow reminders for its linked obligation are
-        # no longer wanted - flag every due-date instance for removal on the next
-        # live surface run. When it is accepted or un-decided (reset), clear any
-        # earlier tombstone so a re-surfaced item is not immediately retired again.
-        existing_obligation_id = result.get("existing_obligation_id")
-        if existing_obligation_id:
-            status = result.get("status")
-            prefix = f"obligation-due:{existing_obligation_id}:"
-            if status in ("rejected", "deferred"):
-                request_emission_retire_prefix(conn, prefix)
-            elif status in ("proposed", "accepted"):
-                conn.execute(
-                    "UPDATE todoist_emissions SET retire_requested_at = NULL "
-                    "WHERE surface_key LIKE ? || '%' AND status = 'open'",
-                    (prefix,),
-                )
+        result = _record_onboarding_decision(conn, candidate_id, decision)
         conn.commit()
         return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def record_charge_onboarding_decisions(
+    decisions: list[dict],
+    db_path: str | None = None,
+) -> dict:
+    """Record review decisions for MANY charge-onboarding candidates in one call.
+
+    Each item is {"candidate_id": str, "decision": <str|dict>} where decision is an
+    action string ("defer"/"reject"/...) or {"action": ...}, same as the single
+    record_charge_onboarding_decision. This clears the one-at-a-time grind on a big
+    queue. Items are applied independently in one transaction; a bad item is
+    reported as an error and does NOT abort the rest. Returns
+    {total, applied, failed, results:[{candidate_id, ok, status|error}]}.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    results: list[dict] = []
+    applied = failed = 0
+    try:
+        for item in decisions or []:
+            cid = (item or {}).get("candidate_id")
+            dec = (item or {}).get("decision")
+            if not cid:
+                failed += 1
+                results.append({"candidate_id": cid, "ok": False, "error": "missing candidate_id"})
+                continue
+            try:
+                res = _record_onboarding_decision(conn, cid, dec)
+                applied += 1
+                results.append({"candidate_id": cid, "ok": True, "status": res.get("status")})
+            except Exception as exc:  # noqa: BLE001 - record per item, never abort the batch
+                failed += 1
+                results.append({"candidate_id": cid, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+        conn.commit()
+        return {"total": len(decisions or []), "applied": applied, "failed": failed, "results": results}
     finally:
         conn.close()
 
