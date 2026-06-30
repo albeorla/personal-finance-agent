@@ -1136,7 +1136,15 @@ def reconcile_todoist_project_for_db(
             "kept": 0,
             "needs_review": 0,
         },
-        "ledger_findings": {"ledger_orphan": 0},
+        "ledger_findings": {
+            "ledger_orphan": 0,
+            "ledger_orphan_note": (
+                "Open emissions whose task is not in THIS project's current list - "
+                "the task may have been deleted, completed, or moved out of the "
+                "project. This is project-membership only, NOT confirmed deletion; "
+                "completions are reconciled authoritatively by reconcile_todoist_completions."
+            ),
+        },
         "actions": {"deleted": 0, "ledger_resolved": 0, "skipped_not_live": 0, "failed": 0},
         "tasks": [],
     }
