@@ -563,10 +563,22 @@ def extract_surface_key(description: str | None) -> str | None:
     return key or None
 
 
-def content_hash_for(content: str, description: str) -> str:
-    """Stable 16-char hash of the surfaced content, for change detection."""
+def content_hash_for(
+    content: str,
+    description: str,
+    due_date: str | None = None,
+    priority: int | None = None,
+) -> str:
+    """Stable 16-char hash of the surfaced item, for change detection.
 
-    raw = f"{content}\n{description}"
+    ``due_date`` and ``priority`` are part of the hash so a due-date-only change
+    (an obligation's date shifting) still triggers an in-place update instead of
+    being skipped as unchanged - which previously left stale due dates on managed
+    tasks. Both default to None so existing two-arg callers (e.g. live-task dedup)
+    keep their prior hashes.
+    """
+
+    raw = f"{content}\n{description}\n{due_date or ''}\n{priority if priority is not None else ''}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -937,7 +949,7 @@ def surface_to_todoist(
         description = item.get("description") or ""
         due_date = item.get("due_date")
         priority = item.get("priority")
-        new_hash = content_hash_for(content, description)
+        new_hash = content_hash_for(content, description, due_date, priority)
 
         row = conn.execute(
             "SELECT surface_key, todoist_task_id, status, content_hash FROM todoist_emissions WHERE surface_key = ?",

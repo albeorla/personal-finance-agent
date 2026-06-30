@@ -90,6 +90,32 @@ def test_marker_round_trips():
 def test_content_hash_is_deterministic():
     assert content_hash_for("a", "b") == content_hash_for("a", "b")
     assert content_hash_for("a", "b") != content_hash_for("a", "c")
+    # a due-date-only change must change the hash so the task is not skipped
+    assert content_hash_for("a", "b", "2026-07-01") != content_hash_for("a", "b", "2026-06-28")
+
+
+def test_due_date_only_change_updates_task_in_place(tmp_path):
+    # Same content/description, shifted due date: must UPDATE the same task (push
+    # the new date), not skip it as unchanged - the bug that left stale dates.
+    conn = _db(tmp_path / "f.db")
+    spy = _Spy()
+    item = {
+        "surface_key": "obligation-due:rent:2026-07-03",
+        "content": "Rent due: $3,000.00",
+        "description": "Pay rent.",
+        "due_date": "2026-07-01",
+    }
+    first = _enabled(conn, [item], spy)
+    assert first["created"] == 1 and len(spy.creates) == 1
+
+    second = _enabled(conn, [{**item, "due_date": "2026-06-28"}], spy)
+    assert second["updated"] == 1 and second["skipped"] == 0
+    assert len(spy.updates) == 1
+    assert spy.updates[-1]["body"].get("due_date") == "2026-06-28"
+
+    # re-running with the same (new) due date is now idempotent
+    third = _enabled(conn, [{**item, "due_date": "2026-06-28"}], spy)
+    assert third["skipped"] == 1 and third["updated"] == 0
 
 
 # --- create-once-then-skip -------------------------------------------------
