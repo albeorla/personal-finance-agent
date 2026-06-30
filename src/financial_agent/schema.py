@@ -8,7 +8,7 @@ from pathlib import Path
 # Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
 # a fresh DB ends at this version after ensure_app_schema runs. When adding a
 # migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
@@ -585,12 +585,25 @@ def _migrate_to_v3(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v4(conn: sqlite3.Connection) -> None:
+    """Give obligations an optional end date.
+
+    A bill with a known end - a lease, a loan payoff, a subscription being
+    cancelled - should stop hitting the projection on that date instead of being
+    re-extended forever. ``active_until`` (ISO date) is NULL for open-ended bills;
+    when set, the projection hard-stops at it. Idempotent.
+    """
+
+    _ensure_column(conn, "obligations", "active_until", "TEXT")
+
+
 # Ordered migration registry: (target version, idempotent apply function).
 # Append-only; never reorder or renumber existing entries.
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _migrate_to_v1),
     (2, _migrate_to_v2),
     (3, _migrate_to_v3),
+    (4, _migrate_to_v4),
 ]
 
 

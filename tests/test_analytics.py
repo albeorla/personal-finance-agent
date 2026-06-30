@@ -6,10 +6,73 @@ import pytest
 
 from financial_agent.analytics import (
     categorize,
+    list_transactions,
     normalize_merchant,
     render_spending_markdown,
     summarize_spending,
 )
+
+
+def _db_with_accounts(path, txns):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT)")
+    conn.execute("INSERT INTO accounts (id, name) VALUES ('chk', 'Checking 4321')")
+    conn.execute(
+        "CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT, "
+        "amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT)"
+    )
+    for i, (posted, amount, payee, desc) in enumerate(txns):
+        conn.execute(
+            "INSERT INTO transactions (id, account_id, posted, amount, payee, description, pending, source) "
+            "VALUES (?,?,?,?,?,?,0,'simplefin')",
+            (f"t{i}", "chk", posted, amount, payee, desc),
+        )
+    conn.commit()
+    return conn
+
+
+def test_list_transactions_filters_and_orders(tmp_path):
+    conn = _db_with_accounts(
+        tmp_path / "f.db",
+        [
+            ("2026-06-01", -12.50, "Starbucks", "coffee"),
+            ("2026-06-15", -250.00, "DMV", "Auto payment"),
+            ("2026-06-20", 5000.00, "Payroll", "direct deposit"),
+        ],
+    )
+    # newest first, with the account name joined in
+    res = list_transactions(conn)
+    assert res["count"] == 3
+    assert res["transactions"][0]["posted"] == "2026-06-20"
+    assert res["transactions"][0]["account_name"] == "Checking 4321"
+
+    # text search spans payee + description
+    hit = list_transactions(conn, query="auto")
+    assert hit["count"] == 1 and hit["transactions"][0]["amount"] == -250.00
+
+    # absolute-amount floor
+    big = list_transactions(conn, min_amount=100)
+    assert {t["payee"] for t in big["transactions"]} == {"DMV", "Payroll"}
+
+    # inclusive date range
+    rng = list_transactions(conn, start_date="2026-06-10", end_date="2026-06-18")
+    assert rng["count"] == 1 and rng["transactions"][0]["payee"] == "DMV"
+
+    # limit + truncated flag
+    lim = list_transactions(conn, limit=1)
+    assert lim["count"] == 1 and lim["truncated"] is True
+
+
+def test_list_transactions_missing_table_is_empty(tmp_path):
+    conn = sqlite3.connect(tmp_path / "empty.db")
+    conn.row_factory = sqlite3.Row
+    assert list_transactions(conn) == {
+        "count": 0,
+        "truncated": False,
+        "limit": 50,
+        "transactions": [],
+    }
 
 
 def _db(path, txns):

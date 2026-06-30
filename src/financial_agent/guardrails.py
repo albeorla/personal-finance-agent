@@ -23,6 +23,7 @@ from typing import Any
 
 from .cashflow import build_cash_flow_projections
 from .debts import list_debts
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
 
@@ -298,12 +299,12 @@ def _latest_accounts(conn) -> list[dict[str, Any]]:
     if not _has_table(conn, "balance_snapshots"):
         return []
     rows = conn.execute(
-        """
+        f"""
         SELECT a.id AS account_id, a.name AS account_name, a.kind, bs.available, bs.recorded_at
         FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id
         WHERE bs.id = (SELECT inner_bs.id FROM balance_snapshots inner_bs
                        WHERE inner_bs.account_id = bs.account_id
-                       ORDER BY inner_bs.recorded_at DESC, inner_bs.id DESC LIMIT 1)
+                       {BALANCE_PRECEDENCE_ORDER_BY.format(alias="inner_bs")} LIMIT 1)
         """
     ).fetchall()
     return [{"account_id": r["account_id"], "account_name": r["account_name"], "kind": r["kind"],

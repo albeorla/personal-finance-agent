@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from statistics import median as _stat_median
 from typing import Any
 
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
 
@@ -50,7 +51,28 @@ def apply_obligation_instances(
     obligation: dict[str, Any],
     instances: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Create or update an obligation and its dated instances."""
+    """Create or update an obligation and its dated instances.
+
+    ``obligation`` keys: ``id`` (req), ``name`` (req), ``kind`` (req), ``source``
+    (req); ``cadence`` (e.g. 'monthly'), ``status`` (default 'active'), ``autopay``
+    (default True - set False to surface it as a manual-due reminder),
+    ``amount_discretionary`` (default False - True when the modeled amount is only
+    a floor the user finalizes, e.g. a card minimum).
+
+    Each ``instances`` item: ``due_date`` (req), ``amount`` (req; negative => outflow
+    when ``direction`` is omitted, and the stored amount is the magnitude with the
+    sign carried by ``direction``), ``source`` (req); optional ``id`` (defaults to
+    ``"<obligation_id>:<due_date>"``, auto-suffixed ``:1``, ``:2`` for additional
+    instances sharing a date so they never overwrite each other), ``direction``
+    ('inflow'/'outflow', inferred from amount sign), ``status`` (default 'expected'),
+    ``confidence``, ``notes``, ``amount_status``, ``amount_source``,
+    ``amount_observed_at``, ``statement_close_date``, ``review_after``,
+    ``estimation_method``, ``estimation_inputs`` (dict), ``cash_flow_treatment``,
+    ``statement_target_obligation_id``.
+
+    Returns ``{"obligation_id", "created", "updated", "instance_ids"}`` so the
+    caller can tell new inserts from re-applied upserts (never a silent no-op).
+    """
 
     ensure_app_schema(conn)
     now = _now()
@@ -65,8 +87,8 @@ def apply_obligation_instances(
         """
         INSERT INTO obligations (
             id, name, kind, cadence, status, source, autopay,
-            amount_discretionary, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            amount_discretionary, active_until, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             kind = excluded.kind,
@@ -75,6 +97,7 @@ def apply_obligation_instances(
             source = excluded.source,
             autopay = excluded.autopay,
             amount_discretionary = excluded.amount_discretionary,
+            active_until = excluded.active_until,
             updated_at = excluded.updated_at
         """,
         (
@@ -86,6 +109,7 @@ def apply_obligation_instances(
             obligation["source"],
             autopay,
             amount_discretionary,
+            _optional_date(obligation.get("active_until")),
             now,
             now,
         ),
@@ -179,6 +203,7 @@ def _compact_obligation(obligation: dict[str, Any]) -> dict[str, Any]:
 def list_obligations(
     conn: sqlite3.Connection,
     *,
+    obligation_id: str | None = None,
     kind: str | None = None,
     status: str | None = "active",
     include_instances: bool = True,
@@ -187,10 +212,15 @@ def list_obligations(
     ensure_app_schema(conn)
     where = []
     params: list[Any] = []
+    if obligation_id is not None:
+        # A by-id lookup returns that obligation regardless of status (so you can
+        # pull one inactive/superseded row without dumping the whole roster).
+        where.append("id = ?")
+        params.append(obligation_id)
     if kind is not None:
         where.append("kind = ?")
         params.append(kind)
-    if status is not None:
+    if status is not None and obligation_id is None:
         where.append("status = ?")
         params.append(status)
 
@@ -398,6 +428,83 @@ def delete_obligation_instance(
         "previous_status": row["status"],
         "status": "deleted",
         "updated_at": now,
+    }
+
+
+def set_obligation_end(
+    conn: sqlite3.Connection,
+    obligation_id: str,
+    active_until: str | None,
+) -> dict[str, Any]:
+    """Set (or clear) the date a bill stops projecting.
+
+    A bill with a known end - a lease, a loan payoff, a subscription being
+    cancelled - should not keep filling the runway forever. Setting ``active_until``
+    (ISO date) hard-stops its instances from the projection on and after that date;
+    passing None clears it (open-ended again). Reversible, no instances are
+    deleted - they are simply excluded past the end date.
+    """
+
+    ensure_app_schema(conn)
+    row = conn.execute(
+        "SELECT id, name, active_until FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()
+    if row is None:
+        return {"obligation_id": obligation_id, "updated": False, "reason": "not_found"}
+
+    end = _optional_date(active_until)
+    now = _now()
+    conn.execute(
+        "UPDATE obligations SET active_until = ?, updated_at = ? WHERE id = ?",
+        (end, now, obligation_id),
+    )
+    return {
+        "obligation_id": obligation_id,
+        "name": row["name"] if isinstance(row, sqlite3.Row) else row[1],
+        "updated": True,
+        "previous_active_until": row["active_until"] if isinstance(row, sqlite3.Row) else row[2],
+        "active_until": end,
+    }
+
+
+def deactivate_obligation(
+    conn: sqlite3.Connection,
+    obligation_id: str,
+) -> dict[str, Any]:
+    """Retire a whole obligation by setting its status to 'inactive'.
+
+    Every instance drops out of the projection, listings, reconciliation, and
+    drift, while the rows stay for audit. Idempotent. Reports how many projectable
+    instances this pulls from the runway, so a bulk deactivation can't silently
+    drop a real upcoming bill without the count showing it.
+    """
+
+    ensure_app_schema(conn)
+    row = conn.execute(
+        "SELECT id, name, status FROM obligations WHERE id = ?", (obligation_id,)
+    ).fetchone()
+    if row is None:
+        return {"obligation_id": obligation_id, "deactivated": False, "reason": "not_found"}
+    status = row["status"] if isinstance(row, sqlite3.Row) else row[2]
+    if status == "inactive":
+        return {"obligation_id": obligation_id, "deactivated": False, "reason": "already_inactive"}
+
+    removed = conn.execute(
+        "SELECT COUNT(*) FROM obligation_instances WHERE obligation_id = ? "
+        "AND status IN ('expected', 'needs_review', 'partially_paid')",
+        (obligation_id,),
+    ).fetchone()[0]
+    now = _now()
+    conn.execute(
+        "UPDATE obligations SET status = 'inactive', updated_at = ? WHERE id = ?",
+        (now, obligation_id),
+    )
+    return {
+        "obligation_id": obligation_id,
+        "name": row["name"] if isinstance(row, sqlite3.Row) else row[1],
+        "deactivated": True,
+        "previous_status": status,
+        "projectable_instances_removed": removed,
     }
 
 
@@ -1057,11 +1164,11 @@ def _account_dormancy(
 
     for account_id in account_ids:
         row = conn.execute(
-            """
+            f"""
             SELECT balance, available, recorded_at
             FROM balance_snapshots
             WHERE account_id = ?
-            ORDER BY recorded_at DESC
+            {BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
             LIMIT 1
             """,
             (account_id,),
@@ -1219,7 +1326,7 @@ def _instances_for_obligation(conn: sqlite3.Connection, obligation_id: str) -> l
             cash_flow_treatment, statement_target_obligation_id
         FROM obligation_instances
         WHERE obligation_id = ?
-          AND status != 'deleted'
+          AND status NOT IN ('deleted', 'canceled')
         ORDER BY due_date, id
         """,
         (obligation_id,),

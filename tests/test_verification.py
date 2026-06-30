@@ -22,6 +22,8 @@ _CHECKS = [
     "duplicate_instances",
     "statement_identity",
     "instance_sign_sanity",
+    "coverage_horizon",
+    "cross_obligation_overlap",
 ]
 
 
@@ -101,7 +103,7 @@ def test_clean_model_passes_all_checks(tmp_path):
 
     assert result["ok"] is True
     assert result["checks_run"] == _CHECKS
-    assert result["checks_total"] == 4
+    assert result["checks_total"] == 6
     assert result["findings_total"] == 0
     assert result["by_severity"] == {}
     assert result["findings"] == []
@@ -171,6 +173,46 @@ def test_instance_sign_sanity_flags_negative_stored_amount(tmp_path):
     assert sign[0]["evidence"]["amount"] == -120.0
 
 
+# --- coverage_horizon ------------------------------------------------------
+
+
+def test_coverage_horizon_flags_recurring_that_runs_out(tmp_path):
+    conn = _clean_db(tmp_path / "cov.sqlite")
+    # A monthly bill whose only future instance is next month runs out well before
+    # the 90-day horizon (2026-06-20 + 90d = 2026-09-18).
+    conn.execute(
+        "INSERT INTO obligations (id,name,kind,cadence,status,source,created_at,updated_at) "
+        "VALUES ('gym','Gym','fitness','monthly','active','seed','t','t')"
+    )
+    _insert_instance(conn, iid="gym:2026-07-01", obligation_id="gym", due_date="2026-07-01", amount=3000.0)
+    conn.commit()
+
+    cov = [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+           if f["check_id"] == "coverage_horizon"]
+    assert len(cov) == 1 and cov[0]["severity"] == "warn"
+    assert cov[0]["evidence"]["obligation_id"] == "gym"
+
+    # Extend it past the horizon -> no longer flagged.
+    _insert_instance(conn, iid="gym:2026-10-01", obligation_id="gym", due_date="2026-10-01", amount=3000.0)
+    conn.commit()
+    assert not [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+                if f["check_id"] == "coverage_horizon"]
+
+
+def test_coverage_horizon_ignores_obligation_with_active_until(tmp_path):
+    # A bill that ENDS before the horizon (active_until set) ran out on purpose -
+    # it must not be flagged as "runs out early".
+    conn = _clean_db(tmp_path / "cov.sqlite")
+    conn.execute(
+        "INSERT INTO obligations (id,name,kind,cadence,status,source,active_until,created_at,updated_at) "
+        "VALUES ('gym','Gym','fitness','monthly','active','seed','2026-07-31','t','t')"
+    )
+    _insert_instance(conn, iid="gym:2026-07-01", obligation_id="gym", due_date="2026-07-01", amount=3000.0)
+    conn.commit()
+    assert not [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+                if f["check_id"] == "coverage_horizon"]
+
+
 # --- persistence -----------------------------------------------------------
 
 
@@ -208,6 +250,40 @@ def test_persist_false_writes_nothing(tmp_path):
     assert list_verification_findings(conn, status=None) == []
 
 
+# --- cross_obligation_overlap ----------------------------------------------
+
+
+def test_cross_obligation_overlap_flags_likely_duplicate(tmp_path):
+    conn = _clean_db(tmp_path / "ov.sqlite")
+    # Two active 'auto' obligations with instances in the same month at comparable
+    # amounts -> likely the same real bill (old lease replaced by new). Review flag.
+    for oid, name in [("oldcar", "Old car lease"), ("newcar", "New car lease")]:
+        conn.execute(
+            "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
+            "VALUES (?,?,'auto','active','seed','t','t')",
+            (oid, name),
+        )
+    _insert_instance(conn, iid="oldcar:2026-08-08", obligation_id="oldcar", due_date="2026-08-08", amount=700.0)
+    _insert_instance(conn, iid="newcar:2026-08-10", obligation_id="newcar", due_date="2026-08-10", amount=600.0)
+    conn.commit()
+
+    ov = [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+          if f["check_id"] == "cross_obligation_overlap"]
+    assert len(ov) == 1 and ov[0]["severity"] == "warn"
+    assert ov[0]["evidence"]["shared_months"] == ["2026-08"]
+
+    # A different-kind bill in the same month does NOT pair with them.
+    conn.execute(
+        "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
+        "VALUES ('netflix','Netflix','subscription','active','seed','t','t')"
+    )
+    _insert_instance(conn, iid="netflix:2026-08-15", obligation_id="netflix", due_date="2026-08-15", amount=15.0)
+    conn.commit()
+    ov2 = [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+           if f["check_id"] == "cross_obligation_overlap"]
+    assert len(ov2) == 1  # still just the two car leases
+
+
 # --- pipeline integration --------------------------------------------------
 
 
@@ -218,7 +294,7 @@ def test_background_sync_runs_verify_between_suppress_and_surface(tmp_path):
     verify = result["result_summary"]["verify"]
     assert set(verify) == {"ok", "checks_total", "findings_total", "by_severity"}
     assert verify["ok"] is True
-    assert verify["checks_total"] == 4
+    assert verify["checks_total"] == 6
 
     events = [e["event_type"] for e in get_background_run(conn, result["run_id"])["events"]]
     assert "verify" in events
@@ -262,7 +338,7 @@ def test_digest_includes_verification_block(tmp_path):
     block = digest["verification"]
     assert set(block) == {"ok", "checks_total", "findings_total", "by_severity", "findings"}
     assert block["ok"] is True
-    assert block["checks_total"] == 4
+    assert block["checks_total"] == 6
     assert block["findings_total"] == 0
 
     # The digest read is non-persisting: nothing was written.

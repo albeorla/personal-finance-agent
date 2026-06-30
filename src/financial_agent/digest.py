@@ -102,7 +102,13 @@ def build_daily_digest(
             "net_across_accounts": status["balances"]["total_balance"],
             "liquid_available": deposit_liquid,
             "accounts": [
-                {"name": a["account_name"], "org": a.get("org"), "balance": a["balance"], "available": a["available"]}
+                {
+                    "name": a["account_name"],
+                    "org": a.get("org"),
+                    "balance": a["balance"],
+                    "available": a["available"],
+                    "recorded_at": a.get("recorded_at"),
+                }
                 for a in status["balances"]["accounts"]
             ],
         },
@@ -139,6 +145,7 @@ def build_daily_digest(
             "guardrails": "evaluate_guardrails (cash floor / drift / window-age / avalanche)",
             "coverage": "obligation roster + projection events + manual-due surface rows + onboarding queue + board freshness",
             "trough_sensitivity": "estimated low-confidence outflows before the projected low point",
+            "db_file": resolved_db_path,
         },
     }
     # #7: headline band = the longest window (matches the lowest_balance headline).
@@ -154,7 +161,7 @@ def build_daily_digest(
         drift_warnings=status["drift_warnings"],
         longest_projection=longest,
     )
-    digest["status_color"] = _status_color(digest)
+    digest["status_color"], digest["status_reason"] = _status_color(digest)
     # Deterministic self-checks: does the model tie out internally? Read-only
     # here (persist=False), so the digest reports the live consistency state
     # without writing findings. The grounding gate proves each number traces to
@@ -174,6 +181,7 @@ def _adversarial_review_block(db_path: str) -> dict[str, Any]:
 
     import sqlite3
 
+    from .adversarial import adversarial_review_enabled
     from .verification import list_verification_findings
 
     conn = sqlite3.connect(db_path)
@@ -187,6 +195,7 @@ def _adversarial_review_block(db_path: str) -> dict[str, Any]:
         by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
     return {
         "ok": len(findings) == 0,
+        "enabled": adversarial_review_enabled(),
         "advisory": True,
         "note": "Independent reviewer flags - advisory attention-routing, not verdicts.",
         "findings_total": len(findings),
@@ -220,7 +229,9 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append(f"# Finance Daily Digest - {digest['as_of_date']}")
     lines.append("")
-    lines.append(f"Cash runway (modeled bills only): {digest['status_color']}")
+    lines.append(
+        f"Cash runway (modeled bills only): {digest['status_color']} - {digest.get('status_reason', '')}"
+    )
     lines.append("")
     _render_coverage(digest.get("coverage"), lines)
     if digest.get("recurring_checking_count"):
@@ -247,7 +258,10 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
         bal_v, avail_v = a.get("balance"), a.get("available")
         if bal_v is not None and avail_v is not None and bal_v >= 0 and abs(avail_v - bal_v) > 0.01:
             note = f" (avail ${_money(avail_v)})"
-        lines.append(f"- {_account_label(a)}: ${_money(bal_v)}{note}")
+        # Freshness: how old this balance is, so a stale balance-only feed (e.g. an
+        # "Updated Monthly" card weeks out of date) is visibly stale, not implied live.
+        fresh = f" _(as of {_relative_time(a.get('recorded_at'))})_" if a.get("recorded_at") else ""
+        lines.append(f"- {_account_label(a)}: ${_money(bal_v)}{note}{fresh}")
     lines.append("")
 
     lines.append("## Cash-Flow Projection")
@@ -356,8 +370,10 @@ def _render_coverage(cov: dict[str, Any] | None, lines: list[str]) -> None:
             for status, n in cov["onboarding_by_status"].items()
             if n
         )
+        n_active = cov["onboarding_active"]
+        noun = "charge" if n_active == 1 else "charges"
         lines.append(
-            f"Not yet modeled: {cov['onboarding_active']} charges awaiting review "
+            f"Not yet modeled: {n_active} {noun} awaiting review "
             f"({parts}) - these are NOT in the runway."
         )
     else:
@@ -755,36 +771,57 @@ def _relative_time(iso: Any) -> str:
     return f"{int(age_h // 24)} days ago"
 
 
-def _status_color(digest: dict[str, Any]) -> str:
-    severities = {g["severity"] for g in digest["guardrails"] if not g.get("advisory")}
+def _guardrail_reason(g: dict[str, Any] | None) -> str:
+    """One human phrase for a guardrail finding, distinguishing a cash danger from
+    a benign review chore (drift) so the color is not the only signal."""
+    if not g:
+        return "a guardrail tripped"
+    msg = g.get("message") or "a guardrail tripped"
+    if g.get("rule_type") == "drift_threshold":
+        return f"drift to reconcile (not a cash shortfall) - {msg}"
+    return msg
+
+
+def _status_color(digest: dict[str, Any]) -> tuple[str, str]:
+    """Return (color, reason). The reason names WHY, so a reader can tell a cash
+    danger (RED: dip below the floor) from a review chore (YELLOW: reconcile drift)
+    without the color alone carrying both meanings."""
+    findings = [g for g in digest["guardrails"] if not g.get("advisory")]
+    severities = {g["severity"] for g in findings}
+    rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+    def dominant(*levels: str) -> dict[str, Any] | None:
+        cand = [g for g in findings if g["severity"] in levels]
+        return max(cand, key=lambda g: rank.get(g["severity"], 0)) if cand else None
+
     if "critical" in severities or "high" in severities:
-        return "RED"
+        return "RED", _guardrail_reason(dominant("critical", "high"))
     if any((c["lowest_balance"] is not None and c["lowest_balance"] < 0) for c in digest["cash_flow"]):
-        return "RED"
+        return "RED", "modeled bills push the balance below zero before the low point"
     # #7: a trough whose downside band crosses zero is RED even when the point
     # estimate clears - the estimated bills before the low point could push it
     # negative (mirrors the lowest_balance < 0 gate above).
     if any((c.get("trough_low_estimate") is not None and c["trough_low_estimate"] < 0) for c in digest["cash_flow"]):
-        return "RED"
+        return "RED", "estimated bills could push the trough below zero"
     if "medium" in severities:
-        return "YELLOW"
+        return "YELLOW", _guardrail_reason(dominant("medium"))
     # #7: the point estimate clears the floor, but the estimated outflows before
     # the trough could drop it below the $2,500 cash floor (or to zero) - cap at
     # YELLOW until those amounts are confirmed.
     ts = digest.get("trough_sensitivity")
     if ts and ts.get("breach_risk"):
-        return "YELLOW"
+        return "YELLOW", "estimated bills before the low point could dip below the cash floor"
     # A confident GREEN is unwarranted when material recurring CHECKING debits are
     # known but not yet in the projection (e.g. a car payment): the runway is
     # provably incomplete, so cap at YELLOW until they are modeled.
     if digest.get("recurring_checking_monthly", 0) >= 100:
-        return "YELLOW"
+        return "YELLOW", "known recurring checking debits are not yet in the projection"
     # A material ESTIMATED bill (e.g. a variable card statement payment) means the
     # runway hinges on a guess for one of the largest outflows; the real amount has
     # run well above the estimate, so confident GREEN is unwarranted - cap at YELLOW.
     if digest.get("estimated_material"):
-        return "YELLOW"
-    return "GREEN"
+        return "YELLOW", "a large bill is still an estimate, not a confirmed amount"
+    return "GREEN", "modeled runway clears the cash floor"
 
 
 def _account_label(account: dict[str, Any]) -> str:

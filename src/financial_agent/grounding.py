@@ -19,6 +19,7 @@ import sqlite3
 from typing import Any
 
 from .config import get_finance_config
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .status import default_db_path
 
 DEFAULT_TOLERANCE = 0.02
@@ -47,13 +48,14 @@ def verify_grounding(
         if hint:
             snap = conn.execute(
                 "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
-                "WHERE a.name LIKE '%' || ? || '%' ORDER BY bs.recorded_at DESC LIMIT 1",
+                "WHERE a.name LIKE '%' || ? || '%' "
+                f"{BALANCE_PRECEDENCE_ORDER_BY.format(alias='bs')} LIMIT 1",
                 (hint,),
             ).fetchone()
         else:
             snap = conn.execute(
                 "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
-                "WHERE a.kind = 'checking' ORDER BY bs.recorded_at DESC LIMIT 1"
+                f"WHERE a.kind = 'checking' {BALANCE_PRECEDENCE_ORDER_BY.format(alias='bs')} LIMIT 1"
             ).fetchone()
         if norm["working_cash"] is not None:
             checks.append(_num_check(
@@ -66,8 +68,9 @@ def verify_grounding(
         if norm["net_across_accounts"] is not None:
             net_row = conn.execute(
                 "SELECT COALESCE(SUM(bs.balance), 0) FROM balance_snapshots bs "
-                "JOIN (SELECT account_id, MAX(recorded_at) AS mr FROM balance_snapshots GROUP BY account_id) m "
-                "ON m.account_id = bs.account_id AND m.mr = bs.recorded_at"
+                "WHERE bs.id = (SELECT inner_bs.id FROM balance_snapshots inner_bs "
+                f"WHERE inner_bs.account_id = bs.account_id "
+                f"{BALANCE_PRECEDENCE_ORDER_BY.format(alias='inner_bs')} LIMIT 1)"
             ).fetchone()
             checks.append(_num_check(
                 "net_across_accounts", norm["net_across_accounts"],
@@ -79,8 +82,9 @@ def verify_grounding(
         if norm.get("liquid_available") is not None:
             liq_row = conn.execute(
                 "SELECT COALESCE(SUM(bs.available), 0) FROM balance_snapshots bs "
-                "JOIN (SELECT account_id, MAX(recorded_at) AS mr FROM balance_snapshots GROUP BY account_id) m "
-                "ON m.account_id = bs.account_id AND m.mr = bs.recorded_at WHERE bs.balance >= 0"
+                "WHERE bs.balance >= 0 AND bs.id = (SELECT inner_bs.id FROM balance_snapshots inner_bs "
+                f"WHERE inner_bs.account_id = bs.account_id "
+                f"{BALANCE_PRECEDENCE_ORDER_BY.format(alias='inner_bs')} LIMIT 1)"
             ).fetchone()
             checks.append(_num_check(
                 "liquid_available", norm["liquid_available"],
