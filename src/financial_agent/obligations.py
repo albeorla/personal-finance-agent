@@ -51,7 +51,28 @@ def apply_obligation_instances(
     obligation: dict[str, Any],
     instances: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Create or update an obligation and its dated instances."""
+    """Create or update an obligation and its dated instances.
+
+    ``obligation`` keys: ``id`` (req), ``name`` (req), ``kind`` (req), ``source``
+    (req); ``cadence`` (e.g. 'monthly'), ``status`` (default 'active'), ``autopay``
+    (default True - set False to surface it as a manual-due reminder),
+    ``amount_discretionary`` (default False - True when the modeled amount is only
+    a floor the user finalizes, e.g. a card minimum).
+
+    Each ``instances`` item: ``due_date`` (req), ``amount`` (req; negative => outflow
+    when ``direction`` is omitted, and the stored amount is the magnitude with the
+    sign carried by ``direction``), ``source`` (req); optional ``id`` (defaults to
+    ``"<obligation_id>:<due_date>"``, auto-suffixed ``:1``, ``:2`` for additional
+    instances sharing a date so they never overwrite each other), ``direction``
+    ('inflow'/'outflow', inferred from amount sign), ``status`` (default 'expected'),
+    ``confidence``, ``notes``, ``amount_status``, ``amount_source``,
+    ``amount_observed_at``, ``statement_close_date``, ``review_after``,
+    ``estimation_method``, ``estimation_inputs`` (dict), ``cash_flow_treatment``,
+    ``statement_target_obligation_id``.
+
+    Returns ``{"obligation_id", "created", "updated", "instance_ids"}`` so the
+    caller can tell new inserts from re-applied upserts (never a silent no-op).
+    """
 
     ensure_app_schema(conn)
     now = _now()
