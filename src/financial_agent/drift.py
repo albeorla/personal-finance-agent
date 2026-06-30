@@ -48,6 +48,22 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "amount_change_threshold": 0.20,
 }
 
+# Same-charge gate for amount_changed. To call a past-due obligation "paid but at
+# a different amount" (vs unpaid), the candidate transaction must corroborate on
+# BOTH merchant and date - not either alone. The old `merchant>0 OR date<=1` gate
+# matched unrelated charges: an electric bill to a YouTube TV charge a day later,
+# a car-lease bill to an Amex payment - then recommended overwriting the real
+# amount. A miss here only downgrades to missing_expected ("confirm whether
+# paid"), so leaning to precision protects the modeled numbers.
+#
+# Merchant corroboration = at least one shared meaningful token (merchant_score >
+# 0). The tokenizer already drops stopwords and tokens < 3 chars, so any positive
+# score is a real shared word - which cleanly separates a same-merchant amount
+# change (Eversource->Eversource shares "eversource") from a coincidental nearby
+# charge (Eversource vs "Youtube TV" shares nothing). SAME_CHARGE_DATE_DAYS is the
+# date-proximity window, a tunable knob.
+SAME_CHARGE_DATE_DAYS = 3
+
 _RECONCILABLE_STATUSES = ("expected", "needs_review", "partially_paid")
 _RECURRING_CANDIDATE_TYPES = ("direct_checking_outflow", "card_statement_input", "inflow")
 _ACTIVE_CANDIDATE_STATUSES = ("discovered", "proposed", "in_review")
@@ -139,7 +155,14 @@ def find_payment_drift(
 
         approx = find_transaction_matches(conn, obligation_instance=dict(inst), options=loose)
         present = approx[0] if approx else None
-        same_charge = present is not None and (present["merchant_score"] > 0 or abs(present["date_delta_days"]) <= 1)
+        # Require merchant corroboration AND date proximity (not either alone):
+        # otherwise an unrelated charge on a nearby date is mistaken for this bill
+        # paid at a different amount, corrupting the modeled number.
+        same_charge = (
+            present is not None
+            and present["merchant_score"] > 0.0
+            and abs(present["date_delta_days"]) <= SAME_CHARGE_DATE_DAYS
+        )
 
         if same_charge and expected > 0:
             observed = round(abs(float(present["txn_amount"])), 2)

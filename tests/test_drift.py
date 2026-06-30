@@ -91,6 +91,23 @@ def test_amount_changed_when_charge_present_but_different(tmp_path):
     assert changed[0]["evidence"]["expected_amount"] == 115.87
 
 
+def test_unrelated_charge_on_nearby_date_is_not_amount_changed(tmp_path):
+    # Regression for the live false match: an unrelated charge a day off the due
+    # date with ZERO merchant overlap must NOT be read as the bill paid at a
+    # different amount (which would overwrite the real expected amount). The bug
+    # matched "Eversource electric estimates" ($173.80) to a YouTube TV charge.
+    conn = _db(
+        tmp_path / "d.sqlite",
+        transactions=[("t-yt", "ACT-chk", "2026-06-26T08:00:00", -88.26, "Youtube TV", "GOOGLE*YOUTUBE TV")],
+    )
+    _ob(conn, "eversource", "Eversource electric estimates", "utility",
+        [{"id": "eversource:2026-06-25", "due_date": "2026-06-25", "amount": -173.80, "source": "seed"}])
+    result = detect_drift(conn, as_of_date="2026-07-10", persist=False)
+    assert "amount_changed" not in _types(result)
+    # past grace with no real match -> the safe finding is "confirm whether paid"
+    assert "missing_expected" in _types(result)
+
+
 def test_cash_flow_impact_signs_follow_convention(tmp_path):
     # A missing outflow lowers the (would-be) balance, so its impact is negative.
     conn = _db(tmp_path / "d.sqlite")
