@@ -42,6 +42,20 @@ from difflib import SequenceMatcher
 from typing import Any
 
 
+# Canonical precedence for "which balance_snapshots row is the truth for an
+# account": a manual correction wins over any feed snapshot regardless of
+# timestamp, then newest recorded_at, then newest row id. Every code path that
+# reads the latest balance per account must order by this, or a manual correction
+# silently reverts to the stale feed the next time it syncs. ``{alias}`` is the
+# balance_snapshots alias (or the bare table name when unaliased).
+BALANCE_PRECEDENCE_ORDER_BY = """
+    ORDER BY
+        CASE WHEN {alias}.source = 'manual' THEN 0 ELSE 1 END,
+        {alias}.recorded_at DESC,
+        {alias}.id DESC
+"""
+
+
 # Default stamp: noon UTC on the as-of date. Readable, and after most morning
 # syncs. When a later same-day snapshot already exists we bump past it (see
 # ``_effective_recorded_at``) so the manual correction is never shadowed.

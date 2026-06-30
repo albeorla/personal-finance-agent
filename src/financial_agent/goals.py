@@ -5,6 +5,7 @@ import sqlite3
 from datetime import date, datetime
 from typing import Any
 
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
 # A goal whose deadline is within this many days is flagged ``due_soon`` so the
@@ -303,12 +304,12 @@ def _live_balance(
     if not _has_table(conn, "balance_snapshots"):
         return None
     row = conn.execute(
-        """
+        f"""
         SELECT balance
         FROM balance_snapshots
         WHERE account_id = ?
           AND recorded_at <= ?
-        ORDER BY recorded_at DESC, id DESC
+        {BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
         LIMIT 1
         """,
         (source_account, _as_of_bound(as_of)),

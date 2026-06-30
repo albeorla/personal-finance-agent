@@ -36,6 +36,7 @@ from .config import get_finance_config
 from .follow_ups import list_due_followups
 from .goals import list_goals
 from .guardrails import evaluate_guardrails
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .obligations import list_obligation_review_candidates
 from .onboarding import list_charge_onboarding_queue
 from .reconciliation import list_reconciliation_review_items
@@ -728,7 +729,7 @@ def _snapshot_refresh_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
     if not _has_table(conn, "balance_snapshots") or not _has_table(conn, "accounts"):
         return []
     rows = conn.execute(
-        """
+        f"""
         SELECT a.id AS account_id, a.name AS account_name, a.org,
                bs.recorded_at, bs.source
         FROM balance_snapshots bs
@@ -736,7 +737,7 @@ def _snapshot_refresh_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
         WHERE bs.id = (
             SELECT inner_bs.id FROM balance_snapshots inner_bs
             WHERE inner_bs.account_id = bs.account_id
-            ORDER BY inner_bs.recorded_at DESC, inner_bs.id DESC LIMIT 1
+            {BALANCE_PRECEDENCE_ORDER_BY.format(alias="inner_bs")} LIMIT 1
         )
         """
     ).fetchall()

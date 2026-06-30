@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from statistics import median as _stat_median
 from typing import Any
 
+from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
 
@@ -1057,11 +1058,11 @@ def _account_dormancy(
 
     for account_id in account_ids:
         row = conn.execute(
-            """
+            f"""
             SELECT balance, available, recorded_at
             FROM balance_snapshots
             WHERE account_id = ?
-            ORDER BY recorded_at DESC
+            {BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
             LIMIT 1
             """,
             (account_id,),
