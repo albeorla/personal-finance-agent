@@ -27,6 +27,7 @@ import json
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any, Callable
 
 from .schema import ensure_app_schema, has_app_schema
@@ -47,6 +48,12 @@ SEVERITY_WARN = "warn"
 # rosy (the later cycles are simply absent). Tunable knob.
 COVERAGE_HORIZON_DAYS = 90
 _RECURRING_CADENCES = ("monthly", "weekly", "biweekly", "quarterly", "semimonthly")
+
+# Overlap check gates: two same-kind same-month obligations only pair when their
+# names read alike OR their median amounts are within this fraction of the larger.
+# Same-month same-kind alone flagged unrelated subscriptions (Claude vs Optimum).
+_OVERLAP_NAME_SIMILARITY = 0.6
+_OVERLAP_AMOUNT_PCT = 0.15
 
 
 def run_verification(
@@ -83,6 +90,21 @@ def run_verification(
         checks_run.append(name)
         findings.extend(check(conn, as_of_date))
 
+    # A finding the human already acknowledged (via
+    # acknowledge_verification_findings) is baseline noise, not news: it keeps
+    # its row but stops flipping ok and stops counting as new.
+    ack_keys = {
+        _row_key(r["check_id"], r["evidence_json"])
+        for r in conn.execute(
+            "SELECT check_id, evidence_json FROM verification_findings "
+            "WHERE status = 'acknowledged' AND source = 'deterministic'"
+        ).fetchall()
+    }
+    for finding in findings:
+        finding["acknowledged"] = (
+            _finding_key(finding["check_id"], finding["evidence"]) in ack_keys
+        )
+
     if persist:
         # Reconcile on every persisting run - including a clean run with no
         # findings, which is how a fixed identity gets its stale 'open' row
@@ -90,16 +112,24 @@ def run_verification(
         _reconcile_and_persist(conn, findings, run_id=run_id, as_of_date=as_of_date)
 
     by_severity: dict[str, int] = {}
+    by_check: dict[str, int] = {}
+    new_total = 0
     for finding in findings:
         by_severity[finding["severity"]] = by_severity.get(finding["severity"], 0) + 1
+        by_check[finding["check_id"]] = by_check.get(finding["check_id"], 0) + 1
+        if not finding["acknowledged"]:
+            new_total += 1
 
     return {
         "as_of_date": as_of_date,
-        "ok": len(findings) == 0,
+        "ok": new_total == 0,
         "checks_run": checks_run,
         "checks_total": len(checks_run),
         "findings_total": len(findings),
+        "new_total": new_total,
+        "acknowledged_total": len(findings) - new_total,
         "by_severity": by_severity,
+        "by_check": dict(sorted(by_check.items(), key=lambda kv: -kv[1])),
         "findings": findings,
     }
 
@@ -159,6 +189,47 @@ def list_verification_findings(
         }
         for r in rows
     ]
+
+
+def acknowledge_verification_findings(
+    conn: sqlite3.Connection,
+    *,
+    finding_ids: list[str] | None = None,
+    check_id: str | None = None,
+    source: str = "deterministic",
+) -> dict[str, Any]:
+    """Baseline open findings so later runs report only what is NEW.
+
+    Acknowledged findings keep their row (a still-failing identity is not
+    forgotten) but stop counting toward ``ok`` / ``new_total`` in
+    run_verification and the background sync's verify summary. A later run where
+    the identity no longer fails still flips them to 'resolved'.
+
+    With ``finding_ids`` the listed findings are acknowledged regardless of
+    severity - an explicit, per-id decision. Without ids this is a blanket
+    acknowledge of open findings (optionally narrowed to one ``check_id``) and
+    deliberately SKIPS error-severity findings: an error must be acknowledged by
+    explicit id so it can never be silenced in bulk.
+    """
+
+    ensure_app_schema(conn)
+    where = ["status = 'open'", "source = ?"]
+    params: list[Any] = [source]
+    if finding_ids:
+        where.append(f"id IN ({','.join('?' for _ in finding_ids)})")
+        params.extend(finding_ids)
+    else:
+        where.append("severity != ?")
+        params.append(SEVERITY_ERROR)
+        if check_id is not None:
+            where.append("check_id = ?")
+            params.append(check_id)
+    cur = conn.execute(
+        "UPDATE verification_findings SET status = 'acknowledged' WHERE "
+        + " AND ".join(where),
+        params,
+    )
+    return {"acknowledged": cur.rowcount}
 
 
 # --- checks ----------------------------------------------------------------
@@ -431,9 +502,9 @@ def _check_cross_obligation_overlap(conn: sqlite3.Connection, as_of_date: str) -
     The duplicate-instance check only catches one obligation listed twice. A
     retired-then-replaced bill (an old lease and its replacement) lives as two
     separate rows and double-counts. This surfaces pairs of same-kind active
-    obligations with projectable instances in a shared month at comparable amounts
-    for a human to confirm - WARN, review-only, never auto-deactivates (two
-    genuinely-distinct same-kind bills will false-positive).
+    obligations with projectable instances in a shared month whose names read
+    alike or whose amounts sit within ~15% of each other, for a human to confirm
+    - WARN, review-only, never auto-deactivates.
     """
 
     rows = conn.execute(
@@ -465,7 +536,12 @@ def _check_cross_obligation_overlap(conn: sqlite3.Connection, as_of_date: str) -
             amt_a = sorted(a["amts"])[len(a["amts"]) // 2]  # median
             amt_b = sorted(b["amts"])[len(b["amts"]) // 2]
             larger = max(amt_a, amt_b)
-            if larger == 0 or abs(amt_a - amt_b) > 0.6 * larger:  # not comparable amounts
+            names_alike = (
+                SequenceMatcher(None, a["name"].lower(), b["name"].lower()).ratio()
+                >= _OVERLAP_NAME_SIMILARITY
+            )
+            amounts_alike = larger > 0 and abs(amt_a - amt_b) <= _OVERLAP_AMOUNT_PCT * larger
+            if not (names_alike or amounts_alike):
                 continue
             findings.append(
                 _finding(
@@ -537,9 +613,11 @@ def _reconcile_and_persist(
     existing: dict[str, list[str]] = {}
     for row in conn.execute(
         # Scope to this producer only: the deterministic reconciler must never
-        # resolve an adversarial-review finding (and vice versa).
+        # resolve an adversarial-review finding (and vice versa). Acknowledged
+        # rows count as existing: a still-failing acknowledged finding keeps its
+        # status (no duplicate open row), and a fixed one flips to resolved.
         "SELECT id, check_id, evidence_json FROM verification_findings "
-        "WHERE status = 'open' AND source = 'deterministic'"
+        "WHERE status IN ('open', 'acknowledged') AND source = 'deterministic'"
     ).fetchall():
         existing.setdefault(_row_key(row["check_id"], row["evidence_json"]), []).append(row["id"])
 
@@ -592,7 +670,10 @@ def _empty_summary(as_of_date: str) -> dict[str, Any]:
         "checks_run": [],
         "checks_total": 0,
         "findings_total": 0,
+        "new_total": 0,
+        "acknowledged_total": 0,
         "by_severity": {},
+        "by_check": {},
         "findings": [],
     }
 

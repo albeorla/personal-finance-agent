@@ -284,6 +284,89 @@ def test_cross_obligation_overlap_flags_likely_duplicate(tmp_path):
     assert len(ov2) == 1  # still just the two car leases
 
 
+def test_cross_obligation_overlap_ignores_unrelated_same_kind_bills(tmp_path):
+    # Same kind, same month, but dissimilar names AND amounts more than 15%
+    # apart: unrelated subscriptions (the Claude-vs-Optimum noise), no finding.
+    conn = _clean_db(tmp_path / "ov2.sqlite")
+    for oid, name in [("claude", "Claude subscription"), ("optimum", "Optimum internet")]:
+        conn.execute(
+            "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
+            "VALUES (?,?,'subscription','active','seed','t','t')",
+            (oid, name),
+        )
+    _insert_instance(conn, iid="claude:2026-08-05", obligation_id="claude", due_date="2026-08-05", amount=200.0)
+    _insert_instance(conn, iid="optimum:2026-08-12", obligation_id="optimum", due_date="2026-08-12", amount=120.0)
+    conn.commit()
+
+    assert not [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+                if f["check_id"] == "cross_obligation_overlap"]
+
+
+# --- acknowledge / baseline --------------------------------------------------
+
+
+def test_acknowledged_findings_stop_counting_as_new(tmp_path):
+    from financial_agent.verification import acknowledge_verification_findings
+
+    conn = _clean_db(tmp_path / "ack.sqlite")
+    # Plant a warn finding: two similarly-named same-kind bills in one month.
+    for oid, name in [("oldcar", "Old car lease"), ("newcar", "New car lease")]:
+        conn.execute(
+            "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
+            "VALUES (?,?,'auto','active','seed','t','t')",
+            (oid, name),
+        )
+    _insert_instance(conn, iid="oldcar:2026-08-08", obligation_id="oldcar", due_date="2026-08-08", amount=700.0)
+    _insert_instance(conn, iid="newcar:2026-08-10", obligation_id="newcar", due_date="2026-08-10", amount=600.0)
+    conn.commit()
+
+    first = run_verification(conn, as_of_date="2026-06-20", persist=True)
+    assert first["ok"] is False and first["new_total"] == 1
+
+    assert acknowledge_verification_findings(conn) == {"acknowledged": 1}
+
+    # Still failing, but acknowledged: ok flips true, counts split new vs acked.
+    second = run_verification(conn, as_of_date="2026-06-21", persist=True)
+    assert second["ok"] is True
+    assert second["findings_total"] == 1
+    assert second["new_total"] == 0
+    assert second["acknowledged_total"] == 1
+    assert second["by_check"] == {"cross_obligation_overlap": 1}
+    assert second["findings"][0]["acknowledged"] is True
+    # No duplicate open row was inserted; the acknowledged row survives.
+    assert list_verification_findings(conn, status="open") == []
+    assert len(list_verification_findings(conn, status="acknowledged")) == 1
+
+    # Fixing the underlying overlap still resolves the acknowledged row.
+    conn.execute("DELETE FROM obligation_instances WHERE id = 'oldcar:2026-08-08'")
+    conn.commit()
+    run_verification(conn, as_of_date="2026-06-22", persist=True)
+    assert list_verification_findings(conn, status="acknowledged") == []
+    assert len(list_verification_findings(conn, status="resolved")) == 1
+
+
+def test_blanket_acknowledge_skips_errors_but_explicit_id_works(tmp_path):
+    from financial_agent.verification import acknowledge_verification_findings
+
+    conn = _clean_db(tmp_path / "ackerr.sqlite")
+    _insert_obligation(conn, "card", "Apple Card")
+    _insert_instance(conn, iid="card:a", obligation_id="card", due_date="2026-07-15", amount=100.0)
+    _insert_instance(conn, iid="card:b", obligation_id="card", due_date="2026-07-15", amount=100.0)
+    conn.commit()
+    run_verification(conn, as_of_date="2026-06-20", persist=True)
+
+    # Blanket acknowledge must not silence the error-severity finding.
+    assert acknowledge_verification_findings(conn) == {"acknowledged": 0}
+    open_rows = list_verification_findings(conn, status="open")
+    assert len(open_rows) == 1
+
+    # An explicit id acknowledges it.
+    assert acknowledge_verification_findings(conn, finding_ids=[open_rows[0]["id"]]) == {
+        "acknowledged": 1
+    }
+    assert list_verification_findings(conn, status="open") == []
+
+
 # --- pipeline integration --------------------------------------------------
 
 
@@ -292,9 +375,14 @@ def test_background_sync_runs_verify_between_suppress_and_surface(tmp_path):
     result = run_background_sync(conn, as_of_date="2026-06-30")
 
     verify = result["result_summary"]["verify"]
-    assert set(verify) == {"ok", "checks_total", "findings_total", "by_severity"}
+    assert set(verify) == {
+        "ok", "checks_total", "findings_total", "new_total",
+        "acknowledged_total", "by_severity", "by_check",
+    }
     assert verify["ok"] is True
     assert verify["checks_total"] == 6
+    assert verify["new_total"] == 0
+    assert verify["acknowledged_total"] == 0
 
     events = [e["event_type"] for e in get_background_run(conn, result["run_id"])["events"]]
     assert "verify" in events

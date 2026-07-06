@@ -43,6 +43,7 @@ from .digest import build_daily_digest as build_daily_digest_for_db
 from .digest import render_digest_markdown as render_digest_markdown_for_db
 from .digest import summarize_daily_digest as summarize_daily_digest_for_db
 from .verification import (
+    acknowledge_verification_findings as acknowledge_verification_findings_for_db,
     list_verification_findings as list_verification_findings_for_db,
     run_verification as run_verification_for_db,
 )
@@ -1984,6 +1985,40 @@ def list_verification_findings(
                 conn, status=status, check_id=check_id, source=source, limit=limit
             )
         )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def acknowledge_verification_findings(
+    finding_ids: list[str] | None = None,
+    check_id: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Acknowledge open verification findings so future runs report only NEW ones.
+
+    Acknowledged findings keep their row and stay listable
+    (list_verification_findings status='acknowledged') but stop flipping the
+    verify summary's ok and stop counting as new in run_verification /
+    run_background_sync; when the underlying identity is fixed they still resolve
+    automatically. Pass finding_ids to acknowledge specific findings (any
+    severity, an explicit per-id decision). Without ids this blanket-acknowledges
+    open warn findings (optionally one check_id) and deliberately skips
+    error-severity findings - errors need explicit ids so they cannot be silenced
+    in bulk.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = acknowledge_verification_findings_for_db(
+            conn, finding_ids=finding_ids, check_id=check_id
+        )
+        conn.commit()
+        return result
     finally:
         conn.close()
 

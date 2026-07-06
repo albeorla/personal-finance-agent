@@ -479,11 +479,16 @@ def _surface_due_items_step(
 def _summarize_verification(result: dict[str, Any]) -> dict[str, Any]:
     # Keep the run summary compact: counts only. The full per-finding detail
     # lives in verification_findings, queryable via list_verification_findings.
+    # new vs acknowledged split (plus by_check) is what makes the count readable:
+    # ok reflects only NEW findings, the acknowledged baseline stays visible.
     return {
         "ok": result.get("ok"),
         "checks_total": result.get("checks_total"),
         "findings_total": result.get("findings_total"),
+        "new_total": result.get("new_total"),
+        "acknowledged_total": result.get("acknowledged_total"),
         "by_severity": result.get("by_severity"),
+        "by_check": result.get("by_check"),
     }
 
 
