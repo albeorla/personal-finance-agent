@@ -689,8 +689,14 @@ def test_discretionary_item_round_trips_through_surface_to_todoist_idempotently(
     )
     assert first["created"] == 1
     assert len(spy.creates) == 1
-    # The decide-amount wording is what gets pushed as the task content.
-    assert "decide amount + pay" in spy.creates[0]["body"]["content"]
+    # The task title is a plain action (no date/amount noise); the modeled
+    # minimum and due date live in the description. The [fa:<key>] marker MUST
+    # survive in the description so reconciliation can adopt the task.
+    assert spy.creates[0]["body"]["content"] == "Decide amount + pay Apple Card payment"
+    assert (
+        "[fa:obligation-due:apple_card_minimum_payments:2026-06-30]"
+        in spy.creates[0]["body"]["description"]
+    )
 
     # Re-running with the same items skips: no duplicate create/update.
     items_again = build_surface_items(conn, as_of_date="2026-06-28")
@@ -723,6 +729,14 @@ def test_manual_due_item_round_trips_through_surface_to_todoist_idempotently(tmp
     )
     assert first["created"] == 1
     assert len(spy.creates) == 1
+    # Title is a plain "Pay <name> $<amount>" action; the due date, account, and
+    # manual detail move into the description. The [fa:<key>] marker MUST survive
+    # in the description so reconciliation can adopt the task.
+    assert spy.creates[0]["body"]["content"] == "Pay Rent check $3,000.00"
+    assert (
+        "[fa:obligation-due:rent_check:2026-06-28]"
+        in spy.creates[0]["body"]["description"]
+    )
 
     # Re-running with the same (unchanged) items skips: no duplicate create/update.
     items_again = build_surface_items(conn, as_of_date=AS_OF)

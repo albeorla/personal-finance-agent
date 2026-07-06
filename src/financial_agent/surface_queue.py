@@ -308,6 +308,7 @@ def _manual_obligation_due_surface_items(
     for it in _manual_obligation_due_items(conn, as_of):
         ev = it["evidence"]
         by = it["suggested_todoist_due"]
+        name = it["obligation_name"]
         if ev["amount_discretionary"]:
             # The user decides the amount each time; the modeled figure is a floor.
             action = NextAction(
@@ -318,6 +319,9 @@ def _manual_obligation_due_surface_items(
                 account=account,
                 modeled_min=True,
             )
+            # Title is a plain action; the modeled minimum, due date, and account
+            # live in the description so the Todoist board reads as a task list.
+            content = f"Decide amount + pay {name}"
         else:
             action = NextAction(
                 verb="Pay",
@@ -326,10 +330,11 @@ def _manual_obligation_due_surface_items(
                 direction=ev["direction"],
                 account=account,
             )
+            content = f"Pay {name} ${_money(ev['amount'])}"
         items.append(
             {
                 "surface_key": it["id"],  # obligation-due:<obligation_id>:<due_date>
-                "content": it["message"],
+                "content": content,
                 "description": f"Manual bill (no autopay). {render_next_action(action)}",
                 "due_date": by,
             }
@@ -629,6 +634,7 @@ def _manual_obligation_due_items(conn: sqlite3.Connection, as_of: date) -> list[
                 "id": f"obligation-due:{r['obligation_id']}:{r['due_date']}",
                 "type": "obligation_due",
                 "severity": _manual_due_severity(days_until),
+                "obligation_name": r["obligation_name"],
                 "message": message,
                 "suggested_todoist_due": _manual_due_todoist_due(due),
                 "related_ids": [r["instance_id"], r["obligation_id"]],
