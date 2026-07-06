@@ -304,6 +304,49 @@ def test_advisory_guardrails_excluded(tmp_path):
     assert not [i for i in q["items"] if i.get("evidence", {}).get("rule_type") == "debt_avalanche"]
 
 
+def test_unchanged_drift_warning_snoozes_after_first_emission(tmp_path):
+    """The same drift-threshold warning must not re-alert daily: once persisted
+    and unchanged since an earlier day it is snoozed, until its content changes."""
+
+    from financial_agent.drift import detect_drift
+
+    conn = _db(tmp_path / "t.db")
+    _checking(conn)
+    _fresh_sync(conn)
+    # A missing $3,000 rent past grace pushes total drift over the $200 threshold.
+    _seed_obligation(
+        conn, "rent", "Rent check", "housing",
+        {"id": "rent:2026-06-01", "due_date": "2026-06-01", "amount": -3000.0, "source": "seed"},
+    )
+    conn.commit()
+
+    def drift_items():
+        q = get_surface_queue(conn, as_of_date=AS_OF)
+        return [
+            i for i in q["items"]
+            if i["type"] == "guardrail_warning" and i["evidence"]["rule_type"] == "drift_threshold"
+        ]
+
+    # Not yet persisted (never emitted): surfaces.
+    assert drift_items()
+
+    # Persisted by the day's sync, content changed "today" (real wall clock,
+    # after AS_OF): still surfaces the day it appears.
+    detect_drift(conn, as_of_date=AS_OF, persist=True)
+    assert drift_items()
+
+    # Simulate the next day: the finding last changed BEFORE as_of -> snoozed.
+    conn.execute("UPDATE drift_findings SET updated_at = '2026-06-23T08:00:00+00:00'")
+    conn.commit()
+    assert not drift_items()
+
+    # The underlying amount changes -> persisted impacts no longer match the
+    # live total -> the warning re-surfaces.
+    conn.execute("UPDATE obligation_instances SET amount = -3500.0 WHERE id = 'rent:2026-06-01'")
+    conn.commit()
+    assert drift_items()
+
+
 def test_goal_review_items_surface_behind_goals(tmp_path):
     from financial_agent.goals import set_goal
 

@@ -162,6 +162,7 @@ def find_payment_drift(
             present is not None
             and present["merchant_score"] > 0.0
             and abs(present["date_delta_days"]) <= SAME_CHARGE_DATE_DAYS
+            and _account_consistent(conn, inst["obligation_id"], present.get("txn_account_id"))
         )
 
         if same_charge and expected > 0:
@@ -214,6 +215,31 @@ def find_payment_drift(
                 }
             )
     return findings
+
+
+def _account_consistent(
+    conn: sqlite3.Connection, obligation_id: str, txn_account_id: str | None
+) -> bool:
+    """Same-account gate for amount_changed: the candidate must post to an account
+    this obligation has actually settled from before (confirmed matches). A bill
+    that always clears checking is never "paid at a new amount" by a card charge.
+    No payment history means no constraint (cold start), so the merchant/date
+    gates alone decide.
+    """
+
+    if not txn_account_id:
+        return True
+    rows = conn.execute(
+        """
+        SELECT DISTINCT t.account_id
+        FROM obligation_instances oi
+        JOIN transactions t ON t.id = oi.matched_transaction_id
+        WHERE oi.obligation_id = ? AND oi.matched_transaction_id IS NOT NULL
+        """,
+        (obligation_id,),
+    ).fetchall()
+    known = {r["account_id"] for r in rows if r["account_id"]}
+    return not known or txn_account_id in known
 
 
 def find_stale_estimates(
@@ -340,10 +366,40 @@ def list_drift_findings(
 # --- persistence -----------------------------------------------------------
 
 
+# Evidence keys that tick daily without the finding materially changing (a
+# missing_expected ages by one day every day). Excluded from the change
+# signature so updated_at stays put and the surface queue can snooze an
+# unchanged finding instead of re-alerting daily.
+_VOLATILE_EVIDENCE_KEYS: frozenset[str] = frozenset({"age_days"})
+
+
+def _content_signature(severity: str, cash_flow_impact: Any, evidence: dict[str, Any] | None) -> str:
+    stable = {k: v for k, v in (evidence or {}).items() if k not in _VOLATILE_EVIDENCE_KEYS}
+    return json.dumps([severity, cash_flow_impact, stable], sort_keys=True)
+
+
 def _persist(conn: sqlite3.Connection, findings: list[dict[str, Any]], as_of: date) -> None:
     now = _now()
     live_ids = {f["id"] for f in findings}
+    existing = {
+        r["id"]: r
+        for r in conn.execute(
+            "SELECT id, severity, cash_flow_impact, evidence_json, updated_at "
+            "FROM drift_findings WHERE status = 'active'"
+        ).fetchall()
+    }
     for finding in findings:
+        # updated_at means "when this finding's content last changed", not "last
+        # seen" (as_of_date tracks that). An unchanged re-detect keeps the old
+        # timestamp so downstream surfacing can tell new/changed from repeat.
+        prior = existing.get(finding["id"])
+        updated_at = now
+        if prior is not None:
+            prior_evidence = json.loads(prior["evidence_json"]) if prior["evidence_json"] else None
+            if _content_signature(prior["severity"], prior["cash_flow_impact"], prior_evidence) == _content_signature(
+                finding["severity"], finding["cash_flow_impact"], finding["evidence"]
+            ):
+                updated_at = prior["updated_at"]
         conn.execute(
             """
             INSERT INTO drift_findings (
@@ -373,7 +429,7 @@ def _persist(conn: sqlite3.Connection, findings: list[dict[str, Any]], as_of: da
                 json.dumps(finding["related_transaction_ids"], sort_keys=True),
                 finding["cash_flow_impact"], finding["confidence"],
                 json.dumps(finding["evidence"], sort_keys=True), finding["recommended_action"],
-                as_of.isoformat(), now, now,
+                as_of.isoformat(), now, updated_at,
             ),
         )
     # Resolve findings that no longer appear.

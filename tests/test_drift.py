@@ -108,6 +108,62 @@ def test_unrelated_charge_on_nearby_date_is_not_amount_changed(tmp_path):
     assert "missing_expected" in _types(result)
 
 
+def test_cross_account_charge_with_merchant_overlap_is_not_amount_changed(tmp_path):
+    # Same-account gate: an obligation that has always settled from checking
+    # (confirmed match history) must not be re-priced by a merchant-similar
+    # charge that posted to a card account.
+    conn = _db(
+        tmp_path / "d.sqlite",
+        transactions=[
+            ("t-old", "ACT-chk", "2026-05-26T08:00:00", -115.87, "Eversource Energy", "EVERSOURCE"),
+            ("t-card", "ACT-card", "2026-06-26T08:00:00", -150.00, "Eversource Energy", "EVERSOURCE"),
+        ],
+    )
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-card','Apple Card','Apple','','USD')")
+    _ob(conn, "eversource", "Eversource electric estimates", "utility",
+        [
+            {"id": "eversource:2026-05-25", "due_date": "2026-05-25", "amount": -115.87, "status": "paid", "source": "seed"},
+            {"id": "eversource:2026-06-25", "due_date": "2026-06-25", "amount": -115.87, "source": "seed"},
+        ])
+    conn.execute(
+        "UPDATE obligation_instances SET matched_transaction_id='t-old' WHERE id='eversource:2026-05-25'"
+    )
+    conn.commit()
+
+    result = detect_drift(conn, as_of_date="2026-07-10", persist=False)
+    assert "amount_changed" not in _types(result)
+    assert "missing_expected" in _types(result)
+
+    # Same charge on the KNOWN account still flags an amount change.
+    conn.execute("UPDATE transactions SET account_id='ACT-chk' WHERE id='t-card'")
+    conn.commit()
+    result = detect_drift(conn, as_of_date="2026-07-10", persist=False)
+    assert "amount_changed" in _types(result)
+
+
+def test_persist_updated_at_bumps_only_on_content_change(tmp_path):
+    # updated_at means "content last changed": a daily unchanged re-detect must
+    # not bump it (age_days ticking is volatile), while a real amount change must.
+    conn = _db(tmp_path / "d.sqlite")
+    _ob(conn, "rent", "Rent check", "housing",
+        [{"id": "rent:2026-06-01", "due_date": "2026-06-01", "amount": -3000.0, "source": "seed"}])
+
+    def updated_at():
+        return conn.execute(
+            "SELECT updated_at FROM drift_findings WHERE finding_type='missing_expected'"
+        ).fetchone()[0]
+
+    detect_drift(conn, as_of_date="2026-06-20", persist=True)
+    first = updated_at()
+    detect_drift(conn, as_of_date="2026-06-21", persist=True)  # unchanged, one day older
+    assert updated_at() == first
+
+    conn.execute("UPDATE obligation_instances SET amount=-3200.0 WHERE id='rent:2026-06-01'")
+    conn.commit()
+    detect_drift(conn, as_of_date="2026-06-21", persist=True)
+    assert updated_at() != first
+
+
 def test_cash_flow_impact_signs_follow_convention(tmp_path):
     # A missing outflow lowers the (would-be) balance, so its impact is negative.
     conn = _db(tmp_path / "d.sqlite")

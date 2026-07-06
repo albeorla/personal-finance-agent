@@ -118,23 +118,42 @@ def reconcile_obligation_instances(
     return summary
 
 
-def confirm_reconciliation_match(conn: sqlite3.Connection, instance_id: str) -> dict[str, Any]:
+def confirm_reconciliation_match(
+    conn: sqlite3.Connection, instance_id: str, transaction_id: str | None = None
+) -> dict[str, Any]:
     """Mark a reviewed obligation instance paid, using its recorded match.
 
     Guarded: there must be a recorded transaction match (run reconcile first);
     marking paid is never automatic. Records the matched transaction as evidence.
+
+    ``transaction_id`` force-matches that specific transaction to the instance
+    (recorded in the match ledger as a user-asserted ``manual`` match, then
+    confirmed like any other). Use it when the scorer's tolerance rejected the
+    real payment.
     """
 
     ensure_app_schema(conn)
-    inst = conn.execute("SELECT id, status FROM obligation_instances WHERE id = ?", (instance_id,)).fetchone()
+    inst = conn.execute(
+        """
+        SELECT oi.id, oi.status, oi.due_date, oi.amount, oi.direction,
+               o.name AS obligation_name
+        FROM obligation_instances oi
+        JOIN obligations o ON o.id = oi.obligation_id
+        WHERE oi.id = ?
+        """,
+        (instance_id,),
+    ).fetchone()
     if inst is None:
         raise ValueError(f"unknown obligation instance: {instance_id}")
+    if transaction_id is not None:
+        _record_forced_match(conn, inst, transaction_id)
+        _clear_unmatched(conn, instance_id)
     match = conn.execute(
         "SELECT transaction_id, match_score FROM transaction_obligation_matches WHERE obligation_instance_id = ?",
         (instance_id,),
     ).fetchone()
     if match is None:
-        raise ValueError(f"no recorded transaction match for {instance_id}; run reconcile first")
+        raise ValueError(_no_match_reason(conn, dict(inst)))
     now = _now()
     conn.execute(
         """
@@ -146,6 +165,75 @@ def confirm_reconciliation_match(conn: sqlite3.Connection, instance_id: str) -> 
     )
     return {"instance_id": instance_id, "status": "paid",
             "matched_transaction_id": match["transaction_id"], "match_confidence": round(float(match["match_score"]), 3)}
+
+
+def _record_forced_match(conn: sqlite3.Connection, inst: sqlite3.Row, transaction_id: str) -> None:
+    """Record a user-asserted match for a specific transaction (match_type 'manual')."""
+
+    if not _has_transactions_table(conn):
+        raise ValueError(f"unknown transaction: {transaction_id} (no transactions table)")
+    txn = conn.execute(
+        "SELECT id, posted, transacted_at, amount, payee, description FROM transactions WHERE id = ?",
+        (transaction_id,),
+    ).fetchone()
+    if txn is None:
+        raise ValueError(f"unknown transaction: {transaction_id}")
+    due = _coerce_date(inst["due_date"])
+    posted = (txn["posted"] or txn["transacted_at"] or "")[:10]
+    txn_amount = float(txn["amount"])
+    expected = abs(float(inst["amount"]))
+    best = {
+        "transaction_id": txn["id"],
+        "match_type": "manual",
+        # User assertion is ground truth; confidence is by definition full.
+        "match_score": 1.0,
+        "amount_score": 1.0,
+        "date_score": 1.0,
+        "merchant_score": _merchant_score(
+            _tokens(inst["obligation_name"] or ""),
+            _tokens(f"{txn['payee'] or ''} {txn['description'] or ''}"),
+        ),
+        "amount_delta": round(abs(abs(txn_amount) - expected), 2),
+        "date_delta_days": (date.fromisoformat(posted) - due).days if posted else 0,
+        "txn_amount": round(txn_amount, 2),
+        "txn_payee": txn["payee"],
+        "txn_date": posted or None,
+    }
+    _record_match(conn, inst, best, date.fromisoformat(posted) if posted else due, _now())
+
+
+def _no_match_reason(conn: sqlite3.Connection, inst: dict[str, Any]) -> str:
+    """Explain WHY there is no recorded match: no candidates vs amount tolerance."""
+
+    base = f"no recorded transaction match for {inst['id']}"
+    window = int(DEFAULT_OPTIONS["date_window_days"])
+    # Re-scan the date window with amount tolerance disabled so near-miss
+    # transactions (right merchant/date, wrong amount) become visible.
+    candidates = _scored_candidates(
+        conn, inst, {**DEFAULT_OPTIONS, "amount_abs_tolerance": float("inf")}
+    )
+    if not candidates:
+        return (
+            f"{base}: no {inst['direction']} transactions within {window} days of due date "
+            f"{inst['due_date']}. Run reconcile after the transaction posts, or pass "
+            f"transaction_id to force-match."
+        )
+    expected = abs(float(inst["amount"]))
+    tol = max(
+        float(DEFAULT_OPTIONS["amount_abs_tolerance"]),
+        expected * float(DEFAULT_OPTIONS["amount_pct_tolerance"]),
+    )
+    nearest = sorted(candidates, key=lambda c: c["amount_delta"])[:3]
+    listed = "; ".join(
+        f"{c['transaction_id']} ({c['txn_payee'] or 'no payee'}, {c['txn_date']}, "
+        f"${abs(c['txn_amount']):,.2f}, delta ${c['amount_delta']:,.2f})"
+        for c in nearest
+    )
+    return (
+        f"{base}: {len(candidates)} candidate {inst['direction']} txn(s) within {window} days "
+        f"of {inst['due_date']}, but none within the ${tol:,.2f} amount tolerance of "
+        f"${expected:,.2f}. Nearest: {listed}. Pass transaction_id to force-match the right one."
+    )
 
 
 def unconfirm_reconciliation_match(conn: sqlite3.Connection, instance_id: str) -> dict[str, Any]:
@@ -399,6 +487,7 @@ def _scored_candidates(
                 "txn_amount": round(txn_amount, 2),
                 "txn_payee": txn["payee"],
                 "txn_date": posted,
+                "txn_account_id": txn["account_id"],
             }
         )
 

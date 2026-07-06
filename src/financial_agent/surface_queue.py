@@ -803,6 +803,10 @@ def _guardrail_items(
             # The day's sync failed: balances are stale, so a cash-floor / drift
             # trip built on them would be a false alarm. Drop it for this run.
             continue
+        if f["rule_type"] == "drift_threshold" and _drift_warning_snoozed(conn, f, as_of):
+            # Already surfaced on an earlier day and unchanged since: snoozed
+            # until its underlying drift findings change (no daily re-alert).
+            continue
         severity = f["severity"]
         # High/critical guardrail trips need attention today; lower ones can wait.
         due = "today" if _SEVERITY_RANK.get(severity, 0) >= 3 else "3 days"
@@ -825,6 +829,43 @@ def _guardrail_items(
             }
         )
     return items
+
+
+def _drift_warning_snoozed(conn: sqlite3.Connection, finding: dict[str, Any], as_of: date) -> bool:
+    """Whether the drift-threshold warning is an unchanged repeat of a prior day.
+
+    The same "Total drift impact $X exceeds ..." message re-alerted every day
+    while the underlying findings sat unchanged. The persisted drift_findings
+    ledger bumps ``updated_at`` only when a finding's content materially changes
+    (see drift._persist), so: if every contributing finding is persisted, active,
+    unchanged since before ``as_of``, and the persisted impacts still sum to the
+    warning's total, the warning already surfaced once and is snoozed. Any new,
+    changed, or not-yet-persisted contributor re-surfaces it. Read-only.
+    """
+
+    evidence = finding.get("evidence") or {}
+    contributing = evidence.get("contributing") or []
+    if not contributing:
+        return False
+    placeholders = ",".join("?" for _ in contributing)
+    rows = conn.execute(
+        f"SELECT id, status, updated_at, cash_flow_impact FROM drift_findings WHERE id IN ({placeholders})",
+        contributing,
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    for fid in contributing:
+        row = by_id.get(fid)
+        if row is None or row["status"] != "active":
+            return False  # never persisted (never emitted) or was resolved: surface it
+        changed_on = _date_part(row["updated_at"])
+        if changed_on is None or changed_on >= as_of:
+            return False  # new or changed today: surface it
+    # Guard against a stale ledger: if the live total no longer matches the
+    # persisted impacts, the content changed and must surface.
+    persisted_total = round(
+        sum(abs(float(by_id[fid]["cash_flow_impact"] or 0.0)) for fid in contributing), 2
+    )
+    return persisted_total == evidence.get("total_drift_impact")
 
 
 # --- next-action contract --------------------------------------------------

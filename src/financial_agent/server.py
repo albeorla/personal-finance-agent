@@ -2323,10 +2323,17 @@ def list_reconciliation_review_items(as_of_date: str | None = None, db_path: str
 
 
 @mcp.tool()
-def confirm_reconciliation_match(instance_id: str, db_path: str | None = None) -> dict:
+def confirm_reconciliation_match(
+    instance_id: str, transaction_id: str | None = None, db_path: str | None = None
+) -> dict:
     """Mark a reviewed obligation instance paid using its recorded transaction
     match. Guarded: requires a recorded match (run reconcile first); never
     auto-pays. Reversible with unconfirm_reconciliation_match.
+
+    When there is no recorded match the error explains why (no candidate
+    transactions in the date window vs amount outside tolerance, with the
+    nearest candidates listed). Pass transaction_id to force-match a specific
+    transaction to the instance; it is recorded as a normal confirmed match.
     """
 
     import sqlite3
@@ -2335,7 +2342,7 @@ def confirm_reconciliation_match(instance_id: str, db_path: str | None = None) -
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
-        result = confirm_reconciliation_match_for_db(conn, instance_id)
+        result = confirm_reconciliation_match_for_db(conn, instance_id, transaction_id)
         conn.commit()
         return result
     finally:

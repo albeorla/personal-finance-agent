@@ -82,6 +82,66 @@ def test_unconfirm_reverts_to_expected(tmp_path):
     assert row["matched_transaction_id"] is None and row["match_confidence"] is None
 
 
+def _add_transactions(conn, rows):
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT,
+            amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO transactions (id,account_id,posted,amount,payee,description,pending,source) "
+        "VALUES (?,?,?,?,?,?,0,'simplefin')",
+        rows,
+    )
+    conn.commit()
+
+
+def test_confirm_error_explains_no_candidates_in_window(tmp_path):
+    conn = _db(tmp_path / "r.sqlite", with_match=False)
+    with pytest.raises(ValueError, match="no outflow transactions within"):
+        confirm_reconciliation_match(conn, _INSTANCE)
+
+
+def test_confirm_error_lists_nearest_out_of_tolerance_candidates(tmp_path):
+    conn = _db(tmp_path / "r.sqlite", with_match=False)
+    # Right merchant, right date, but $167 vs the expected $28.62: outside
+    # tolerance, so no match was recorded. The error must say so and name it.
+    _add_transactions(conn, [("TRN-near", "chk", "2026-06-23T09:00:00", -167.00, "NYTimes", "NYT SUBSCRIPTION")])
+    with pytest.raises(ValueError) as exc:
+        confirm_reconciliation_match(conn, _INSTANCE)
+    message = str(exc.value)
+    assert "amount tolerance" in message
+    assert "TRN-near" in message
+    assert "transaction_id" in message  # points at the force-match escape hatch
+
+
+def test_confirm_force_match_with_transaction_id(tmp_path):
+    conn = _db(tmp_path / "r.sqlite", with_match=False)
+    _add_transactions(conn, [("TRN-near", "chk", "2026-06-23T09:00:00", -167.00, "NYTimes", "NYT SUBSCRIPTION")])
+    result = confirm_reconciliation_match(conn, _INSTANCE, transaction_id="TRN-near")
+    assert result["status"] == "paid"
+    assert result["matched_transaction_id"] == "TRN-near"
+    row = _status(conn)
+    assert row["status"] == "paid" and row["matched_transaction_id"] == "TRN-near"
+    match = conn.execute(
+        "SELECT transaction_id, match_type FROM transaction_obligation_matches WHERE obligation_instance_id = ?",
+        (_INSTANCE,),
+    ).fetchone()
+    assert match["transaction_id"] == "TRN-near"
+    assert match["match_type"] == "manual"
+
+
+def test_confirm_force_match_unknown_transaction_raises(tmp_path):
+    conn = _db(tmp_path / "r.sqlite", with_match=False)
+    _add_transactions(conn, [])
+    with pytest.raises(ValueError, match="unknown transaction"):
+        confirm_reconciliation_match(conn, _INSTANCE, transaction_id="TRN-nope")
+    assert _status(conn)["status"] == "expected"
+
+
 def test_list_review_items_surfaces_then_clears_after_confirm(tmp_path):
     conn = _db(tmp_path / "r.sqlite")
     items = list_reconciliation_review_items(conn, as_of_date="2026-06-30")
