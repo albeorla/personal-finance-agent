@@ -153,6 +153,27 @@ def test_normalize_merchant_key_is_deterministic_slug():
     assert normalize_merchant_key("New York Times") == "new_york_times"
     assert normalize_merchant_key("Eversource Energy") == "eversource_energy"
     assert normalize_merchant_key("  AT&T  Wireless ") == "at_t_wireless"
+    # Case variants of the same payee must collapse to one key (one candidate).
+    assert normalize_merchant_key("PORT CHESTER BEER") == normalize_merchant_key("Port Chester Beer")
+    assert normalize_merchant_key("Port Chester Beer") == "port_chester_beer"
+
+
+def test_cadence_needs_three_consistent_intervals():
+    from financial_agent.onboarding import _cadence_label
+
+    # One consecutive-day interval (two Exxon fills) must not become "weekly".
+    assert _cadence_label(1.0, [1]) == "unknown"
+    # Two intervals is still not enough for a schedulable cadence.
+    assert _cadence_label(30.0, [29, 31]) == "unknown"
+    # Three agreeing intervals earn the label.
+    assert _cadence_label(30.0, [29, 31, 30]) == "monthly"
+    assert _cadence_label(7.0, [7, 7, 7]) == "weekly"
+    # A median that lands in a bucket only 2 of 4 intervals agree with stays unproposed.
+    assert _cadence_label(18.0, [2, 18, 18, 60]) == "unknown"
+    # Non-schedulable buckets are untouched (Gault's lumpy multiweek shape).
+    assert _cadence_label(43.5, [39, 48]) == "irregular_multiweek"
+    # Backward-compat: no intervals passed keeps the raw bucket.
+    assert _cadence_label(30.0) == "monthly"
 
 
 def test_account_class_infers_from_name_and_org_when_kind_empty():
@@ -253,6 +274,46 @@ def test_scan_creates_nyt_fixed_subscription_candidate(tmp_path):
     assert amount_policy["method"] == "fixed"
     assert amount_policy["amount"] == 30.30
     assert nyt["proposed_schedule_policy"]["cadence"] == "monthly"
+
+
+def test_scan_never_proposes_weekly_from_two_consecutive_charges(tmp_path):
+    # Two Exxon fills a day apart used to detect as a "weekly" candidate.
+    exxon_rows = [
+        ("exxon-1", "ACT-chk", "2026-06-01T08:00:00", -62.00, "Exxon", "EXXONMOBIL PORT CHESTER"),
+        ("exxon-2", "ACT-chk", "2026-06-02T08:00:00", -58.00, "Exxon", "EXXONMOBIL PORT CHESTER"),
+    ]
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[CHECKING], transactions=exxon_rows)
+
+    scan_charge_onboarding_candidates(conn)
+
+    exxon = _find(list_charge_onboarding_queue(conn), "exxon")
+    assert exxon is not None
+    # One observed interval is not a schedule: no cadence, low confidence.
+    assert exxon["proposed_schedule_policy"]["cadence"] == "unknown"
+    assert exxon["confidence"] == "low"
+
+
+def test_scan_parks_card_spend_absorbed_by_modeled_statement(tmp_path):
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[AMEX], transactions=GAULT_AMEX_ROWS)
+    # Model the Amex statement payment the card spend already rolls into.
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "amex_statement_payment",
+            "name": "Amex statement payment",
+            "kind": "credit_card_statement",
+            "status": "active",
+            "source": "seed",
+        },
+        instances=[],
+    )
+
+    scan_charge_onboarding_candidates(conn)
+
+    gault = _find(list_charge_onboarding_queue(conn), "gault_energy")
+    policy = gault["proposed_review_policy"]
+    assert policy["auto_disposition"] == DISPOSITION_PARK
+    assert any("absorbed" in reason for reason in policy["disposition_reasons"])
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +946,8 @@ def test_apply_through_date_is_exclusive_so_preview_matches_projection(tmp_path)
 
 def test_apply_inflow_projects_as_income(tmp_path):
     rows = [
+        # Four occurrences: a monthly cadence needs 3+ consistent intervals.
+        ("rein-0", "ACT-chk", "2026-03-17T08:00:00", 196.02, "Anthem", "REMOTE ONLINE DEPOSIT"),
         ("rein-1", "ACT-chk", "2026-04-17T08:00:00", 196.02, "Anthem", "REMOTE ONLINE DEPOSIT"),
         ("rein-2", "ACT-chk", "2026-05-17T08:00:00", 196.02, "Anthem", "REMOTE ONLINE DEPOSIT"),
         ("rein-3", "ACT-chk", "2026-06-17T08:00:00", 196.02, "Anthem", "REMOTE ONLINE DEPOSIT"),
@@ -1001,6 +1064,18 @@ def test_classify_internal_transfer_parks():
 def test_classify_review_only_parks():
     candidate = _disposition_candidate(candidate_type="review_only", confidence="low")
     assert classify_candidate_disposition(candidate)["disposition"] == DISPOSITION_PARK
+
+
+def test_classify_statement_absorbed_card_spend_parks():
+    candidate = _disposition_candidate(
+        candidate_type="card_statement_input", cash_flow_treatment="card_statement_input"
+    )
+    # Without an already-modeled statement payment the card spend surfaces...
+    assert classify_candidate_disposition(candidate)["disposition"] == DISPOSITION_SURFACE
+    # ...but once the statement obligation carries this cash flow, it parks.
+    result = classify_candidate_disposition(candidate, statement_absorbed=True)
+    assert result["disposition"] == DISPOSITION_PARK
+    assert any("absorbed" in reason for reason in result["reasons"])
 
 
 # --- pure classifier: the three safety backstops ---------------------------

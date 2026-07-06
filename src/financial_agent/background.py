@@ -39,10 +39,11 @@ DEFAULT_RUN_TYPE = "daily_sync"
 
 # A daily job that has not completed within this many hours is treated as stale
 # (the scheduler probably stopped). 26h = the 24h cadence plus a 2h grace for an
-# overnight run that slips. A completed run (succeeded OR partial_success) counts
-# as a heartbeat: partial_success still ingested and saw the data.
+# overnight run that slips. A completed run (succeeded, succeeded_with_warnings,
+# OR partial_success) counts as a heartbeat: all of them ingested and saw the
+# data. succeeded_with_warnings still surfaces the warning via last_run_status.
 STALE_JOB_THRESHOLD_HOURS = 26
-_HEALTHY_RUN_STATUSES = ("succeeded", "partial_success")
+_HEALTHY_RUN_STATUSES = ("succeeded", "succeeded_with_warnings", "partial_success")
 
 
 def run_background_sync(
@@ -157,11 +158,18 @@ def run_background_sync(
 
     summary: dict[str, Any] = {}
     errors = 0
+    warned = 0
     for name, fn in steps:
         try:
             result = fn()
             summary[name] = result
-            _emit(conn, run_id, name, "ok", result)
+            # A step that completed but recorded feed problems (e.g. per-connection
+            # sync errors) is not a clean ok: mark it so job health surfaces it.
+            if result.get("error") or result.get("warnings"):
+                warned += 1
+                _emit(conn, run_id, name, "succeeded_with_warnings", result)
+            else:
+                _emit(conn, run_id, name, "ok", result)
         except Exception as exc:  # noqa: BLE001 - one bad step must not abort the run
             errors += 1
             summary[name] = {"error": str(exc)}
@@ -169,7 +177,12 @@ def run_background_sync(
 
     finished = _now_dt()
     duration_ms = int((finished - started).total_seconds() * 1000)
-    status = "succeeded" if errors == 0 else "partial_success"
+    if errors:
+        status = "partial_success"
+    elif warned:
+        status = "succeeded_with_warnings"
+    else:
+        status = "succeeded"
     _emit(conn, run_id, "run_finished", status, {"errors": errors, "duration_ms": duration_ms})
     conn.execute(
         """
@@ -411,7 +424,13 @@ def _sync_simplefin_step(conn: sqlite3.Connection, opts: dict[str, Any]) -> dict
     if not get_finance_config(env_path=opts.get("env_path"))["has_simplefin"]:
         return {"skipped": "no SIMPLEFIN_ACCESS_URL configured"}
     r = sync_simplefin(conn, env_path=opts.get("env_path"), incremental=True)
-    return {k: r[k] for k in ("accounts", "inserted", "updated", "error") if k in r}
+    out = {k: r[k] for k in ("accounts", "inserted", "updated", "error") if k in r}
+    # warnings = actionable feed problems (promote the step out of clean ok);
+    # notes = expected balance-only connections (informational only).
+    for key in ("warnings", "notes"):
+        if r.get(key):
+            out[key] = r[key]
+    return out
 
 
 def _summarize_scan(result: dict[str, Any]) -> dict[str, Any]:

@@ -83,6 +83,7 @@ from .statements import (
     aggregate_statement_inputs as aggregate_statement_inputs_for_db,
     list_statement_cycles as list_statement_cycles_for_db,
     recompute_statement_estimates as recompute_statement_estimates_for_db,
+    set_statement_actual as set_statement_actual_for_db,
 )
 from .todoist_outbox import (
     complete_todoist_task as complete_todoist_task_impl,
@@ -1308,6 +1309,46 @@ def recompute_statement_estimates(
 
 
 @mcp.tool()
+def set_statement_actual(
+    obligation_id: str,
+    amount: float,
+    cycle_close_date: str | None = None,
+    due_date: str | None = None,
+    source: str = "portal_statement_amount",
+    note: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Record an observed statement balance on the matching statement instance.
+
+    The direct-entry path for a portal-read statement amount (e.g. the monthly
+    Apple Card balance, which has no transaction feed). Pick the instance by
+    cycle_close_date (YYYY-MM-DD statement close) or due_date; the amount is
+    written as confirmed with provenance and is never overwritten by the rollup
+    estimator. Errors list the known cycles when nothing matches.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = set_statement_actual_for_db(
+            conn,
+            obligation_id=obligation_id,
+            amount=amount,
+            cycle_close_date=cycle_close_date,
+            due_date=due_date,
+            source=source,
+            note=note,
+        )
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def reconcile_obligation_instances(
     as_of_date: str | None = None,
     options: dict | None = None,
@@ -2262,7 +2303,7 @@ def apply_guardrail_rules(db_path: str | None = None) -> dict:
 def sync_simplefin(
     start_date: str | None = None,
     end_date: str | None = None,
-    lookback_days: int = 90,
+    lookback_days: int = 45,
     incremental: bool = False,
     db_path: str | None = None,
 ) -> dict:
@@ -2271,8 +2312,10 @@ def sync_simplefin(
     Reads SIMPLEFIN_ACCESS_URL from the finances .env at runtime (never returned).
     Read-only against SimpleFIN; idempotent upsert by transaction id. When
     start_date is omitted, incremental=true resumes from the last synced
-    transactions (cheap for a daily run); otherwise it pulls lookback_days
-    (SimpleFIN caps the window at 90 days). Returns counts and any warnings.
+    transactions (cheap for a daily run); otherwise it pulls lookback_days,
+    capped at SimpleFIN's recommended 45-day window (pass an explicit start_date
+    for a deliberate backfill). Returns counts plus 'warnings' (actionable feed
+    problems) and 'notes' (expected balance-only connections like Apple Card).
     """
 
     import sqlite3

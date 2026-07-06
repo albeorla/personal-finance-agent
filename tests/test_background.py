@@ -227,6 +227,47 @@ def test_sync_steps_run_when_enabled_and_configured(tmp_path, monkeypatch):
     assert [e["event_type"] for e in run["events"]] == _EXPECTED_WITH_SYNC
 
 
+def test_sync_warnings_promote_run_to_succeeded_with_warnings(tmp_path, monkeypatch):
+    """A completed sync that recorded feed problems must not report a clean ok,
+    so get_job_health surfaces the warning state instead of hiding it."""
+    conn = _db(tmp_path / "b.sqlite")
+    monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": True})
+    monkeypatch.setattr(
+        background, "sync_simplefin",
+        lambda *a, **k: {"accounts": 9, "inserted": 0, "updated": 0, "error": "Chase timeout",
+                         "warnings": ["Chase timeout"], "notes": []},
+    )
+
+    result = run_background_sync(conn, as_of_date="2026-06-30", options={"sync": True})
+    assert result["status"] == "succeeded_with_warnings"
+    assert result["result_summary"]["sync_simplefin"]["warnings"] == ["Chase timeout"]
+    run = get_background_run(conn, result["run_id"])
+    sync_event = next(e for e in run["events"] if e["event_type"] == "sync_simplefin")
+    assert sync_event["status"] == "succeeded_with_warnings"
+
+    # Still a heartbeat (the run completed and ingested), but the status shows
+    # the feed problem instead of a clean "succeeded".
+    health = get_job_health(conn, as_of_date="2026-06-30")
+    assert health["healthy"] is True
+    assert health["last_run_status"] == "succeeded_with_warnings"
+
+
+def test_sync_expected_notes_do_not_warn(tmp_path, monkeypatch):
+    """The permanent Apple Card balance-only note is informational: it must not
+    flip the run out of a clean succeeded status."""
+    conn = _db(tmp_path / "b.sqlite")
+    monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": True})
+    monkeypatch.setattr(
+        background, "sync_simplefin",
+        lambda *a, **k: {"accounts": 9, "inserted": 0, "updated": 0, "error": None, "warnings": [],
+                         "notes": ["Apple Card ... (expected: balance-only connection, no transaction feed)"]},
+    )
+
+    result = run_background_sync(conn, as_of_date="2026-06-30", options={"sync": True})
+    assert result["status"] == "succeeded"
+    assert "notes" in result["result_summary"]["sync_simplefin"]
+
+
 def test_sync_steps_skipped_when_not_configured(tmp_path, monkeypatch):
     conn = _db(tmp_path / "b.sqlite")
     monkeypatch.setattr(background, "get_finance_config", lambda **k: {"has_simplefin": False})

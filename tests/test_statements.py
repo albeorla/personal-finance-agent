@@ -9,11 +9,14 @@ import sqlite3
 
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
+import pytest
+
 from financial_agent.statements import (
     _min_confidence,
     aggregate_statement_inputs,
     list_statement_cycles,
     recompute_statement_estimates,
+    set_statement_actual,
 )
 
 
@@ -175,3 +178,62 @@ def test_recompute_with_zero_baseline_warns(tmp_path):
         "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
     ).fetchone()
     assert august["amount"] == 600.0  # only the modeled card input
+
+
+# --- set_statement_actual: the portal-reading direct-entry path -------------
+
+
+def test_set_statement_actual_confirms_the_matching_instance(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+
+    result = set_statement_actual(
+        conn,
+        obligation_id="amex_statement_payment",
+        cycle_close_date="2026-07-21",
+        amount=5203.48,
+        source="portal_statement_amount",
+    )
+    assert result["instance_id"] == "amex_statement_payment:2026-08-16"
+    assert result["previous_amount"] == 6000.0
+    assert result["amount"] == 5203.48
+
+    row = conn.execute(
+        "SELECT amount, amount_status, amount_source, amount_observed_at FROM obligation_instances "
+        "WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    assert row["amount"] == 5203.48
+    assert row["amount_status"] == "confirmed"
+    assert row["amount_source"] == "portal_statement_amount"
+    assert row["amount_observed_at"] is not None
+
+    # The rollup estimator must never overwrite the observed amount.
+    recompute = recompute_statement_estimates(
+        conn, target_obligation_id="amex_statement_payment", baseline=2000.0
+    )
+    assert recompute["updated"] == 0
+    after = conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    assert after["amount"] == 5203.48
+
+
+def test_set_statement_actual_selects_by_due_date_too(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+    result = set_statement_actual(
+        conn, obligation_id="amex_statement_payment", due_date="2026-07-16", amount=5400.0
+    )
+    assert result["instance_id"] == "amex_statement_payment:2026-07-16"
+
+
+def test_set_statement_actual_requires_a_selector_and_lists_known_cycles(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+    with pytest.raises(ValueError, match="cycle_close_date or due_date"):
+        set_statement_actual(conn, obligation_id="amex_statement_payment", amount=100.0)
+    # A miss names the known cycles so the retry does not need a list dump.
+    with pytest.raises(ValueError, match="known cycles.*2026-06-21.*2026-07-21"):
+        set_statement_actual(
+            conn, obligation_id="amex_statement_payment", cycle_close_date="2026-05-21", amount=100.0
+        )

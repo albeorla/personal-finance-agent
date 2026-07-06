@@ -276,6 +276,97 @@ def recompute_statement_estimates(
     }
 
 
+def set_statement_actual(
+    conn: sqlite3.Connection,
+    *,
+    obligation_id: str,
+    amount: float,
+    cycle_close_date: str | None = None,
+    due_date: str | None = None,
+    source: str = "portal_statement_amount",
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Record an observed statement balance directly on the matching statement instance.
+
+    The direct-entry path for the monthly portal-reading ritual (Apple Card is
+    balance-only forever, so its statement amount arrives by human observation).
+    Selects the statement instance by ``cycle_close_date`` or ``due_date``,
+    writes the observed amount with ``amount_status='confirmed'`` plus
+    provenance, and the rollup estimator will never overwrite it (confirmed
+    amounts are protected).
+    """
+
+    ensure_app_schema(conn)
+    if not cycle_close_date and not due_date:
+        raise ValueError("pass cycle_close_date or due_date to pick the statement instance")
+
+    where = ["obligation_id = ?", "statement_close_date IS NOT NULL"]
+    params: list[Any] = [obligation_id]
+    if cycle_close_date:
+        where.append("statement_close_date = ?")
+        params.append(str(cycle_close_date)[:10])
+    if due_date:
+        where.append("due_date = ?")
+        params.append(str(due_date)[:10])
+    rows = conn.execute(
+        f"""
+        SELECT id, due_date, statement_close_date, amount
+        FROM obligation_instances
+        WHERE {" AND ".join(where)}
+        ORDER BY due_date, id
+        """,
+        params,
+    ).fetchall()
+    if not rows:
+        known = conn.execute(
+            "SELECT due_date, statement_close_date FROM obligation_instances "
+            "WHERE obligation_id = ? AND statement_close_date IS NOT NULL ORDER BY due_date",
+            (obligation_id,),
+        ).fetchall()
+        cycles = (
+            "; ".join(f"close {r['statement_close_date']} due {r['due_date']}" for r in known)
+            or "none"
+        )
+        raise ValueError(
+            f"no statement instance for {obligation_id} matching "
+            f"cycle_close_date={cycle_close_date!r} due_date={due_date!r}; known cycles: {cycles}"
+        )
+    if len(rows) > 1:
+        raise ValueError(
+            f"ambiguous match for {obligation_id}: {[r['id'] for r in rows]}; "
+            "pass both cycle_close_date and due_date"
+        )
+
+    inst = rows[0]
+    now = _now()
+    new_amount = round(abs(float(amount)), 2)
+    conn.execute(
+        """
+        UPDATE obligation_instances
+        SET amount = ?,
+            amount_status = 'confirmed',
+            amount_source = ?,
+            amount_observed_at = ?,
+            confidence = 'high',
+            notes = COALESCE(?, notes),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (new_amount, source, now, note, now, inst["id"]),
+    )
+    return {
+        "instance_id": inst["id"],
+        "obligation_id": obligation_id,
+        "due_date": inst["due_date"],
+        "statement_close_date": inst["statement_close_date"],
+        "previous_amount": round(float(inst["amount"]), 2),
+        "amount": new_amount,
+        "amount_status": "confirmed",
+        "amount_source": source,
+        "amount_observed_at": now,
+    }
+
+
 # --- helpers ---------------------------------------------------------------
 
 

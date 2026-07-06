@@ -138,8 +138,44 @@ def test_sync_incremental_falls_back_to_lookback_when_empty(tmp_path, monkeypatc
     captured = {}
     monkeypatch.setattr(sfin, "fetch_simplefin_accounts",
                         lambda url, *, start_date=None, end_date=None, timeout=60: captured.update(start_date=start_date) or ([], []))
+    # lookback_days above the SimpleFIN-recommended cap is clamped to 45.
     sync_simplefin(conn, access_url="https://u:p@host/simplefin", incremental=True, lookback_days=90)
-    assert captured["start_date"] == (dt.date.today() - dt.timedelta(days=90)).isoformat()
+    assert captured["start_date"] == (dt.date.today() - dt.timedelta(days=45)).isoformat()
+
+
+def test_sync_explicit_start_date_is_not_clamped(tmp_path, monkeypatch):
+    conn = _db(tmp_path / "s.sqlite")
+    captured = {}
+    monkeypatch.setattr(sfin, "fetch_simplefin_accounts",
+                        lambda url, *, start_date=None, end_date=None, timeout=60: captured.update(start_date=start_date) or ([], []))
+    sync_simplefin(conn, access_url="https://u:p@host/simplefin", start_date="2025-01-01")
+    assert captured["start_date"] == "2025-01-01"  # deliberate backfill, caller's choice
+
+
+def test_sync_splits_balance_only_notes_from_warnings(tmp_path, monkeypatch):
+    conn = _db(tmp_path / "s.sqlite")
+    errors = [
+        "Connection to Apple Card (Updated Monthly) may need attention: Auth required",
+        "Connection to Chase Bank failed: timeout",
+    ]
+    monkeypatch.setattr(sfin, "fetch_simplefin_accounts", lambda *a, **k: ([], errors))
+    result = sync_simplefin(conn, access_url="https://u:p@host/simplefin")
+    # The permanent Apple Card balance-only state is an expected note, not a warning.
+    assert len(result["notes"]) == 1 and "Apple Card" in result["notes"][0]
+    assert "expected: balance-only" in result["notes"][0]
+    # The real feed problem is an actionable warning and lands on the sync run.
+    assert result["warnings"] == ["Connection to Chase Bank failed: timeout"]
+    assert result["error"] == "Connection to Chase Bank failed: timeout"
+    assert conn.execute("SELECT error FROM sync_runs").fetchone()[0] == result["error"]
+
+
+def test_sync_only_expected_notes_means_no_error(tmp_path, monkeypatch):
+    conn = _db(tmp_path / "s.sqlite")
+    errors = ["Connection to Apple Card (Updated Monthly) may need attention: Auth required"]
+    monkeypatch.setattr(sfin, "fetch_simplefin_accounts", lambda *a, **k: ([], errors))
+    result = sync_simplefin(conn, access_url="https://u:p@host/simplefin")
+    assert result["warnings"] == [] and result["error"] is None
+    assert len(result["notes"]) == 1
 
 
 def test_config_loads_env_without_mutating_environ(tmp_path):

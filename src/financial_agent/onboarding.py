@@ -91,6 +91,12 @@ CANDIDATE_TYPE_TO_OBLIGATION_KIND: dict[str, str] = {
 # Fixed step (days) for evenly-spaced cadences when generating dated instances.
 FIXED_CADENCE_INTERVAL_DAYS: dict[str, int] = {"weekly": 7, "biweekly": 14, "quarterly": 91}
 
+# Cadence labels that imply a real schedule. Proposing one requires at least
+# MIN_CONSISTENT_INTERVALS observed intervals that agree with the median's
+# bucket, so two consecutive-day gas fills never become a "weekly" candidate.
+SCHEDULABLE_CADENCES: frozenset[str] = frozenset({"weekly", "biweekly", "monthly", "quarterly"})
+MIN_CONSISTENT_INTERVALS = 3
+
 DEFAULT_APPLY_HORIZON_DAYS = 180
 
 
@@ -178,7 +184,7 @@ DISPOSITION_AUTO_REJECT = "auto_reject"
 
 
 def classify_candidate_disposition(
-    candidate: dict[str, Any], *, reject_floor: float = 75.0
+    candidate: dict[str, Any], *, reject_floor: float = 75.0, statement_absorbed: bool = False
 ) -> dict[str, Any]:
     """Map a built candidate to surface / park / auto_reject from signals in hand.
 
@@ -238,6 +244,14 @@ def classify_candidate_disposition(
     # Rule 1: one-off / single-burst -- not enough history to be a schedule.
     if n < 2 or (months_covered < 2 and not regular):
         return _reject_or_guard("too few occurrences / single-burst, not a recurring pattern")
+
+    # Rule 1b: card spend already absorbed by a modeled statement-payment
+    # obligation -- the statement carries this cash flow, so no triage needed.
+    if statement_absorbed and candidate.get("cash_flow_treatment") == "card_statement_input":
+        return _result(
+            DISPOSITION_PARK,
+            "card spend already absorbed by a modeled statement-payment obligation",
+        )
 
     # Rule 2: internal transfer / debt payment -- modeled elsewhere, park.
     if candidate_type == "internal_transfer":
@@ -373,6 +387,7 @@ def scan_charge_onboarding_candidates(
     existing_obligations = (
         _load_obligation_index(conn) if opts["link_existing_obligations"] else []
     )
+    modeled_obligation_ids = {oid for oid, _ in existing_obligations}
 
     now = _now()
     created = updated = unchanged = skipped = 0
@@ -393,7 +408,14 @@ def scan_charge_onboarding_candidates(
         # proposal. "off" leaves the candidate untouched.
         disposition = None
         if triage_mode != "off":
-            disposition = classify_candidate_disposition(candidate, reject_floor=reject_floor)
+            statement_target = (candidate.get("proposed_cash_impact_policy") or {}).get(
+                "statement_target_obligation_id"
+            )
+            disposition = classify_candidate_disposition(
+                candidate,
+                reject_floor=reject_floor,
+                statement_absorbed=bool(statement_target) and statement_target in modeled_obligation_ids,
+            )
             candidate["proposed_review_policy"]["auto_disposition"] = disposition["disposition"]
             candidate["proposed_review_policy"]["disposition_reasons"] = disposition["reasons"]
             by_disposition[disposition["disposition"]] += 1
@@ -534,7 +556,7 @@ def _build_candidate(
     treatment = "inflow" if direction == "inflow" else CLASS_TO_TREATMENT[cls]
     statement_target = _statement_target_for_org(items[0]["account_org"]) if treatment == "card_statement_input" else None
 
-    cadence = _cadence_label(median_interval)
+    cadence = _cadence_label(median_interval, intervals)
     schedule_policy = {
         "cadence": cadence,
         "typical_day_of_month": int(round(_stat_median(days))),
@@ -690,7 +712,16 @@ def _amount_policy(
     return policy
 
 
-def _cadence_label(median_interval: float | None) -> str:
+def _cadence_label(median_interval: float | None, intervals: list[int] | None = None) -> str:
+    label = _interval_bucket(median_interval)
+    if intervals is not None and label in SCHEDULABLE_CADENCES:
+        consistent = sum(1 for iv in intervals if _interval_bucket(float(iv)) == label)
+        if consistent < MIN_CONSISTENT_INTERVALS:
+            return "unknown"
+    return label
+
+
+def _interval_bucket(median_interval: float | None) -> str:
     if median_interval is None:
         return "unknown"
     if median_interval <= 10:

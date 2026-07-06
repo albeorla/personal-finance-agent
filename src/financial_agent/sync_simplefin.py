@@ -21,6 +21,31 @@ from urllib.request import Request, urlopen
 from .config import ensure_source_tables, get_finance_config
 
 
+# SimpleFIN recommends requesting at most ~45 days per pull; larger windows risk
+# silent truncation. Default requests are capped here; an explicit start_date
+# (a deliberate backfill) is the caller's own choice and is not clamped.
+MAX_REQUEST_LOOKBACK_DAYS = 45
+
+# Connections known to be permanently balance-only (no transaction feed). Their
+# standing per-connection error ("Auth required" on every pull) is expected, so
+# it reports as an informational note, not a fresh warning.
+BALANCE_ONLY_CONNECTION_MARKERS: tuple[str, ...] = ("apple card",)
+
+
+def _split_connection_errors(errors: list[Any]) -> tuple[list[str], list[str]]:
+    """Split per-connection errors into actionable warnings vs expected notes."""
+
+    warnings: list[str] = []
+    notes: list[str] = []
+    for err in errors:
+        text = str(err)
+        if any(marker in text.lower() for marker in BALANCE_ONLY_CONNECTION_MARKERS):
+            notes.append(f"{text} (expected: balance-only connection, no transaction feed)")
+        else:
+            warnings.append(text)
+    return warnings, notes
+
+
 def sync_simplefin(
     conn: sqlite3.Connection,
     *,
@@ -28,7 +53,7 @@ def sync_simplefin(
     env_path: str | None = None,
     start_date: Any = None,
     end_date: Any = None,
-    lookback_days: int = 90,
+    lookback_days: int = MAX_REQUEST_LOOKBACK_DAYS,
     incremental: bool = False,
     overlap_days: int = 3,
     fetched_at: str | None = None,
@@ -40,10 +65,13 @@ def sync_simplefin(
 
     SimpleFIN only returns transactions when a start-date is supplied. When
     ``start_date`` is omitted: ``incremental`` resumes from the oldest
-    last-posted date across accounts (minus ``overlap_days``, floored at the
-    90-day cap), so a daily job does not re-pull the full window; otherwise it
-    defaults to ``lookback_days`` before today. A database with no prior
-    transactions falls back to the full lookback.
+    last-posted date across accounts (minus ``overlap_days``), otherwise it
+    defaults to ``lookback_days`` before today; either way the request window is
+    capped at ``MAX_REQUEST_LOOKBACK_DAYS`` (45), SimpleFIN's recommended
+    maximum. A database with no prior transactions falls back to the capped
+    lookback. Per-connection errors are split into ``warnings`` (actionable feed
+    problems, also recorded on the sync run) and ``notes`` (expected
+    balance-only connections such as Apple Card).
     """
 
     ensure_source_tables(conn)
@@ -51,6 +79,7 @@ def sync_simplefin(
         access_url = get_finance_config(env_path=env_path)["simplefin_access_url"]
         if not access_url:
             raise ValueError("no SIMPLEFIN_ACCESS_URL configured (.env or environment)")
+    lookback_days = min(int(lookback_days), MAX_REQUEST_LOOKBACK_DAYS)
     if start_date is None:
         if incremental:
             start_date = incremental_start_date(conn, overlap_days=overlap_days, max_lookback_days=lookback_days)
@@ -70,8 +99,9 @@ def sync_simplefin(
     normalized = normalize_accounts(accounts, fetched_at)
     stored = store_accounts(conn, normalized, source=source)
     finished_at = _now()
-    if errors and error is None:
-        error = "; ".join(str(e) for e in errors)
+    warnings, notes = _split_connection_errors(errors)
+    if warnings and error is None:
+        error = "; ".join(warnings)
 
     if record_run:
         _record_sync_run(
@@ -84,6 +114,8 @@ def sync_simplefin(
         "inserted": stored["inserted"],
         "updated": stored["updated"],
         "errors": errors,
+        "warnings": warnings,
+        "notes": notes,
         "error": error,
         "started_at": started_at,
         "finished_at": finished_at,
