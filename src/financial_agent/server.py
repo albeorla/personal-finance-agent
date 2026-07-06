@@ -137,6 +137,18 @@ def _list_result(items) -> dict:
     return {"items": items, "count": len(items)}
 
 
+def _resolve_as_of(as_of_date: str | None) -> str:
+    """Default a missing as_of_date to today's ISO date.
+
+    Tools accept as_of_date=None so callers (especially post-compaction, when the
+    schema fell out of context) never fail just for omitting today's date.
+    """
+
+    import datetime as _dt
+
+    return as_of_date or _dt.date.today().isoformat()
+
+
 @mcp.tool()
 def set_goal(
     name: str,
@@ -174,7 +186,7 @@ def set_goal(
 
 
 @mcp.tool()
-def list_goals(as_of_date: str, db_path: str | None = None) -> dict:
+def list_goals(as_of_date: str | None = None, db_path: str | None = None) -> dict:
     """List active savings goals with progress vs target and an on-track assessment.
 
     Each goal reports current_progress (a manual override if set, else the
@@ -182,6 +194,7 @@ def list_goals(as_of_date: str, db_path: str | None = None) -> dict:
     required_monthly_rate to hit the deadline, and a status of on_track /
     behind / due_soon / completed / no_deadline.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -277,7 +290,7 @@ def set_debt_terms(
 
 
 @mcp.tool()
-def list_debts(as_of_date: str, db_path: str | None = None) -> dict:
+def list_debts(as_of_date: str | None = None, db_path: str | None = None) -> dict:
     """List debts with live balances, monthly interest, and total revolving interest.
 
     Each debt reports its resolved current_balance (the linked account's latest
@@ -286,6 +299,7 @@ def list_debts(as_of_date: str, db_path: str | None = None) -> dict:
     autopay flags, and min_payment. The result also carries a
     total_monthly_interest summed across the revolving debts only.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -336,13 +350,14 @@ def capture_followup(
 
 
 @mcp.tool()
-def list_due_followups(as_of_date: str, db_path: str | None = None) -> dict:
+def list_due_followups(as_of_date: str | None = None, db_path: str | None = None) -> dict:
     """List pending follow-ups due on or before as_of_date (the surfacing queue).
 
     Returns only pending follow-ups whose surface_when is on or before as_of_date,
     ordered by surface_when, then priority (high first). This is what the daily
     job reads to decide what to surface.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -409,7 +424,7 @@ def update_followup(
 
 @mcp.tool()
 def get_surface_queue(
-    as_of_date: str,
+    as_of_date: str | None = None,
     limit: int = 30,
     suppress_balance_guardrails: bool = False,
     db_path: str | None = None,
@@ -428,6 +443,7 @@ def get_surface_queue(
     stale balances, while still surfacing non-balance items (due follow-ups,
     manual obligations by date, the data-freshness guardrail).
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -473,7 +489,7 @@ def get_finance_status(
 def set_manual_balance(
     account_query: str,
     balance: float,
-    as_of_date: str,
+    as_of_date: str | None = None,
     note: str | None = None,
     db_path: str | None = None,
 ) -> dict:
@@ -485,10 +501,13 @@ def set_manual_balance(
     account matching account_query, so get_finance_status and get_daily_digest
     reflect it immediately.
 
-    account_query is fuzzy-matched against account name/org. An ambiguous match
+    account_query is fuzzy-matched against account name/org. A trailing 4-digit
+    mask (e.g. "PREMIER PLUS CKG (4321)") is matched exactly against account
+    name/id first, so a masked query resolves unambiguously. An ambiguous match
     returns a candidate list and writes nothing; no match returns not_found. A
     later sync that records a newer snapshot supersedes the manual correction.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -779,7 +798,7 @@ def deactivate_obligation(
 
 @mcp.tool()
 def suppress_contradicted_estimates(
-    as_of_date: str,
+    as_of_date: str | None = None,
     mode: str = "report",
     options: dict | None = None,
     db_path: str | None = None,
@@ -801,6 +820,7 @@ def suppress_contradicted_estimates(
     contradiction_cycles, contradiction_lookback_days, near_zero_monthly) go in
     options.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -856,10 +876,11 @@ def list_obligations(
 
 @mcp.tool()
 def list_obligation_review_candidates(
-    as_of_date: str,
+    as_of_date: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """List obligation instances that need review, such as estimated amounts due for refresh."""
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1259,7 +1280,7 @@ def recompute_statement_estimates(
 
 @mcp.tool()
 def reconcile_obligation_instances(
-    as_of_date: str,
+    as_of_date: str | None = None,
     options: dict | None = None,
     db_path: str | None = None,
 ) -> dict:
@@ -1272,6 +1293,7 @@ def reconcile_obligation_instances(
     options.flag_unmatched_needs_review to opt in), and card-statement-input
     instances are skipped (they settle via the statement, not a checking match).
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1324,7 +1346,7 @@ def list_unmatched_obligation_instances(
 
 @mcp.tool()
 def detect_drift(
-    as_of_date: str,
+    as_of_date: str | None = None,
     options: dict | None = None,
     persist: bool = True,
     db_path: str | None = None,
@@ -1337,6 +1359,7 @@ def detect_drift(
     onboarding but not yet modeled). Deterministic and idempotent. When persist
     is true, findings are upserted and disappeared ones marked resolved.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1540,7 +1563,7 @@ def delete_todoist_task(task_id: str) -> dict:
 
 @mcp.tool()
 def surface_due_items_to_todoist(
-    as_of_date: str,
+    as_of_date: str | None = None,
     db_path: str | None = None,
     sync_failed: bool = False,
 ) -> dict:
@@ -1567,6 +1590,7 @@ def surface_due_items_to_todoist(
     the ledger untouched, and returns status "awaiting-integration". Returns a
     summary with created / updated / skipped / resolved / failed counts.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1617,7 +1641,7 @@ def reconcile_todoist_emission(
 
 @mcp.tool()
 def reconcile_todoist_completions(
-    as_of_date: str,
+    as_of_date: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Map user-completed/deleted Todoist tasks back to the emissions ledger.
@@ -1635,6 +1659,7 @@ def reconcile_todoist_completions(
     read-only; the only writes are to the local ledger / follow-ups. Returns
     checked / resolved / followups_resolved / still_open / failed counts.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1651,7 +1676,7 @@ def reconcile_todoist_completions(
 
 @mcp.tool()
 def reconcile_todoist_project(
-    as_of_date: str,
+    as_of_date: str | None = None,
     apply: bool = False,
     db_path: str | None = None,
 ) -> dict:
@@ -1676,6 +1701,7 @@ def reconcile_todoist_project(
     unsound on a partial view. Idempotent: a second run over a cleaned project
     finds nothing to delete.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1692,7 +1718,7 @@ def reconcile_todoist_project(
 
 @mcp.tool()
 def list_todoist_project(
-    as_of_date: str,
+    as_of_date: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """READ-ONLY LIST + classify of the whole Finance project (no delete, no apply).
@@ -1710,6 +1736,7 @@ def list_todoist_project(
     actually intend to clean up. A truncated or failed LIST is reported via the
     ``truncated`` / ``status`` fields exactly as the reconcile path reports it.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1742,7 +1769,7 @@ def list_action_outbox(
 
 @mcp.tool()
 def run_background_sync(
-    as_of_date: str,
+    as_of_date: str | None = None,
     options: dict | None = None,
     run_type: str = "daily_sync",
     trigger_type: str = "manual",
@@ -1756,6 +1783,7 @@ def run_background_sync(
     operation-event log. A failing step is logged and the run continues
     (partial_success). Returns the run id, trace id, status, and step summaries.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1858,7 +1886,7 @@ def get_job_health(
 
 @mcp.tool()
 def run_verification(
-    as_of_date: str,
+    as_of_date: str | None = None,
     persist: bool = True,
     db_path: str | None = None,
 ) -> dict:
@@ -1875,6 +1903,7 @@ def run_verification(
     read-only check. This runs automatically inside run_background_sync; call it
     directly to re-check after a correction.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1925,7 +1954,7 @@ def list_verification_findings(
 
 @mcp.tool()
 def run_adversarial_review(
-    as_of_date: str,
+    as_of_date: str | None = None,
     persist: bool = True,
     model: str | None = None,
     db_path: str | None = None,
@@ -1948,6 +1977,7 @@ def run_adversarial_review(
     This runs automatically inside run_background_sync only when
     FINANCE_AGENT_ADVERSARIAL is enabled; call it directly to review on demand.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -1966,17 +1996,23 @@ def run_adversarial_review(
 
 @mcp.tool()
 def write_finance_memory(
-    text: str,
+    text: str | None = None,
     metadata: dict | None = None,
     kind: str = "note",
     source: str | None = None,
     db_path: str | None = None,
+    content: str | None = None,
 ) -> dict:
     """Store a finance memory (a correction, decision, or fact to recall later).
 
     Idempotent by (kind, source, text). Use kind to scope memories, e.g.
-    'decision', 'correction', 'fact'.
+    'decision', 'correction', 'fact'. 'content' is accepted as an alias for
+    'text' (a common first-call mistake); one of the two is required.
     """
+
+    text = text or content
+    if not text:
+        raise ValueError("write_finance_memory requires 'text' (or its alias 'content')")
 
     import sqlite3
 
@@ -2090,7 +2126,7 @@ def apply_obligation_migration(
 
 @mcp.tool()
 def evaluate_guardrails(
-    as_of_date: str,
+    as_of_date: str | None = None,
     persist: bool = False,
     db_path: str | None = None,
 ) -> dict:
@@ -2099,6 +2135,7 @@ def evaluate_guardrails(
     Returns findings ordered by severity. Reads balances and drift from the DB.
     When persist is true, records the evaluation (pass/fail per rule).
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 
@@ -2184,7 +2221,7 @@ def sync_simplefin(
 
 @mcp.tool()
 def run_live_validation(
-    as_of_date: str,
+    as_of_date: str | None = None,
     sync: bool = True,
     keep_work_db: bool = False,
     db_path: str | None = None,
@@ -2197,6 +2234,7 @@ def run_live_validation(
     orphaned statement targets after a card rename). The source database is never
     mutated.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     resolved_db_path = db_path or str(default_db_path())
     return run_live_validation_for_db(
@@ -2400,13 +2438,14 @@ def verify_grounding(payload: dict, as_of_date: str | None = None, db_path: str 
 
 
 @mcp.tool()
-def backfill_recurring_instances(as_of_date: str, lookback_days: int = 90, db_path: str | None = None) -> dict:
+def backfill_recurring_instances(as_of_date: str | None = None, lookback_days: int = 90, db_path: str | None = None) -> dict:
     """Materialize past-due instances for active recurring obligations over a
     trailing window and reconcile them against posted transactions, so the digest
     can answer "did rent / Amex / Apple clear this cycle?". Past instances do not
     enter the cash-flow projection (forward-only); no payment is fabricated -
     matches come from the normal reconciliation matcher.
     """
+    as_of_date = _resolve_as_of(as_of_date)
 
     import sqlite3
 

@@ -74,6 +74,25 @@ def apply_obligation_instances(
     caller can tell new inserts from re-applied upserts (never a silent no-op).
     """
 
+    # Validate the whole payload up front and report every missing field in one
+    # error, instead of leaking one raw KeyError per retry.
+    problems: list[str] = []
+    missing = [key for key in ("id", "name", "kind", "source") if not (obligation or {}).get(key)]
+    if missing:
+        problems.append(f"obligation missing required key(s): {', '.join(missing)}")
+    for index, instance in enumerate(instances):
+        inst_missing = [
+            key for key in ("due_date", "amount", "source") if (instance or {}).get(key) is None
+        ]
+        if inst_missing:
+            problems.append(f"instances[{index}] missing required key(s): {', '.join(inst_missing)}")
+    if problems:
+        raise ValueError(
+            "; ".join(problems)
+            + ". Required shape: obligation {id, name, kind, source}, "
+            "each instance {due_date, amount, source}."
+        )
+
     ensure_app_schema(conn)
     now = _now()
     # autopay defaults to True (quiet): an obligation is only surfaced as a

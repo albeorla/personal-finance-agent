@@ -1498,3 +1498,23 @@ def test_contradiction_noop_without_source_tables(tmp_path):
     result = suppress_contradicted_estimates(conn, as_of_date="2026-06-25")
     assert result["contradicted_count"] == 0
     assert result["evaluated"] == 0
+
+
+def test_apply_reports_all_missing_fields_in_one_error(tmp_path):
+    import pytest
+
+    conn = _db(tmp_path / "o.sqlite")
+    # obligation is missing name/kind/source and the instance is missing
+    # due_date/source: every gap must be named in ONE ValueError, not leaked
+    # as one raw KeyError per retry.
+    with pytest.raises(ValueError) as excinfo:
+        apply_obligation_instances(
+            conn,
+            obligation={"id": "x"},
+            instances=[{"amount": -10.0}],
+        )
+    message = str(excinfo.value)
+    for field in ("name", "kind", "source", "due_date"):
+        assert field in message
+    assert "instances[0]" in message
+    assert "Required shape" in message

@@ -563,3 +563,45 @@ def test_set_manual_balance_org_tie_when_names_equal_is_ambiguous(tmp_path):
     assert result["status"] == "ambiguous"
     ids = {c["account_id"] for c in result["candidates"]}
     assert ids == {"chase-card", "amex-card"}
+
+
+def test_set_manual_balance_trailing_mask_resolves_unambiguously(tmp_path):
+    db_path = tmp_path / "transactions.sqlite"
+    _build_db(
+        db_path,
+        accounts=[
+            ("chk-1", "PREMIER PLUS CKG (4321)", "Webster Bank"),
+            ("chk-2", "PREMIER PLUS CKG (1224)", "Webster Bank"),
+        ],
+    )
+
+    conn = _connect(db_path)
+    # The full display name including the "(4321)" mask resolves via the
+    # exact-mask preference (which must not regress the common masked query).
+    result = set_manual_balance(conn, "PREMIER PLUS CKG (4321)", 5000.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+
+    assert result["status"] == "ok"
+    assert result["account_id"] == "chk-1"
+
+
+def test_set_manual_balance_mask_matches_account_id_suffix(tmp_path):
+    db_path = tmp_path / "transactions.sqlite"
+    _build_db(
+        db_path,
+        accounts=[
+            ("chk-4321", "PREMIER PLUS CKG", "Webster Bank"),
+            ("chk-1224", "PREMIER PLUS CKG", "Webster Bank"),
+        ],
+    )
+
+    conn = _connect(db_path)
+    # Identical names are pure fuzzy ties; the mask living only in the account
+    # id must break the tie.
+    result = set_manual_balance(conn, "PREMIER PLUS CKG (4321)", 5000.0, "2026-06-20")
+    conn.commit()
+    conn.close()
+
+    assert result["status"] == "ok"
+    assert result["account_id"] == "chk-4321"

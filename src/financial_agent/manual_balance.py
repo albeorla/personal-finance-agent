@@ -37,6 +37,7 @@ leaving the feed (``simplefin``) history untouched.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sqlite3
 from difflib import SequenceMatcher
 from typing import Any
@@ -238,14 +239,50 @@ def set_manual_balance(
     if not rows:
         return {"status": "not_found", "message": f"No accounts matched {account_query!r} (no accounts in database)"}
 
-    scored = sorted(
+    # Exact-mask preference: a query ending in a 4-digit mask like
+    # "PREMIER PLUS CKG (4321)" names one account. Prefer accounts whose name or
+    # id carries that mask before fuzzy matching, and strip the mask from the
+    # fuzzy query either way so the "(4321)" suffix cannot poison the scores
+    # into a spurious ambiguous result.
+    query = account_query
+    mask_hit = re.search(r"\(?\s*(\d{4})\s*\)?\s*$", account_query.strip())
+    if mask_hit:
+        mask = mask_hit.group(1)
+        base_query = account_query.strip()[: mask_hit.start()].strip(" (*.-x")
+        masked_rows = [
+            row
+            for row in rows
+            if mask in ((row["name"] if isinstance(row, sqlite3.Row) else row[1]) or "")
+            or mask in ((row["id"] if isinstance(row, sqlite3.Row) else row[0]) or "")
+        ]
+        if masked_rows:
+            rows = masked_rows
+        if base_query:
+            query = base_query
+        if len(masked_rows) == 1:
+            row = masked_rows[0]
+            # Unambiguous by mask: skip fuzzy scoring entirely.
+            scored_override = [
+                {
+                    "account_id": row["id"] if isinstance(row, sqlite3.Row) else row[0],
+                    "account_name": row["name"] if isinstance(row, sqlite3.Row) else row[1],
+                    "org": row["org"] if isinstance(row, sqlite3.Row) else row[2],
+                    "match_score": 1.0,
+                }
+            ]
+        else:
+            scored_override = None
+    else:
+        scored_override = None
+
+    scored = scored_override or sorted(
         (
             {
                 "account_id": row["id"] if isinstance(row, sqlite3.Row) else row[0],
                 "account_name": row["name"] if isinstance(row, sqlite3.Row) else row[1],
                 "org": row["org"] if isinstance(row, sqlite3.Row) else row[2],
                 "match_score": _score(
-                    account_query,
+                    query,
                     row["name"] if isinstance(row, sqlite3.Row) else row[1],
                     row["org"] if isinstance(row, sqlite3.Row) else row[2],
                 ),
