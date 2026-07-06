@@ -316,6 +316,44 @@ def test_send_failure_recorded_not_raised(tmp_path):
     assert n == 0
 
 
+def test_update_404_closes_emission_and_resolves_followup(tmp_path):
+    """A 404 on the in-place update means the task was deleted in Todoist.
+    Instead of failing the same push every day (the fup_352f... loop), the
+    emission is closed as deleted_by_user and the linked follow-up is resolved,
+    so the item is never retried."""
+
+    import urllib.error
+
+    conn = _db(tmp_path / "f.db")
+    fup = capture_followup(conn, "Call the bank", AS_OF)
+    key = f"followup:{fup['id']}"
+    spy = _Spy()
+    _enabled(conn, [{"surface_key": key, "content": "old", "description": "x"}], spy)
+    assert list_due_followups(conn, as_of_date=AS_OF)
+
+    def gone(token, path, body, **kwargs):
+        raise urllib.error.HTTPError(f"https://api.todoist.com{path}", 404, "Not Found", None, None)
+
+    # Changed content forces the in-place update, which 404s: self-heal.
+    r = surface_to_todoist(
+        conn,
+        [{"surface_key": key, "content": "new", "description": "x"}],
+        AS_OF,
+        write_enabled=True, token="tok", project_id="proj", send_func=gone,
+    )
+    assert r["failed"] == 0
+    assert r["resolved"] == 1 and r["followups_resolved"] == 1
+    row = conn.execute("SELECT status FROM todoist_emissions WHERE surface_key = ?", (key,)).fetchone()
+    assert row["status"] == "deleted_by_user"
+    assert not list_due_followups(conn, as_of_date=AS_OF)
+
+    # Next daily run: resolved short-circuit, no HTTP retry, ever.
+    spy2 = _Spy()
+    r2 = _enabled(conn, [{"surface_key": key, "content": "new", "description": "x"}], spy2)
+    assert r2["resolved"] == 1 and r2["failed"] == 0
+    assert spy2.calls == []
+
+
 def test_missing_task_id_in_create_response_fails_that_item_only(tmp_path):
     """A malformed-but-200 create (no id) records that item failed and continues
     the batch instead of raising IntegrityError on the NOT-NULL ledger column."""

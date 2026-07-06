@@ -863,6 +863,9 @@ def surface_to_todoist(
     - row exists + open + content_hash unchanged -> skip (idempotent)
     - row exists + open + content_hash changed -> update the same task in place,
       refresh the ledger hash (never recreate)
+    - the in-place update returns HTTP 404 -> the task was deleted in Todoist;
+      close the emission (deleted_by_user) and resolve a linked ``followup:<id>``
+      follow-up so the push is never retried daily
     - row exists + completed / deleted_by_user -> the user resolved it; mark the
       source item resolved and do NOT recreate
 
@@ -901,6 +904,7 @@ def surface_to_todoist(
         "updated": 0,
         "skipped": 0,
         "resolved": 0,
+        "followups_resolved": 0,
         "retired": 0,
         "failed": 0,
         "items": [],
@@ -980,6 +984,25 @@ def surface_to_todoist(
                     due_date=due_date, priority=priority, send_func=send_func,
                 )
             except Exception as exc:  # noqa: BLE001 - record, never crash the batch
+                if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    # The task is gone in Todoist (deleted outside the app).
+                    # Self-heal instead of failing the same push every day:
+                    # close the emission and resolve any linked follow-up so
+                    # the item is never retried.
+                    mark_emission_status(conn, key, "deleted_by_user")
+                    summary["resolved"] += 1
+                    item_out: dict[str, Any] = {
+                        "surface_key": key, "action": "resolved",
+                        "status": "deleted_by_user",
+                        "reason": "task not found (404); emission closed",
+                    }
+                    if key.startswith("followup:"):
+                        followup_id = key[len("followup:") :]
+                        if resolve_followup(conn, followup_id).get("resolved"):
+                            summary["followups_resolved"] += 1
+                            item_out["followup_resolved"] = followup_id
+                    summary["items"].append(item_out)
+                    continue
                 summary["failed"] += 1
                 summary["items"].append({"surface_key": key, "action": "failed", "reason": f"{type(exc).__name__}: {exc}"[:200]})
                 continue
@@ -1093,8 +1116,9 @@ def reconcile_todoist_project_for_db(
     Each entry in the returned ``tasks`` list carries the task's
     ``task_id``, ``content``, ``surface_key``, ``has_fa_auto``,
     ``classification``, ``action``, ``reason``, plus ``due_date`` (the task's
-    due date string, or None when the task has no due date) and ``description``
-    (the raw Todoist description, "" when empty).
+    due date string, or None when the task has no due date), ``labels`` (the
+    task's Todoist label names, [] when none), and ``description`` (the raw
+    Todoist description, "" when empty).
 
     Gating mirrors ``surface_to_todoist``: the dry-run report needs only
     token+project (reads are allowed with write-back off); apply (delete/resolve)
@@ -1214,6 +1238,7 @@ def reconcile_todoist_project_for_db(
             "surface_key": sk,
             "has_fa_auto": has_fa_auto,
             "due_date": (t.get("due") or {}).get("date"),
+            "labels": list(labels),
             "description": description,
         }
         order.append(tid)
@@ -1258,6 +1283,7 @@ def reconcile_todoist_project_for_db(
             "surface_key": sk,
             "has_fa_auto": has_fa_auto,
             "due_date": a["due_date"],
+            "labels": a["labels"],
             "description": a["description"],
         }
 

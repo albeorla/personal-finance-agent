@@ -1729,7 +1729,9 @@ def list_todoist_project(
     delete capability and NO apply path - ``applied`` is always false and every
     ``actions`` count is zero - so it can never mutate Todoist or the local ledger.
     Tasks a cleanup WOULD remove still show as ``would_delete`` for visibility, but
-    nothing is deleted.
+    nothing is deleted. Each task entry carries ``content``, ``due_date``,
+    ``labels``, and ``description``, so there is no need to hit the raw Todoist
+    API for those fields.
 
     Use this for board reads under the finance-scoped read-only permission profile;
     use the delete-capable ``reconcile_todoist_project`` (kept prompting) when you
@@ -1782,6 +1784,12 @@ def run_background_sync(
     (de-duped, gated off by default). Records a run record plus an ordered
     operation-event log. A failing step is logged and the run continues
     (partial_success). Returns the run id, trace id, status, and step summaries.
+
+    NOTE: the surface_due_items step here is DELIBERATELY gated off (its summary
+    shows awaiting-integration / created:0) unless options carries a "surface"
+    dict, e.g. options={"surface": {"write_enabled": true}} to resolve the
+    Todoist gate from the finances .env. For the live daily push, prefer calling
+    surface_due_items_to_todoist directly.
     """
     as_of_date = _resolve_as_of(as_of_date)
 
