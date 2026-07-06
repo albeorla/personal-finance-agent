@@ -1006,6 +1006,76 @@ def test_list_obligations_mixed_parameters(tmp_path):
         assert "instance_count" not in ob
 
 
+def test_list_obligations_name_filter_and_instance_window(tmp_path):
+    conn = _db(tmp_path / "obligations.sqlite")
+    _seed_compact_fixture(conn)
+
+    # name_contains substring-matches on name or id (LIKE, case-insensitive for ASCII).
+    assert [o["id"] for o in list_obligations(conn, name_contains="Bill 1")] == ["bill-1"]
+    assert [o["id"] for o in list_obligations(conn, name_contains="bill-2")] == ["bill-2"]
+
+    # instances_start/instances_through window the instances by due date.
+    windowed = list_obligations(
+        conn, obligation_id="bill-0",
+        instances_start="2026-03-01", instances_through="2026-05-31",
+    )
+    assert [i["due_date"] for i in windowed[0]["instances"]] == [
+        "2026-03-15", "2026-04-15", "2026-05-15"
+    ]
+
+    # instances_summary trims each instance row to the compact triage fields.
+    compact_rows = list_obligations(conn, obligation_id="bill-0", instances_summary=True)
+    inst = compact_rows[0]["instances"][0]
+    assert set(inst) == {
+        "id", "due_date", "amount", "direction", "status",
+        "confidence", "amount_status", "cash_flow_treatment",
+    }
+    assert "notes" not in inst and "estimation_inputs" not in inst
+
+
+def test_list_statement_input_estimates_summary_and_paging(tmp_path):
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "amex_statement_payment", "name": "Amex statement payment", "kind": "credit_card_statement", "status": "active", "source": "seed"},
+        instances=[{"due_date": "2026-09-05", "amount": -1000.0, "source": "seed"}],
+    )
+    apply_obligation_instances(
+        conn,
+        obligation={"id": "gault_card_spend", "name": "Gault card spend", "kind": "utility_card_spend", "status": "active", "source": "seed"},
+        instances=[
+            {
+                "due_date": f"2026-{month:02d}-01",
+                "amount": -175.0,
+                "source": "seed",
+                "confidence": "low",
+                "amount_status": "estimated",
+                "estimation_inputs": {"summer_amount": 175.0},
+                "cash_flow_treatment": "card_statement_input",
+                "statement_target_obligation_id": "amex_statement_payment",
+            }
+            for month in (7, 8, 9)
+        ],
+    )
+
+    # Summary rows drop estimation provenance and keep the triage fields.
+    summary = list_statement_input_estimates(conn, summary=True)
+    assert len(summary) == 3
+    assert set(summary[0]) == {
+        "instance_id", "obligation_name", "due_date", "amount",
+        "status", "confidence", "statement_target_obligation_id",
+    }
+
+    # limit/offset page through the due-date ordering.
+    page1 = list_statement_input_estimates(conn, limit=2, summary=True)
+    page2 = list_statement_input_estimates(conn, limit=2, offset=2, summary=True)
+    assert [r["due_date"] for r in page1] == ["2026-07-01", "2026-08-01"]
+    assert [r["due_date"] for r in page2] == ["2026-09-01"]
+    # Full rows still carry the provenance fields.
+    full = list_statement_input_estimates(conn, offset=1)
+    assert full[0]["estimation_inputs"] == {"summer_amount": 175.0}
+
+
 # --- dormant avg-estimate suppression --------------------------------------
 
 

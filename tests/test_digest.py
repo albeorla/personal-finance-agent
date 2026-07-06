@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from financial_agent.digest import build_daily_digest, render_digest_markdown
+from financial_agent.digest import build_daily_digest, render_digest_markdown, summarize_daily_digest
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
 
@@ -176,6 +176,37 @@ def test_upcoming_obligations_match_longest_projection(tmp_path):
     digest = build_daily_digest(db, as_of_date="2026-06-20")
     due = [o["due_date"] for o in digest["upcoming_obligations"]]
     assert due == ["2026-07-03", "2026-07-23"]  # both inside the 60-day window, in date order
+
+
+def test_summarize_daily_digest_is_compact_and_windowed(tmp_path):
+    import json
+
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0, obligations=[
+        ("rent", "Rent check", "housing", [{"id": "rent:2026-06-28", "due_date": "2026-06-28", "amount": -3000.0, "source": "seed"}]),
+        ("nyt", "New York Times", "subscription", [{"id": "nyt:2026-07-23", "due_date": "2026-07-23", "amount": -30.30, "source": "seed"}]),
+    ])
+    full = build_daily_digest(db, as_of_date="2026-06-20")
+    summary = summarize_daily_digest(full)
+
+    # The essentials survive: cash, freshness, projection endpoints, alerts, counts.
+    assert summary["mode"] == "summary"
+    assert summary["balances"]["working_cash"] == 9000.0
+    assert summary["source_freshness"] == full["source_freshness"]
+    assert summary["cash_flow"] == full["cash_flow"]
+    assert summary["status_color"] == full["status_color"]
+    assert "queue_counts" in summary and "guardrails" in summary
+
+    # Only the next-14d obligations are inlined; the rest is a count.
+    assert [o["obligation_name"] for o in summary["upcoming_14d"]] == ["Rent check"]
+    assert summary["upcoming_total"] == 2
+
+    # Heavy payload parts are gone: full event list, finding bodies, markdown.
+    assert "upcoming_obligations" not in summary
+    assert "recurring_candidates" not in summary
+    assert "findings" not in summary["verification"]
+    assert "findings" not in summary["adversarial_review"]
+    assert "markdown" not in summary
+    assert len(json.dumps(summary)) < len(json.dumps(full))
 
 
 def test_auto_match_is_cleared_not_awaiting_confirmation(tmp_path):

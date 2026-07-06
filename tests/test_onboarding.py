@@ -460,6 +460,37 @@ def test_record_decision_supports_defer_reject_needs_more_evidence(tmp_path):
     assert len(list_charge_onboarding_queue(conn, status="deferred")) == 1
 
 
+def test_list_queue_summary_and_offset_paging(tmp_path):
+    conn = _seed_source_db(
+        tmp_path / "src.sqlite",
+        accounts=[AMEX, CHECKING],
+        transactions=GAULT_AMEX_ROWS + EVERSOURCE_CHECKING_ROWS + NYT_CHECKING_ROWS,
+    )
+    scan_charge_onboarding_candidates(conn)
+    full = list_charge_onboarding_queue(conn)
+    assert len(full) == 3
+
+    # Summary rows carry the triage fields and drop the heavy evidence blobs.
+    summary = list_charge_onboarding_queue(conn, summary=True)
+    assert len(summary) == 3
+    assert set(summary[0]) == {
+        "id", "merchant", "amount", "cadence", "confidence", "status",
+        "cash_flow_treatment", "evidence_count", "priority_score",
+        "existing_obligation_id",
+    }
+    assert summary[0]["id"] == full[0]["id"]
+    assert summary[0]["cadence"] == (full[0]["proposed_schedule_policy"] or {}).get("cadence")
+    assert "evidence_transaction_ids" not in summary[0]
+
+    # limit/offset page through the same ordering.
+    page1 = list_charge_onboarding_queue(conn, limit=2, summary=True)
+    page2 = list_charge_onboarding_queue(conn, limit=2, offset=2, summary=True)
+    assert [c["id"] for c in page1] == [c["id"] for c in summary[:2]]
+    assert [c["id"] for c in page2] == [c["id"] for c in summary[2:]]
+    # offset without limit also works.
+    assert [c["id"] for c in list_charge_onboarding_queue(conn, offset=1)] == [c["id"] for c in full[1:]]
+
+
 def test_record_decision_rejects_apply_in_first_slice(tmp_path):
     conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[AMEX], transactions=GAULT_AMEX_ROWS)
     scan_charge_onboarding_candidates(conn)

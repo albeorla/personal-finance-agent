@@ -223,9 +223,13 @@ def list_obligations(
     conn: sqlite3.Connection,
     *,
     obligation_id: str | None = None,
+    name_contains: str | None = None,
     kind: str | None = None,
     status: str | None = "active",
     include_instances: bool = True,
+    instances_start: date | str | None = None,
+    instances_through: date | str | None = None,
+    instances_summary: bool = False,
     compact: bool = False,
 ) -> list[dict[str, Any]]:
     ensure_app_schema(conn)
@@ -236,6 +240,10 @@ def list_obligations(
         # pull one inactive/superseded row without dumping the whole roster).
         where.append("id = ?")
         params.append(obligation_id)
+    if name_contains is not None:
+        where.append("(name LIKE ? OR id LIKE ?)")
+        pattern = f"%{name_contains}%"
+        params.extend([pattern, pattern])
     if kind is not None:
         where.append("kind = ?")
         params.append(kind)
@@ -265,7 +273,13 @@ def list_obligations(
             "amount_discretionary": bool(row["amount_discretionary"]),
         }
         if include_instances:
-            obligation["instances"] = _instances_for_obligation(conn, row["id"])
+            obligation["instances"] = _instances_for_obligation(
+                conn,
+                row["id"],
+                start_date=instances_start,
+                through_date=instances_through,
+                summary=instances_summary,
+            )
         if compact:
             obligation = _compact_obligation(obligation)
         result.append(obligation)
@@ -349,6 +363,9 @@ def list_statement_input_estimates(
     start_date: date | str | None = None,
     through_date: date | str | None = None,
     status: str | None = "expected",
+    limit: int | None = None,
+    offset: int | None = None,
+    summary: bool = False,
 ) -> list[dict[str, Any]]:
     ensure_app_schema(conn)
     where = ["oi.cash_flow_treatment = 'card_statement_input'"]
@@ -365,6 +382,10 @@ def list_statement_input_estimates(
     if status is not None:
         where.append("oi.status = ?")
         params.append(status)
+
+    # LIMIT -1 = unlimited in SQLite, so offset works without a limit.
+    paging = " LIMIT ? OFFSET ?"
+    params.extend([limit if limit is not None else -1, offset or 0])
 
     rows = conn.execute(
         f"""
@@ -388,10 +409,23 @@ def list_statement_input_estimates(
         JOIN obligations o ON o.id = oi.obligation_id
         WHERE {" AND ".join(where)}
           AND o.status = 'active'
-        ORDER BY oi.due_date, oi.id
+        ORDER BY oi.due_date, oi.id{paging}
         """,
         params,
     ).fetchall()
+    if summary:
+        return [
+            {
+                "instance_id": row["instance_id"],
+                "obligation_name": row["obligation_name"],
+                "due_date": row["due_date"],
+                "amount": round(float(row["amount"]), 2),
+                "status": row["status"],
+                "confidence": row["confidence"],
+                "statement_target_obligation_id": row["statement_target_obligation_id"],
+            }
+            for row in rows
+        ]
     return [
         {
             "instance_id": row["instance_id"],
@@ -1335,21 +1369,51 @@ def _normalize_instance(
     }
 
 
-def _instances_for_obligation(conn: sqlite3.Connection, obligation_id: str) -> list[dict[str, Any]]:
+def _instances_for_obligation(
+    conn: sqlite3.Connection,
+    obligation_id: str,
+    *,
+    start_date: date | str | None = None,
+    through_date: date | str | None = None,
+    summary: bool = False,
+) -> list[dict[str, Any]]:
+    where = ["obligation_id = ?", "status NOT IN ('deleted', 'canceled')"]
+    params: list[Any] = [obligation_id]
+    if start_date is not None:
+        where.append("due_date >= ?")
+        params.append(_coerce_date(start_date).isoformat())
+    if through_date is not None:
+        where.append("due_date <= ?")
+        params.append(_coerce_date(through_date).isoformat())
     rows = conn.execute(
-        """
+        f"""
         SELECT
             id, due_date, amount, direction, status, source, confidence, notes,
             amount_status, amount_source, amount_observed_at, statement_close_date,
             review_after, estimation_method, estimation_inputs_json,
             cash_flow_treatment, statement_target_obligation_id
         FROM obligation_instances
-        WHERE obligation_id = ?
-          AND status NOT IN ('deleted', 'canceled')
+        WHERE {" AND ".join(where)}
         ORDER BY due_date, id
         """,
-        (obligation_id,),
+        params,
     ).fetchall()
+    if summary:
+        # Compact per-row shape for the tool layer: the fields a session needs to
+        # reason about a bill, without the estimation provenance blobs.
+        return [
+            {
+                "id": row["id"],
+                "due_date": row["due_date"],
+                "amount": round(float(row["amount"]), 2),
+                "direction": row["direction"],
+                "status": row["status"],
+                "confidence": row["confidence"],
+                "amount_status": row["amount_status"],
+                "cash_flow_treatment": row["cash_flow_treatment"],
+            }
+            for row in rows
+        ]
     return [
         {
             "id": row["id"],

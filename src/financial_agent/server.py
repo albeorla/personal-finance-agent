@@ -41,6 +41,7 @@ from .background import (
 )
 from .digest import build_daily_digest as build_daily_digest_for_db
 from .digest import render_digest_markdown as render_digest_markdown_for_db
+from .digest import summarize_daily_digest as summarize_daily_digest_for_db
 from .verification import (
     list_verification_findings as list_verification_findings_for_db,
     run_verification as run_verification_for_db,
@@ -841,19 +842,25 @@ def suppress_contradicted_estimates(
 @mcp.tool()
 def list_obligations(
     obligation_id: str | None = None,
+    name_contains: str | None = None,
     kind: str | None = None,
     status: str | None = "active",
     include_instances: bool = True,
+    instances_start: str | None = None,
+    instances_through: str | None = None,
     compact: bool = False,
+    full: bool = False,
     db_path: str | None = None,
 ) -> dict:
     """List local canonical obligations and optionally their dated instances.
 
-    Pass obligation_id to fetch just one obligation (any status) instead of the
-    whole roster - the laziest way to inspect/edit a single bill without dumping
-    everything. Set compact=True to replace each obligation's instances array with
-    an instance_count, keeping the response small enough for the model context
-    while preserving obligation metadata.
+    Pass obligation_id to fetch just one obligation (any status), or
+    name_contains to substring-match on name/id, instead of dumping the whole
+    roster. instances_start/instances_through (YYYY-MM-DD) window the instances
+    by due date - prefer a window whenever include_instances is true. Instance
+    rows are compact by default (due date, amount, status, confidence); set
+    full=true for estimation provenance and notes. Set compact=True to replace
+    each obligation's instances array with an instance_count.
     """
 
     import sqlite3
@@ -865,9 +872,13 @@ def list_obligations(
         return _list_result(list_obligations_for_db(
             conn,
             obligation_id=obligation_id,
+            name_contains=name_contains,
             kind=kind,
             status=status,
             include_instances=include_instances,
+            instances_start=instances_start,
+            instances_through=instances_through,
+            instances_summary=not full,
             compact=compact,
         ))
     finally:
@@ -902,9 +913,16 @@ def list_statement_input_estimates(
     start_date: str | None = None,
     through_date: str | None = None,
     status: str | None = "expected",
+    limit: int | None = None,
+    offset: int | None = None,
+    full: bool = False,
     db_path: str | None = None,
 ) -> dict:
-    """List card-spend inputs that feed future statement estimates without directly reducing checking."""
+    """List card-spend inputs that feed future statement estimates without
+    directly reducing checking. Rows are compact by default (instance id,
+    obligation, due date, amount, status, confidence); set full=true for
+    estimation provenance and notes. Use limit/offset to page.
+    """
 
     import sqlite3
 
@@ -918,6 +936,9 @@ def list_statement_input_estimates(
             start_date=start_date,
             through_date=through_date,
             status=status,
+            limit=limit,
+            offset=offset,
+            summary=not full,
         ))
     finally:
         conn.close()
@@ -985,14 +1006,19 @@ def scan_charge_onboarding_candidates(
 def list_charge_onboarding_queue(
     status: str | None = None,
     limit: int | None = None,
+    offset: int | None = None,
     include_resolved: bool = False,
+    full: bool = False,
     db_path: str | None = None,
 ) -> dict:
     """List charge-onboarding candidates ordered by estimated monthly cash impact.
 
     By default returns only the active queue (candidates still awaiting a
-    decision). Pass status to filter exactly, or include_resolved=True to see
-    decided/paused candidates such as deferred or rejected ones.
+    decision) as compact rows (id, merchant, amount, cadence, confidence,
+    status). Set full=true for evidence transactions, policies, and notes -
+    prefer full=true only with a small limit. Use limit/offset to page. Pass
+    status to filter exactly, or include_resolved=True to see decided/paused
+    candidates such as deferred or rejected ones.
     """
 
     import sqlite3
@@ -1005,7 +1031,9 @@ def list_charge_onboarding_queue(
             conn,
             status=status,
             limit=limit,
+            offset=offset,
             include_resolved=include_resolved,
+            summary=not full,
         ))
     finally:
         conn.close()
@@ -2254,12 +2282,14 @@ def run_live_validation(
 def get_daily_digest(
     as_of_date: str | None = None,
     windows: list[int] | None = None,
-    render_markdown: bool = True,
+    verbose: bool = False,
     db_path: str | None = None,
 ) -> dict:
-    """The daily finance summary (replaces `just daily`): balances, cash-flow
-    projection, upcoming obligations, drift/review items, recurring candidates,
-    and guardrail status, each with provenance. Set render_markdown for a
+    """The daily finance summary (replaces `just daily`). Default is a compact
+    summary: working cash + balance one-liners, source freshness, next-14d
+    obligations, projection window endpoints with trough bands, guardrail/
+    drift/match alerts, and queue counts. Set verbose=true for the full
+    payload (all events, finding bodies, recurring candidate detail) plus a
     cash-flow.md-style narrative under the 'markdown' key. Read-only.
     """
 
@@ -2269,9 +2299,10 @@ def get_daily_digest(
         as_of_date=as_of_date,
         windows=tuple(windows) if windows else (7, 14, 30, 60),
     )
-    if render_markdown:
+    if verbose:
         digest["markdown"] = render_digest_markdown_for_db(digest)
-    return digest
+        return digest
+    return summarize_daily_digest_for_db(digest)
 
 
 @mcp.tool()

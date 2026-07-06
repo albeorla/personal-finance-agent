@@ -775,13 +775,16 @@ def list_charge_onboarding_queue(
     *,
     status: str | None = None,
     limit: int | None = None,
+    offset: int | None = None,
     include_resolved: bool = False,
+    summary: bool = False,
 ) -> list[dict[str, Any]]:
     """List candidates ordered by estimated monthly cash impact, descending.
 
     By default returns only the active queue (statuses that still want a human
     decision). Pass ``status`` to filter exactly, or ``include_resolved=True``
-    to see decided/paused candidates too.
+    to see decided/paused candidates too. ``summary=True`` returns compact rows
+    (id, merchant, amount, cadence, confidence, status) instead of full detail.
     """
 
     ensure_app_schema(conn)
@@ -799,11 +802,33 @@ def list_charge_onboarding_queue(
     if where:
         query += " WHERE " + " AND ".join(where)
     query += " ORDER BY priority_score DESC, evidence_count DESC, merchant_key ASC"
-    if limit is not None:
-        query += " LIMIT ?"
-        params.append(limit)
+    # LIMIT -1 = unlimited in SQLite, so offset works without a limit.
+    query += " LIMIT ? OFFSET ?"
+    params.extend([limit if limit is not None else -1, offset or 0])
 
-    return [_row_to_candidate(row) for row in conn.execute(query, params).fetchall()]
+    candidates = [_row_to_candidate(row) for row in conn.execute(query, params).fetchall()]
+    if summary:
+        return [_candidate_summary(c) for c in candidates]
+    return candidates
+
+
+def _candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Compact queue row: what a session needs to triage, nothing more."""
+
+    schedule = candidate.get("proposed_schedule_policy") or {}
+    amount_policy = candidate.get("proposed_amount_policy") or {}
+    return {
+        "id": candidate["id"],
+        "merchant": candidate["display_name"],
+        "amount": amount_policy.get("amount"),
+        "cadence": schedule.get("cadence"),
+        "confidence": candidate["confidence"],
+        "status": candidate["status"],
+        "cash_flow_treatment": candidate["cash_flow_treatment"],
+        "evidence_count": candidate["evidence_count"],
+        "priority_score": candidate["priority_score"],
+        "existing_obligation_id": candidate["existing_obligation_id"],
+    }
 
 
 def get_next_charge_onboarding_candidate(conn: sqlite3.Connection) -> dict[str, Any] | None:

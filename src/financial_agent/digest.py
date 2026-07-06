@@ -224,6 +224,108 @@ def _verification_block(db_path: str, as_of_date: str) -> dict[str, Any]:
     }
 
 
+def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
+    """Compact view of a full digest: the numbers a session actually acts on.
+
+    Keeps working cash + per-account one-liners, source freshness, the next-14d
+    obligations, projection window endpoints with trough bands, guardrail/drift/
+    match alerts, and queue counts. Drops the full 60d event list, verification
+    finding bodies, recurring candidate detail, and the markdown - the full
+    payload stays available via get_daily_digest(verbose=true).
+    """
+
+    as_of = digest["as_of_date"]
+    cutoff = (dt.date.fromisoformat(as_of) + dt.timedelta(days=14)).isoformat()
+    bal = digest["balances"]
+    upcoming = digest["upcoming_obligations"]
+    upcoming_14d = [
+        {
+            k: o.get(k)
+            for k in (
+                "due_date", "obligation_name", "amount", "direction",
+                "status", "amount_status", "confidence", "running_balance",
+            )
+        }
+        for o in upcoming
+        if o.get("due_date") and o["due_date"] <= cutoff
+    ]
+    drift = [
+        {
+            "severity": d.get("severity"),
+            "finding_type": d.get("finding_type"),
+            "obligation": (d.get("evidence") or {}).get("obligation_name") or d.get("obligation_id"),
+            "obligation_instance_id": d.get("obligation_instance_id"),
+            "cash_flow_impact": d.get("cash_flow_impact"),
+            "recommended_action": (d.get("recommended_action") or "")[:120],
+        }
+        for d in digest["drift"]
+    ]
+    matches = [
+        {
+            k: m.get(k)
+            for k in (
+                "obligation_instance_id", "obligation_name", "due_date",
+                "amount", "transaction_id",
+            )
+        }
+        for m in digest.get("matches_to_confirm", [])
+    ]
+    verification = digest.get("verification") or {}
+    adversarial = digest.get("adversarial_review") or {}
+    coverage = digest.get("coverage") or {}
+    return {
+        "mode": "summary",
+        "note": "compact digest; call get_daily_digest(verbose=true) for full detail",
+        "as_of_date": as_of,
+        "status_color": digest["status_color"],
+        "status_reason": digest["status_reason"],
+        "balances": {
+            "working_cash": bal.get("working_cash"),
+            "working_account": bal.get("working_account"),
+            "net_across_accounts": bal.get("net_across_accounts"),
+            "liquid_available": bal.get("liquid_available"),
+            "accounts": [
+                {
+                    "name": a.get("name"),
+                    "balance": a.get("balance"),
+                    "available": a.get("available"),
+                    "recorded_at": a.get("recorded_at"),
+                }
+                for a in bal.get("accounts", [])
+            ],
+        },
+        "source_freshness": digest.get("source_freshness"),
+        # Window endpoints + sub-floor trough bands, already compact per window.
+        "cash_flow": digest["cash_flow"],
+        "trough_sensitivity": digest.get("trough_sensitivity"),
+        "upcoming_14d": upcoming_14d,
+        "upcoming_total": len(upcoming),
+        "estimated_material": digest.get("estimated_material", []),
+        "drift": drift,
+        "matches_to_confirm": matches,
+        "guardrails": digest["guardrails"],
+        "warnings": digest.get("warnings"),
+        "coverage": coverage,
+        "queue_counts": {
+            "recurring_candidates": digest.get("recurring_total", 0),
+            "recurring_checking": digest.get("recurring_checking_count", 0),
+            "recurring_checking_monthly": digest.get("recurring_checking_monthly", 0),
+            "matches_to_confirm": len(matches),
+            "recently_cleared_30d": len(digest.get("recently_cleared", [])),
+            "onboarding_active": coverage.get("onboarding_active", 0),
+        },
+        "verification": {
+            k: verification.get(k)
+            for k in ("ok", "checks_total", "findings_total", "by_severity")
+        },
+        "adversarial_review": {
+            k: adversarial.get(k)
+            for k in ("ok", "enabled", "findings_total", "by_severity")
+        },
+        "provenance": {"db_file": (digest.get("provenance") or {}).get("db_file")},
+    }
+
+
 def render_digest_markdown(digest: dict[str, Any]) -> str:
     bal = digest["balances"]
     lines: list[str] = []
