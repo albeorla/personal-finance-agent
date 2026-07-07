@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Auto-bump the patch version on any commit that changes package code.
+
+Why pre-commit and not commit-msg: only the pre-commit hook can stage a file
+that lands in the SAME commit (verified: a `git add` in commit-msg or
+prepare-commit-msg leaves the change dangling as unstaged `M`). pre-commit gets
+no commit message, so message-driven feat/fix bumping is impossible here - hence
+the rule below: patch is automatic, and a hand-edited version (minor/major) is
+respected as-is.
+
+Behavior:
+- No staged file under src/financial_agent/  -> do nothing (docs/test/chore commits do not bump).
+- The version line is already changed in this commit -> do nothing (respect a manual minor/major bump).
+- Otherwise -> increment patch and re-stage __init__.py into this commit.
+
+Never blocks a commit: any parse/IO problem exits 0 with a warning.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+INIT = Path("src/financial_agent/__init__.py")
+PYPROJECT = Path("pyproject.toml")
+INIT_RE = re.compile(r'(__version__\s*=\s*")(\d+)\.(\d+)\.(\d+)(")')
+# pyproject [project].version - anchored to a line start so it does not catch a
+# dependency's version pin elsewhere in the file.
+PYPROJECT_RE = re.compile(r'^(version\s*=\s*")(\d+)\.(\d+)\.(\d+)(")', re.M)
+
+
+def _run(args: list[str]) -> str:
+    return subprocess.run(args, capture_output=True, text=True).stdout
+
+
+def _bump_file(path: Path, pattern: re.Pattern, new: str) -> bool:
+    """Rewrite the version in `path` to `new`. Returns True if it changed."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    m = pattern.search(text)
+    if not m:
+        return False
+    text = text[: m.start()] + f"{m.group(1)}{new}{m.group(5)}" + text[m.end():]
+    path.write_text(text)
+    subprocess.run(["git", "add", "--", str(path)])
+    return True
+
+
+def main() -> int:
+    staged = _run(["git", "diff", "--cached", "--name-only"]).split()
+    if not any(f.startswith("src/financial_agent/") for f in staged):
+        return 0  # no package code changed
+
+    try:
+        text = INIT.read_text()
+    except OSError:
+        return 0
+    m = INIT_RE.search(text)
+    if not m:
+        print("[pre-commit] no __version__ found; skipping bump", file=sys.stderr)
+        return 0
+
+    # Respect a manual bump: if the version line is among this commit's additions
+    # (in either file), leave both alone.
+    init_diff = _run(["git", "diff", "--cached", "--", str(INIT)])
+    pyproject_diff = _run(["git", "diff", "--cached", "--", str(PYPROJECT)])
+    if re.search(r"^\+.*__version__", init_diff, re.M) or re.search(r"^\+version\s*=", pyproject_diff, re.M):
+        return 0
+
+    major, minor, patch = int(m.group(2)), int(m.group(3)), int(m.group(4))
+    new = f"{major}.{minor}.{patch + 1}"
+    _bump_file(INIT, INIT_RE, new)
+    _bump_file(PYPROJECT, PYPROJECT_RE, new)  # keep pyproject in lockstep
+    print(f"[pre-commit] version bumped -> {new}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
