@@ -115,7 +115,7 @@ def _add_whole_foods(conn):
 
     conn.execute(
         "INSERT INTO accounts (id,name,org,kind,currency) VALUES "
-        "('ACT-amex','Platinum Card (5000)','American Express','','USD')"
+        "('ACT-amex','Platinum Card (4328)','American Express','','USD')"
     )
     conn.executemany(
         "INSERT INTO transactions (id,account_id,posted,amount,payee,description,pending,source) "

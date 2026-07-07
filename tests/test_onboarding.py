@@ -41,9 +41,9 @@ from financial_agent.schema import ensure_app_schema
 
 # Account fixtures mirror the real copied database, where account.kind is empty
 # and class must be inferred from name/org.
-AMEX = ("ACT-amex", "Platinum Card® (5000)", "American Express", "", "USD")
+AMEX = ("ACT-amex", "Platinum Card® (4328)", "American Express", "", "USD")
 CHECKING = ("ACT-chk", "PREMIER PLUS CKG (4321)", "Chase Bank", "", "USD")
-SAVINGS = ("ACT-sav", "PREMIER SAVINGS (6175)", "Chase Bank", "", "USD")
+SAVINGS = ("ACT-sav", "PREMIER SAVINGS (4323)", "Chase Bank", "", "USD")
 
 GAULT_AMEX_ROWS = [
     ("gault-1", "ACT-amex", "2026-01-15T08:00:00", -532.10, "Gault Energy", "GAULT ENERGY & HOME 203-2275181 CT"),
@@ -178,11 +178,11 @@ def test_cadence_needs_three_consistent_intervals():
 
 def test_account_class_infers_from_name_and_org_when_kind_empty():
     assert account_class({"name": "PREMIER PLUS CKG (4321)", "org": "Chase Bank", "kind": ""}) == "checking"
-    assert account_class({"name": "PREMIER SAVINGS (6175)", "org": "Chase Bank", "kind": ""}) == "savings"
-    assert account_class({"name": "Platinum Card® (5000)", "org": "American Express", "kind": ""}) == "card"
+    assert account_class({"name": "PREMIER SAVINGS (4323)", "org": "Chase Bank", "kind": ""}) == "savings"
+    assert account_class({"name": "Platinum Card® (4328)", "org": "American Express", "kind": ""}) == "card"
     assert account_class({"name": "Owner", "org": "Apple Card (Updated Monthly)", "kind": ""}) == "card"
-    assert account_class({"name": "Personal Loan (1004)", "org": "American Express", "kind": ""}) == "loan"
-    assert account_class({"name": "PCRA Trust ...746 (746)", "org": "Charles Schwab US", "kind": ""}) == "investment"
+    assert account_class({"name": "Personal Loan (4327)", "org": "American Express", "kind": ""}) == "loan"
+    assert account_class({"name": "PCRA Trust ...4326 (4326)", "org": "Charles Schwab US", "kind": ""}) == "investment"
     assert account_class({"name": "Mystery Wallet", "org": "Unknown Fintech", "kind": ""}) == "other"
 
 
@@ -607,7 +607,7 @@ def test_record_decision_supports_multi_step_transitions(tmp_path):
 
 
 def test_investment_and_other_accounts_become_review_only(tmp_path):
-    schwab = ("ACT-pcra", "PCRA Trust ...746 (746)", "Charles Schwab US", "", "USD")
+    schwab = ("ACT-pcra", "PCRA Trust ...4326 (4326)", "Charles Schwab US", "", "USD")
     rows = [
         ("sch-1", "ACT-pcra", "2026-03-15T08:00:00", -250.00, "Advisory Fee", "ADVISORY FEE"),
         ("sch-2", "ACT-pcra", "2026-04-15T08:00:00", -250.00, "Advisory Fee", "ADVISORY FEE"),

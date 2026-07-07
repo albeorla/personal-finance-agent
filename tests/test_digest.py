@@ -65,7 +65,7 @@ def test_build_daily_digest_composes_grounded_status(tmp_path):
 def test_account_label_appends_org_when_name_uninformative():
     from financial_agent.digest import _account_label
     assert _account_label({"name": "Owner", "org": "Apple Card (Updated Monthly)"}) == "Owner [Apple Card (Updated Monthly)]"
-    assert _account_label({"name": "American Express Gold Card (5000)", "org": "American Express"}) == "American Express Gold Card (5000)"
+    assert _account_label({"name": "American Express Gold Card (4328)", "org": "American Express"}) == "American Express Gold Card (4328)"
 
 
 def test_liquid_available_excludes_card_negative_available(tmp_path):
@@ -128,7 +128,7 @@ def test_net_worth_includes_card_debt_not_just_available(tmp_path):
     # the digest must NOT report a positive "net" from summing `available`.
     db = _status_db(tmp_path / "d.sqlite", available=3000.0)
     conn = sqlite3.connect(db)
-    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('card','Amex Gold (5000)','American Express','credit card','USD')")
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('card','Amex Gold (4328)','American Express','credit card','USD')")
     conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('card',-4000.0,0.0,'2026-06-20T00:00:00+00:00','simplefin')")
     conn.commit()
     conn.close()
@@ -138,7 +138,7 @@ def test_net_worth_includes_card_debt_not_just_available(tmp_path):
     assert digest["balances"]["liquid_available"] == 3000.0
     md = render_digest_markdown(digest, verbose=True)
     assert "Net across all accounts (incl. card debt): $-1,000.00" in md
-    assert "Amex Gold (5000)" in md and "$-4,000.00" in md  # the card shows its real debt, not $0.00
+    assert "Amex Gold (4328)" in md and "$-4,000.00" in md  # the card shows its real debt, not $0.00
 
 
 def test_status_color_red_when_below_cash_floor(tmp_path):

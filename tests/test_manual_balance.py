@@ -530,7 +530,7 @@ def test_set_manual_balance_keeps_manual_rows_from_other_dates(tmp_path):
 
 def test_set_manual_balance_substring_match_scores_high(tmp_path):
     db_path = tmp_path / "transactions.sqlite"
-    _build_db(db_path, accounts=[("sav-1", "Savings 6175", "Chase")])
+    _build_db(db_path, accounts=[("sav-1", "Savings 4323", "Chase")])
 
     conn = _connect(db_path)
     result = set_manual_balance(conn, "savings", 10000.0, "2026-06-20")
@@ -546,8 +546,8 @@ def test_set_manual_balance_org_tie_when_names_equal_is_ambiguous(tmp_path):
     _build_db(
         db_path,
         accounts=[
-            ("chase-card", "Card (5000)", "Chase"),
-            ("amex-card", "Card (5000)", "Amex"),
+            ("chase-card", "Card (4328)", "Chase"),
+            ("amex-card", "Card (4328)", "Amex"),
         ],
     )
 
