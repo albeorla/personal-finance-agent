@@ -24,7 +24,7 @@ from .obligations import list_obligations
 from .onboarding import ACTIVE_STATUSES
 from .reconciliation import list_reconciliation_review_items
 from .status import default_db_path, get_finance_status
-from .surface_queue import MANUAL_DUE_LEAD_DAYS, _manual_obligation_due_rows
+from .surface_queue import MANUAL_DUE_LEAD_DAYS, _manual_obligation_due_rows, build_surface_items
 
 # #7 sensitivity: per-confidence-tier downside fraction used when a per-instance
 # coefficient-of-variation (cv) is not available on the estimate. very_low/null
@@ -298,9 +298,26 @@ def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
     verification = digest.get("verification") or {}
     adversarial = digest.get("adversarial_review") or {}
     coverage = digest.get("coverage") or {}
+    # No working cash means no balance data (e.g. an app-only DB with no sync yet):
+    # there is no health read to compose, so headline is None and the proactive
+    # "Finance status" surface item is skipped rather than emitting a degenerate one.
+    if bal.get("working_cash") is None:
+        headline = None
+    else:
+        headline_parts = [f"{digest['status_color']}: {digest.get('status_reason', '')}"]
+        if (digest.get("trough_sensitivity") or {}).get("breach_risk"):
+            trough_line = _trough_sensitivity_line(digest)
+            if trough_line:
+                headline_parts.append(trough_line)
+        if bal.get("working_account_balance_date_stale"):
+            headline_parts.append(
+                f"working account balance is {bal.get('working_account_balance_age_days')} days stale"
+            )
+        headline = " | ".join(headline_parts)
     return {
         "mode": "summary",
         "note": "compact digest; call get_daily_digest(verbose=true) for full detail",
+        "headline": headline,
         "as_of_date": as_of,
         "status_color": digest["status_color"],
         "status_reason": digest["status_reason"],
@@ -357,29 +374,19 @@ def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def render_digest_markdown(digest: dict[str, Any]) -> str:
-    bal = digest["balances"]
+def render_digest_markdown(digest: dict[str, Any], verbose: bool = False) -> str:
     lines: list[str] = []
-    lines.append(f"# Finance Daily Digest - {digest['as_of_date']}")
+    _render_headline(digest, lines)
+    _render_do_this_today(digest, lines)
     lines.append("")
-    lines.append(
-        f"Cash runway (modeled bills only): {digest['status_color']} - {digest.get('status_reason', '')}"
-    )
+    _render_watch(digest, lines)
+    if not verbose:
+        return "\n".join(lines)
+
     lines.append("")
     _render_coverage(digest.get("coverage"), lines)
-    if digest.get("recurring_checking_count"):
-        # These genuinely lower the runway and are NOT in the projection.
-        eg = digest.get("recurring_checking_top")
-        eg_txt = f", e.g. {eg}" if eg else ""
-        lines.append(f"_WARNING: {digest['recurring_checking_count']} unmodeled recurring CHECKING charges (~${_money(digest.get('recurring_checking_monthly'))}/mo{eg_txt}) are NOT in the projection and will lower the runway - review and apply them below. (Of {digest['recurring_total']} recurring discovered; most are card spend - only partly captured by the modeled statement payments.)_")
-    elif digest.get("recurring_total"):
-        lines.append(f"_Note: {digest['recurring_total']} recurring charges are discovered but not yet modeled (mostly card spend; only the modeled card statement payments are in the projection). See below._")
-    est = digest.get("estimated_material", [])
-    if est:
-        names = ", ".join(f"{e['obligation_name']} ~${_money(e['amount'])}" for e in est[:3])
-        lines.append(f"_CAUTION: the runway leans on ESTIMATED bills whose real amount varies month to month ({names}). Actual may be higher - confirm before trusting the headroom._")
-    lines.append("")
 
+    bal = digest["balances"]
     lines.append("## Balances")
     working_stale = ""
     if bal.get("working_account_balance_date_stale"):
@@ -486,6 +493,94 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_headline(digest: dict[str, Any], lines: list[str]) -> None:
+    lines.append(f"# Finance Daily Digest - {digest['as_of_date']}")
+    lines.append("")
+    lines.append(
+        f"Cash runway (modeled bills only): {digest['status_color']} - {digest.get('status_reason', '')}"
+    )
+    lines.append("")
+    if digest.get("recurring_checking_count"):
+        # These genuinely lower the runway and are NOT in the projection.
+        eg = digest.get("recurring_checking_top")
+        eg_txt = f", e.g. {eg}" if eg else ""
+        lines.append(f"_WARNING: {digest['recurring_checking_count']} unmodeled recurring CHECKING charges (~${_money(digest.get('recurring_checking_monthly'))}/mo{eg_txt}) are NOT in the projection and will lower the runway - review and apply them below. (Of {digest['recurring_total']} recurring discovered; most are card spend - only partly captured by the modeled statement payments.)_")
+    elif digest.get("recurring_total"):
+        lines.append(f"_Note: {digest['recurring_total']} recurring charges are discovered but not yet modeled (mostly card spend; only the modeled card statement payments are in the projection). See below._")
+    est = digest.get("estimated_material", [])
+    if est:
+        names = ", ".join(f"{e['obligation_name']} ~${_money(e['amount'])}" for e in est[:3])
+        lines.append(f"_CAUTION: the runway leans on ESTIMATED bills whose real amount varies month to month ({names}). Actual may be higher - confirm before trusting the headroom._")
+    lines.append("")
+
+
+def _render_do_this_today(digest: dict[str, Any], lines: list[str]) -> None:
+    lines.append("## Do this today")
+    manual_due = _manual_due_surface_items(digest)
+    if manual_due:
+        for item in manual_due:
+            description = (item.get("description") or "").strip()
+            suffix = f" - {description}" if description else ""
+            lines.append(f"- {item.get('content')}{suffix}")
+    else:
+        lines.append("- nothing manual due today")
+
+    for m in digest.get("matches_to_confirm", []):
+        lines.append(f"- {m['due_date']}  {m['obligation_name']} ${_money(m['amount'])} <- txn {m['transaction_id']} (score {m['match_score']}, {m['match_type']})")
+
+    if digest.get("status_color") == "RED":
+        lines.append(f"- RED: {digest.get('status_reason', '')}")
+    elif (digest.get("trough_sensitivity") or {}).get("breach_risk"):
+        lines.append(f"- CAUTION: {digest.get('status_reason', '')}")
+
+
+def _render_watch(digest: dict[str, Any], lines: list[str]) -> None:
+    lines.append("## Watch")
+    items: list[str] = []
+    trough = _trough_sensitivity_line(digest)
+    if trough:
+        items.append(trough)
+
+    for source, value in (digest.get("source_freshness") or {}).items():
+        status = value.get("status") if isinstance(value, dict) else value
+        if status and str(status).lower() not in {"ok", "fresh"}:
+            items.append(f"{source}: {status}")
+
+    if ((digest.get("coverage") or {}).get("board_health") or {}).get("apple_card_stale"):
+        items.append("Apple Card spend has not been pasted this cycle.")
+
+    bal = digest.get("balances") or {}
+    if bal.get("working_account_balance_date_stale"):
+        age = bal.get("working_account_balance_age_days")
+        day = bal.get("working_account_balance_date")
+        date_text = f" ({day})" if day else ""
+        items.append(f"Working account balance date is {age} days old{date_text}.")
+
+    if not items:
+        lines.append("- nothing stale")
+        return
+    for item in items:
+        lines.append(f"- {item}")
+
+
+def _manual_due_surface_items(digest: dict[str, Any]) -> list[dict[str, Any]]:
+    db_path = (digest.get("provenance") or {}).get("db_file")
+    if not db_path:
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            item
+            for item in build_surface_items(conn, as_of_date=digest["as_of_date"])
+            if str(item.get("surface_key", "")).startswith("obligation-due:")
+        ]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
 def _render_coverage(cov: dict[str, Any] | None, lines: list[str]) -> None:
     """The ## Coverage block: leads with the human consequence (autopay = "no
     action", surfaced = "will appear in Todoist", board = clean vs needs you)."""
@@ -567,32 +662,38 @@ def _render_trough_sensitivity(digest: dict[str, Any], lines: list[str]) -> None
     ts = digest.get("trough_sensitivity")
     if not ts or not ts.get("drivers"):
         return
-    window_days = digest["cash_flow"][-1]["window_days"] if digest["cash_flow"] else None
-    low = ts["lowest_balance"]
-    lo, hi = ts["low_estimate"], ts["high_estimate"]
-    breach = ts.get("breach_risk")
-    prefix = "CAUTION: " if breach else ""
-    lines.append(
-        f"{prefix}Trough sensitivity ({window_days}d): low point ${_money(low)} could land "
-        f"between ~${_money(lo)} and ~${_money(hi)}."
-    )
+    lines.append(_trough_sensitivity_line(digest) or "")
     drivers = ts["drivers"]
     names = ", ".join(f"{d['obligation_name']} ~${_money(d['amount'])} est" for d in drivers)
     noun = "bill" if len(drivers) == 1 else "bills"
     lines.append(f"The soft part is {len(drivers)} estimated {noun} before that date ({names}).")
-    lines.append(f"If those run high, the low point drops to ~${_money(lo)}.")
+    lines.append(f"If those run high, the low point drops to ~${_money(ts['low_estimate'])}.")
 
     # Per-driver counterfactual: the single largest driver running hot, holding
     # the rest at their modeled value. Only this driver moves the trough depth,
     # not its date (same event set).
     d0 = drivers[0]
-    recomputed_low = round(low - d0["downside"], 2)
+    recomputed_low = round(ts["lowest_balance"] - d0["downside"], 2)
     one_breach = recomputed_low < CASH_FLOOR or recomputed_low < 0
     cprefix = "CAUTION: " if one_breach else ""
     lines.append(
         f"{cprefix}Biggest single swing: if {d0['obligation_name']} comes in ~${_money(d0['downside'])} "
         f"higher than estimated, the low point alone drops to ~${_money(recomputed_low)} "
         f"on {ts['lowest_balance_date']}."
+    )
+
+
+def _trough_sensitivity_line(digest: dict[str, Any]) -> str | None:
+    ts = digest.get("trough_sensitivity")
+    if not ts or not ts.get("drivers"):
+        return None
+    window_days = digest["cash_flow"][-1]["window_days"] if digest["cash_flow"] else None
+    low = ts["lowest_balance"]
+    lo, hi = ts["low_estimate"], ts["high_estimate"]
+    prefix = "CAUTION: " if ts.get("breach_risk") else ""
+    return (
+        f"{prefix}Trough sensitivity ({window_days}d): low point ${_money(low)} could land "
+        f"between ~${_money(lo)} and ~${_money(hi)}."
     )
 
 
@@ -936,6 +1037,21 @@ def _status_color(digest: dict[str, Any]) -> tuple[str, str]:
     """Return (color, reason). The reason names WHY, so a reader can tell a cash
     danger (RED: dip below the floor) from a review chore (YELLOW: reconcile drift)
     without the color alone carrying both meanings."""
+    # A stale working (checking) balance (WORKING_BALANCE_STALE_DAYS in
+    # status.py, tighter than the general per-account threshold) means every
+    # RED/YELLOW gate below - lowest_balance < 0, trough estimate < 0, the
+    # cash_floor guardrail - is reading a possibly feed-lagged number. Cap the
+    # headline at YELLOW and name it, instead of alarming on a stale balance.
+    bal = digest.get("balances", {})
+    if bal.get("working_account_balance_date_stale"):
+        age = bal.get("working_account_balance_age_days")
+        as_of_suffix = f" (as of {bal['working_account_balance_date']})" if bal.get("working_account_balance_date") else ""
+        return (
+            "YELLOW",
+            f"working balance is {age} days stale{as_of_suffix}; the low point may be "
+            "a feed-lag artifact - confirm the live balance before trusting this.",
+        )
+
     findings = [g for g in digest["guardrails"] if not g.get("advisory")]
     severities = {g["severity"] for g in findings}
     rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}

@@ -14,6 +14,7 @@ import pytest
 from financial_agent.statements import (
     _min_confidence,
     aggregate_statement_inputs,
+    get_statement_status,
     list_statement_cycles,
     recompute_statement_estimates,
     set_statement_actual,
@@ -178,6 +179,69 @@ def test_recompute_with_zero_baseline_warns(tmp_path):
         "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
     ).fetchone()
     assert august["amount"] == 600.0  # only the modeled card input
+
+
+# --- get_statement_status: current portal-read plus open-cycle pace ----------
+
+
+def test_get_statement_status_inside_open_cycle(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+
+    status = get_statement_status(
+        conn, obligation_id="amex_statement_payment", as_of_date="2026-07-10"
+    )
+
+    assert status["obligation_id"] == "amex_statement_payment"
+    assert status["as_of_date"] == "2026-07-10"
+    assert status["closed_statement"] == {
+        "statement_instance_id": "amex_statement_payment:2026-07-16",
+        "cycle_close_date": "2026-06-21",
+        "amount": 5400.0,
+        "amount_status": "estimated",
+        "amount_source": "portal_current_balance_estimate",
+        "due_date": "2026-07-16",
+    }
+    assert status["open_cycle"] == {
+        "cycle_open_date": "2026-06-22",
+        "cycle_close_date": "2026-07-21",
+        "spend_so_far": 600.0,
+        "input_count": 1,
+        "confidence": "low",
+    }
+    assert status["modeled_amount_for_open_cycle"] == {
+        "amount": 6000.0,
+        "amount_status": "estimated",
+        "amount_source": "manual_projection",
+    }
+    assert status["variance"] == 5400.0
+    assert status["on_track"] == "ahead"
+
+
+def test_get_statement_status_before_any_statement_closes(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+
+    status = get_statement_status(
+        conn, obligation_id="amex_statement_payment", as_of_date="2026-06-01"
+    )
+
+    assert status["closed_statement"] is None
+    assert "no statement cycle closes on or before as_of_date" in status["notes"]
+
+
+def test_get_statement_status_is_idempotent(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+
+    first = get_statement_status(
+        conn, obligation_id="amex_statement_payment", as_of_date="2026-07-10"
+    )
+    second = get_statement_status(
+        conn, obligation_id="amex_statement_payment", as_of_date="2026-07-10"
+    )
+
+    assert second == first
 
 
 # --- set_statement_actual: the portal-reading direct-entry path -------------
