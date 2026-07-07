@@ -104,7 +104,7 @@ def test_estimated_amount_marked_in_render(tmp_path):
     conn.execute("UPDATE obligation_instances SET amount_status='estimated' WHERE id='amex:2026-07-16'")
     conn.commit()
     conn.close()
-    assert "(est)" in render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"))
+    assert "(est)" in render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"), verbose=True)
 
 
 def test_status_render_uses_cash_runway_label(tmp_path):
@@ -136,7 +136,7 @@ def test_net_worth_includes_card_debt_not_just_available(tmp_path):
     digest = build_daily_digest(db, as_of_date="2026-06-20")
     assert digest["balances"]["net_across_accounts"] == -1000.0   # 3000 cash - 4000 card debt
     assert digest["balances"]["liquid_available"] == 3000.0
-    md = render_digest_markdown(digest)
+    md = render_digest_markdown(digest, verbose=True)
     assert "Net across all accounts (incl. card debt): $-1,000.00" in md
     assert "Amex Gold (5000)" in md and "$-4,000.00" in md  # the card shows its real debt, not $0.00
 
@@ -165,7 +165,7 @@ def test_balance_freshness_stamp_renders(tmp_path):
     # each account carries its snapshot recorded_at (structured)...
     assert all("recorded_at" in a for a in digest["balances"]["accounts"])
     # ...and the markdown stamps how old each balance is, so a stale feed is visible
-    assert "as of" in render_digest_markdown(digest)
+    assert "as of" in render_digest_markdown(digest, verbose=True)
 
 
 def test_stale_simplefin_balance_date_warns_even_when_sync_succeeds(tmp_path):
@@ -189,7 +189,7 @@ def test_stale_simplefin_balance_date_warns_even_when_sync_succeeds(tmp_path):
     assert digest["balances"]["working_account_balance_age_days"] == 4
     assert digest["balances"]["working_account_balance_date_stale"] is True
     assert any("Working account balance date is 4 days old" in w for w in digest["warnings"])
-    md = render_digest_markdown(digest)
+    md = render_digest_markdown(digest, verbose=True)
     assert "WARNING: balance date is 4 days old" in md
 
 
@@ -202,11 +202,54 @@ def test_render_markdown_has_sections_and_numbers(tmp_path):
     db = _status_db(tmp_path / "d.sqlite", available=9000.0, obligations=[
         ("rent", "Rent check", "housing", [{"id": "rent:2026-07-03", "due_date": "2026-07-03", "amount": -3000.0, "source": "seed"}]),
     ])
-    md = render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"))
+    md = render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"), verbose=True)
     assert "# Finance Daily Digest - 2026-06-20" in md
     assert "## Balances" in md and "## Cash-Flow Projection" in md and "## Upcoming Obligations" in md
     assert "9,000.00" in md and "Rent check" in md
     assert "Provenance:" in md
+
+
+def test_render_markdown_default_is_action_digest(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0)
+    conn = sqlite3.connect(db)
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "manual",
+            "name": "Manual bill",
+            "kind": "utility",
+            "status": "active",
+            "source": "seed",
+            "autopay": False,
+        },
+        instances=[
+            {
+                "id": "manual:2026-06-20",
+                "due_date": "2026-06-20",
+                "amount": -125.0,
+                "source": "seed",
+            }
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    md = render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"))
+
+    assert "## Do this today" in md
+    assert "## Watch" in md
+    assert "Action:" in md
+    assert "## Balances" not in md
+    assert "Provenance:" not in md
+
+
+def test_render_markdown_verbose_keeps_action_and_full_digest(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0)
+
+    md = render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"), verbose=True)
+
+    assert "## Do this today" in md
+    assert "## Balances" in md
 
 
 def test_upcoming_obligations_match_longest_projection(tmp_path):
@@ -267,3 +310,39 @@ def test_auto_match_is_cleared_not_awaiting_confirmation(tmp_path):
     assert "TRN-r" in cleared
     assert "TRN-r" not in confirm
     assert not (cleared & confirm)  # no payment double-listed
+
+
+def test_status_color_capped_yellow_when_working_balance_stale_even_below_floor(tmp_path):
+    """A working (checking) balance that is 2 days stale - over the working
+    account's 1-day bar - must not alarm RED off a cash-floor breach computed
+    on that stale number; it caps at YELLOW and names the staleness."""
+    db = _status_db(
+        tmp_path / "d.sqlite",
+        available=1000.0,  # below the $2,500 floor
+        recorded_at="2026-06-18T00:00:00+00:00",
+        sync_started_at="2026-06-20T09:58:00+00:00",
+        sync_finished_at="2026-06-20T10:00:00+00:00",
+    )
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+
+    assert digest["balances"]["working_account_balance_date_stale"] is True
+    assert digest["balances"]["working_account_balance_age_days"] == 2
+    assert digest["status_color"] == "YELLOW"
+    assert "2 days stale" in digest["status_reason"]
+    assert "confirm the live balance" in digest["status_reason"]
+
+
+def test_status_color_not_capped_when_working_balance_is_one_day_old(tmp_path):
+    """A 1-day-old working balance is at the bar, not over it - stays fresh, so
+    a real floor breach still reads RED (regression guard on the >1 boundary)."""
+    db = _status_db(
+        tmp_path / "d.sqlite",
+        available=1000.0,  # below the $2,500 floor
+        recorded_at="2026-06-19T00:00:00+00:00",
+        sync_started_at="2026-06-20T09:58:00+00:00",
+        sync_finished_at="2026-06-20T10:00:00+00:00",
+    )
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+
+    assert digest["balances"]["working_account_balance_date_stale"] is False
+    assert digest["status_color"] == "RED"

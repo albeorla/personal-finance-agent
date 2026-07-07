@@ -15,7 +15,9 @@ Sources combined (priority high -> low within a severity tier):
    (``list_obligation_review_candidates``).
 4. Snapshot refreshes - balance-only accounts (slow feeds like the Apple Card)
    whose latest balance snapshot is older than one statement cycle (~30 days).
-5. Guardrail trips - cash-floor / drift / window-age findings
+5. Trough breach risk - the daily digest's downside band says the projected low
+   could cross the cash floor or zero.
+6. Guardrail trips - cash-floor / drift / window-age findings
    (``evaluate_guardrails``), advisory findings excluded.
 
 Strictly read-only: it reads the same grounded helpers the individual tools
@@ -35,7 +37,7 @@ from typing import Any
 from .config import get_finance_config
 from .follow_ups import list_due_followups
 from .goals import list_goals
-from .guardrails import evaluate_guardrails
+from .guardrails import CASH_FLOOR, evaluate_guardrails
 from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .obligations import list_obligation_review_candidates
 from .onboarding import list_charge_onboarding_queue
@@ -82,6 +84,8 @@ _TYPE_RANK: dict[str, int] = {
     "obligation_due": 4.5,
     "estimate_review": 4,
     "snapshot_refresh": 3,
+    "confirm_live_balance": 3,
+    "trough_breach_risk": 2.5,
     "guardrail_warning": 2,
     "goal_review": 1,
 }
@@ -92,6 +96,7 @@ _GOAL_SURFACE_STATUSES: frozenset[str] = frozenset({"behind", "due_soon"})
 # Singleton surface key for the onboarding digest. One row in the emissions
 # ledger, updated in place as the candidate count changes; never fans out.
 _ONBOARDING_DIGEST_KEY = "onboarding-digest"
+_FINANCE_STATUS_KEY = "finance-status"
 
 # Max candidate names listed in the digest body (highest priority_score first).
 _ONBOARDING_DIGEST_NAMES = 5
@@ -110,6 +115,8 @@ def get_surface_queue(
     as_of_date: date | str,
     limit: int = DEFAULT_LIMIT,
     suppress_balance_guardrails: bool = False,
+    trough_sensitivity: dict[str, Any] | None = None,
+    working_account_balance_stale: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Aggregate everything the daily job should surface into one ranked list.
 
@@ -122,10 +129,21 @@ def get_surface_queue(
     FAILED: balances are stale, so a cash-floor or drift alert built on them would
     be false. Non-balance items (due follow-ups, manual obligations by date, the
     freshness guardrail) still surface.
+
+    ``working_account_balance_stale`` is optional precomputed digest balance data.
+    When it says the working account's own balance date is stale, the queue also
+    drops balance-derived guardrails for this read and adds one confirm-live-balance
+    item instead of recomputing staleness here. This covers feed-lagged checking
+    balances even when the full daily sync succeeded.
+
+    ``trough_sensitivity`` is optional. The daily-digest builder supplies the
+    already-computed trough downside band; this module does not import
+    ``digest.py`` because the digest already imports this queue module.
     """
 
     ensure_app_schema(conn)
     as_of = _coerce_date(as_of_date)
+    working_balance_stale = bool((working_account_balance_stale or {}).get("stale"))
 
     items: list[dict[str, Any]] = []
     items += _stale_job_items(conn, as_of)
@@ -134,7 +152,13 @@ def get_surface_queue(
     items += _goal_review_items(conn, as_of)
     items += _estimate_review_items(conn, as_of)
     items += _snapshot_refresh_items(conn, as_of)
-    items += _guardrail_items(conn, as_of, suppress_balance_guardrails=suppress_balance_guardrails)
+    items += _trough_breach_items(trough_sensitivity, as_of)
+    items += _working_account_balance_stale_items(working_account_balance_stale)
+    items += _guardrail_items(
+        conn,
+        as_of,
+        suppress_balance_guardrails=suppress_balance_guardrails or working_balance_stale,
+    )
 
     items.sort(
         key=lambda it: (
@@ -195,6 +219,7 @@ def build_surface_items(
     conn: sqlite3.Connection,
     *,
     as_of_date: date | str,
+    headline: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build de-dupe-ready items for ``surface_to_todoist``.
 
@@ -223,6 +248,7 @@ def build_surface_items(
     items += _estimate_review_surface_items(conn, as_of)
     items += _snapshot_due_surface_items(conn, as_of)
     items += _onboarding_digest_surface_item(conn, as_of)
+    items += _finance_status_surface_item(headline)
     return items
 
 
@@ -246,6 +272,18 @@ def build_surface_retire_keys(
     except sqlite3.OperationalError:
         return []
     return [] if candidates else [_ONBOARDING_DIGEST_KEY]
+
+
+def _finance_status_surface_item(headline: str | None) -> list[dict[str, Any]]:
+    if not headline:
+        return []
+    return [
+        {
+            "surface_key": _FINANCE_STATUS_KEY,
+            "content": "Finance status",
+            "description": headline,
+        }
+    ]
 
 
 def _onboarding_digest_surface_item(
@@ -789,6 +827,87 @@ def _snapshot_refresh_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
     return items
 
 
+def _trough_breach_items(
+    trough_sensitivity: dict[str, Any] | None, as_of: date
+) -> list[dict[str, Any]]:
+    """One item when the projected trough's downside band could breach the
+    cash floor or cross zero, naming the single top driver (e.g. "Apple
+    Card statement estimate could drop your Jul low to ~$840"). Fed by
+    digest.py's `_trough_sensitivity` headline band for the longest
+    window, passed in by the caller rather than imported here (digest.py
+    already imports this module, so importing it back would cycle).
+    Singleton id (no date suffix) so a downstream write path keyed on this
+    id updates one task in place across days instead of piling up
+    duplicates - severity flips between high/medium as the risk moves but
+    the id stays the same.
+    """
+
+    ts = trough_sensitivity or {}
+    low_estimate = ts.get("low_estimate")
+    if low_estimate is None or not ts.get("breach_risk") or low_estimate >= CASH_FLOOR:
+        return []
+    severity = "high" if low_estimate < 0 else "medium"
+    drivers = ts.get("drivers") or []
+    top = drivers[0] if drivers else None
+    driver_name = (top or {}).get("obligation_name") or "an estimated outflow"
+    trough_date = ts.get("lowest_balance_date")
+    trough_day = _date_part(trough_date)
+    month_label = trough_day.strftime("%b") if trough_day else "projected"
+    message = f"{driver_name} could drop your {month_label} low to ~${_money(low_estimate)}."
+    return [
+        {
+            "id": "trough-breach",
+            "type": "trough_breach_risk",
+            "severity": severity,
+            "message": message,
+            "suggested_todoist_due": "today",
+            "related_ids": [],
+            "evidence": {
+                "lowest_balance": ts.get("lowest_balance"),
+                "lowest_balance_date": trough_date,
+                "low_estimate": low_estimate,
+                "high_estimate": ts.get("high_estimate"),
+                "top_driver": top,
+            },
+        }
+    ]
+
+
+def _working_account_balance_stale_items(
+    working_account_balance_stale: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    info = working_account_balance_stale or {}
+    if not info.get("stale"):
+        return []
+    account_name = info.get("account_name") or info.get("working_account") or "Working account"
+    age = info.get("balance_age_days")
+    age_text = (
+        f"{age} {'day' if age == 1 else 'days'} old"
+        if age is not None
+        else "stale"
+    )
+    balance_date = info.get("balance_date")
+    date_text = f" (last balance date {balance_date})" if balance_date else ""
+    return [
+        {
+            "id": "confirm-live-balance",
+            "type": "confirm_live_balance",
+            "severity": "medium",
+            "message": (
+                f"{account_name} balance is {age_text}{date_text}; confirm the live "
+                "balance before trusting any cash-floor/drift alert."
+            ),
+            "suggested_todoist_due": "today",
+            "related_ids": [],
+            "evidence": {
+                "account_name": account_name,
+                "balance_age_days": age,
+                "balance_date": balance_date,
+            },
+        }
+    ]
+
+
 def _guardrail_items(
     conn: sqlite3.Connection,
     as_of: date,
@@ -806,8 +925,8 @@ def _guardrail_items(
             # action items for the daily push.
             continue
         if suppress_balance_guardrails and f["rule_type"] in _BALANCE_DERIVED_GUARDRAILS:
-            # The day's sync failed: balances are stale, so a cash-floor / drift
-            # trip built on them would be a false alarm. Drop it for this run.
+            # Balance data is stale for this read, so a cash-floor / drift trip
+            # built on it would be a false alarm. Drop it for this run.
             continue
         if f["rule_type"] == "drift_threshold" and _drift_warning_snoozed(conn, f, as_of):
             # Already surfaced on an earlier day and unchanged since: snoozed

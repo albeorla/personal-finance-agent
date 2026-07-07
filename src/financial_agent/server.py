@@ -81,6 +81,7 @@ from .reconciliation import (
 )
 from .statements import (
     aggregate_statement_inputs as aggregate_statement_inputs_for_db,
+    get_statement_status as get_statement_status_for_db,
     list_statement_cycles as list_statement_cycles_for_db,
     recompute_statement_estimates as recompute_statement_estimates_for_db,
     set_statement_actual as set_statement_actual_for_db,
@@ -150,6 +151,20 @@ def _resolve_as_of(as_of_date: str | None) -> str:
     import datetime as _dt
 
     return as_of_date or _dt.date.today().isoformat()
+
+
+def _has_synced_sources(conn) -> bool:
+    """True when the DB has SimpleFIN source tables (a sync has run).
+
+    The daily digest reads balances/freshness/drift from the source tables; an
+    app-only DB (obligations seeded, never synced) has none of them, so digest
+    enrichment must be skipped rather than crashed on such a DB.
+    """
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='balance_snapshots'"
+        ).fetchone()
+    )
 
 
 @mcp.tool()
@@ -435,16 +450,21 @@ def get_surface_queue(
     """One read for the daily surfacing job: everything worth pushing today.
 
     Aggregates match confirmations, goals behind/due-soon, estimated amounts
-    ready to refresh, stale balance-only snapshots (e.g. Apple Card), and
-    guardrail trips (cash floor / drift / window age) into a single prioritized
-    list. Each item carries a type, a human-readable message, and a suggested
-    Todoist due date. Read-only: it sends nothing and writes nothing. Returns
-    total_items (before the limit) plus the top items capped at limit (default 30).
+    ready to refresh, stale balance-only snapshots (e.g. Apple Card), trough
+    breach risk from the daily digest, and guardrail trips (cash floor / drift /
+    window age) into a single prioritized list. Each item carries a type, a
+    human-readable message, and a suggested Todoist due date. Read-only: it sends
+    nothing and writes nothing. Returns total_items (before the limit) plus the
+    top items capped at limit (default 30).
 
     Set ``suppress_balance_guardrails`` when the day's sync FAILED: it drops the
     balance-derived guardrail trips (cash floor / drift) that would be false on
     stale balances, while still surfacing non-balance items (due follow-ups,
     manual obligations by date, the data-freshness guardrail).
+
+    The queue also drops cash-floor / drift items automatically when the daily
+    digest says the working account's own balance date is stale, and surfaces a
+    confirm-live-balance item instead.
     """
     as_of_date = _resolve_as_of(as_of_date)
 
@@ -454,11 +474,24 @@ def get_surface_queue(
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
+        digest = (
+            build_daily_digest_for_db(db_path=resolved_db_path, as_of_date=as_of_date)
+            if _has_synced_sources(conn)
+            else {}
+        )
+        balances = digest.get("balances") or {}
         return get_surface_queue_for_db(
             conn,
             as_of_date=as_of_date,
             limit=limit,
             suppress_balance_guardrails=suppress_balance_guardrails,
+            trough_sensitivity=digest.get("trough_sensitivity"),
+            working_account_balance_stale={
+                "stale": balances.get("working_account_balance_date_stale"),
+                "account_name": balances.get("working_account"),
+                "balance_age_days": balances.get("working_account_balance_age_days"),
+                "balance_date": balances.get("working_account_balance_date"),
+            },
         )
     finally:
         conn.close()
@@ -1280,6 +1313,34 @@ def list_statement_cycles(
 
 
 @mcp.tool()
+def get_statement_status(
+    obligation_id: str,
+    as_of_date: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Show the latest closed statement and current open-cycle pace for a card obligation.
+
+    Refreshes the card-input rollup first, then reports the most recent closed
+    statement, the open cycle's spend so far, modeled amount, variance, and
+    whether spend is ahead of or behind the modeled pace.
+    """
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = get_statement_status_for_db(
+            conn, obligation_id=obligation_id, as_of_date=as_of_date
+        )
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def recompute_statement_estimates(
     target_obligation_id: str,
     baseline: float = 0.0,
@@ -1668,7 +1729,15 @@ def surface_due_items_to_todoist(
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
-        items = build_surface_items_for_db(conn, as_of_date=as_of_date)
+        # Headline enrichment needs synced balances; on an app-only DB (obligations
+        # seeded, no sync yet) there is no balance/health read, so surface the bare
+        # due items instead of crashing on the digest build.
+        if _has_synced_sources(conn):
+            digest = build_daily_digest_for_db(db_path=resolved_db_path, as_of_date=as_of_date)
+            headline = summarize_daily_digest_for_db(digest).get("headline")
+        else:
+            headline = None
+        items = build_surface_items_for_db(conn, as_of_date=as_of_date, headline=headline)
         retire_keys = build_surface_retire_keys_for_db(conn, as_of_date=as_of_date)
         if sync_failed:
             # Prepend the stale-data flag so it leads the push; the ledger dedupes
@@ -2378,7 +2447,7 @@ def get_daily_digest(
         windows=tuple(windows) if windows else (7, 14, 30, 60),
     )
     if verbose:
-        digest["markdown"] = render_digest_markdown_for_db(digest)
+        digest["markdown"] = render_digest_markdown_for_db(digest, verbose=True)
         return digest
     return summarize_daily_digest_for_db(digest)
 

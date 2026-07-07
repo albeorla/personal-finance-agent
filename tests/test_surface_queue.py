@@ -7,14 +7,32 @@ asserts the aggregated, prioritized queue without touching live data.
 import sqlite3
 from datetime import datetime, timedelta
 
+from financial_agent.guardrails import CASH_FLOOR
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
 from financial_agent.surface_queue import (
     SNAPSHOT_STALE_DAYS,
+    _finance_status_surface_item,
     get_surface_queue,
 )
 
 AS_OF = "2026-06-24"
+
+
+def test_finance_status_surface_item_is_singleton():
+    headline = (
+        "YELLOW: cushion is thin | trough sensitivity (60d): low point $500 "
+        "could land between ~$300 and ~$700"
+    )
+
+    assert _finance_status_surface_item(None) == []
+    assert _finance_status_surface_item(headline) == [
+        {
+            "surface_key": "finance-status",
+            "content": "Finance status",
+            "description": headline,
+        }
+    ]
 
 
 def _recent_iso():
@@ -292,6 +310,57 @@ def test_suppress_balance_guardrails_drops_cash_floor_keeps_other_items(tmp_path
     assert any(i["type"] == "obligation_due" for i in suppressed["items"])
 
 
+def test_stale_working_balance_suppresses_balance_guardrails_and_adds_confirm_item(tmp_path):
+    conn = _db(tmp_path / "t.db")
+    _checking(conn, available=500.0)
+    _fresh_sync(conn)
+    conn.commit()
+
+    not_stale = get_surface_queue(
+        conn,
+        as_of_date=AS_OF,
+        working_account_balance_stale={
+            "stale": False,
+            "account_name": "Checking",
+            "balance_age_days": 0,
+            "balance_date": AS_OF,
+        },
+    )
+    assert any(
+        i["evidence"].get("rule_type") == "cash_floor"
+        for i in not_stale["items"]
+        if i["type"] == "guardrail_warning"
+    )
+
+    stale = get_surface_queue(
+        conn,
+        as_of_date=AS_OF,
+        working_account_balance_stale={
+            "stale": True,
+            "account_name": "Checking",
+            "balance_age_days": 2,
+            "balance_date": "2026-06-22",
+        },
+    )
+    rule_types = {
+        i["evidence"].get("rule_type")
+        for i in stale["items"]
+        if i["type"] == "guardrail_warning"
+    }
+    assert "cash_floor" not in rule_types
+    assert "drift_threshold" not in rule_types
+
+    confirm_items = [i for i in stale["items"] if i["type"] == "confirm_live_balance"]
+    assert len(confirm_items) == 1
+    confirm = confirm_items[0]
+    assert confirm["id"] == "confirm-live-balance"
+    assert confirm["severity"] == "medium"
+    assert "Checking" in confirm["message"]
+    assert "2 days old" in confirm["message"]
+    assert "2026-06-22" in confirm["message"]
+    assert "confirm the live balance" in confirm["message"]
+
+
 def test_advisory_guardrails_excluded(tmp_path):
     conn = _db(tmp_path / "t.db")
     _checking(conn)
@@ -362,6 +431,50 @@ def test_goal_review_items_surface_behind_goals(tmp_path):
     assert len(goals) == 1
     assert "Emergency fund" in goals[0]["message"]
     assert goals[0]["evidence"]["status"] in {"behind", "due_soon"}
+
+
+def test_trough_breach_risk_from_digest_trough_sensitivity(tmp_path):
+    conn = _db(tmp_path / "t.db")
+    _checking(conn)
+    _fresh_sync(conn)
+    conn.commit()
+
+    def trough_items(trough_sensitivity=None):
+        kwargs = {"as_of_date": AS_OF}
+        if trough_sensitivity is not None:
+            kwargs["trough_sensitivity"] = trough_sensitivity
+        q = get_surface_queue(conn, **kwargs)
+        return [i for i in q["items"] if i["type"] == "trough_breach_risk"]
+
+    base = {
+        "lowest_balance": 1200.0,
+        "lowest_balance_date": "2026-07-10",
+        "high_estimate": 2400.0,
+        "drivers": [
+            {
+                "obligation_name": "Sample Card statement (avg estimate)",
+                "amount": 840.0,
+                "confidence": "low",
+                "downside": 1350.0,
+                "balance_only": True,
+            }
+        ],
+    }
+
+    high = trough_items({**base, "low_estimate": -150.0, "breach_risk": True})
+    assert len(high) == 1
+    assert high[0]["id"] == "trough-breach"
+    assert high[0]["severity"] == "high"
+    assert "Sample Card statement (avg estimate)" in high[0]["message"]
+    assert "-150.00" in high[0]["message"]
+
+    medium = trough_items({**base, "low_estimate": 840.0, "breach_risk": True})
+    assert len(medium) == 1
+    assert medium[0]["severity"] == "medium"
+
+    assert not trough_items({**base, "low_estimate": CASH_FLOOR + 100.0, "breach_risk": True})
+    assert not trough_items({**base, "low_estimate": -150.0, "breach_risk": False})
+    assert not trough_items()
 
 
 # --- prioritization & compactness ------------------------------------------

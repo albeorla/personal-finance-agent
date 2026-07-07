@@ -179,6 +179,134 @@ def list_statement_cycles(
     return result
 
 
+def get_statement_status(
+    conn: sqlite3.Connection,
+    *,
+    obligation_id: str,
+    as_of_date: str | date | None = None,
+) -> dict[str, Any]:
+    """Return closed-statement and open-cycle status for one statement obligation."""
+
+    as_of = date.today() if as_of_date is None else date.fromisoformat(str(as_of_date)[:10])
+    aggregate_statement_inputs(conn, target_obligation_id=obligation_id)
+    cycles = list_statement_cycles(conn, target_obligation_id=obligation_id)
+
+    closed_cycle: dict[str, Any] | None = None
+    open_cycle_row: dict[str, Any] | None = None
+    for cycle in cycles:
+        close = date.fromisoformat(cycle["cycle_close_date"])
+        if close <= as_of:
+            closed_cycle = cycle
+        elif open_cycle_row is None:
+            open_cycle_row = cycle
+
+    notes: list[str] = []
+    closed_statement = None
+    if closed_cycle is None:
+        notes.append("no statement cycle closes on or before as_of_date")
+    else:
+        row = conn.execute(
+            """
+            SELECT amount, amount_status, amount_source, due_date
+            FROM obligation_instances
+            WHERE id = ?
+            """,
+            (closed_cycle["statement_instance_id"],),
+        ).fetchone()
+        if row is None:
+            notes.append("closed statement instance is missing")
+        else:
+            closed_statement = {
+                "statement_instance_id": closed_cycle["statement_instance_id"],
+                "cycle_close_date": closed_cycle["cycle_close_date"],
+                "amount": round(float(row["amount"]), 2) if row["amount"] is not None else None,
+                "amount_status": row["amount_status"],
+                "amount_source": row["amount_source"],
+                "due_date": row["due_date"],
+            }
+            if row["amount_status"] != "confirmed":
+                notes.append(f"closed statement amount is {row['amount_status']}")
+
+    open_cycle = None
+    modeled_amount_for_open_cycle = None
+    modeled_amount = None
+    if open_cycle_row is None:
+        notes.append("no statement cycle closes after as_of_date")
+    else:
+        spend_so_far = (
+            round(float(open_cycle_row["input_sum"]), 2)
+            if open_cycle_row["input_sum"] is not None
+            else None
+        )
+        open_cycle = {
+            "cycle_open_date": open_cycle_row["cycle_open_date"],
+            "cycle_close_date": open_cycle_row["cycle_close_date"],
+            "spend_so_far": spend_so_far,
+            "input_count": open_cycle_row["input_count"],
+            "confidence": open_cycle_row["confidence"],
+        }
+        row = conn.execute(
+            """
+            SELECT amount, amount_status, amount_source
+            FROM obligation_instances
+            WHERE id = ?
+            """,
+            (open_cycle_row["statement_instance_id"],),
+        ).fetchone()
+        if row is None:
+            notes.append("open cycle statement instance is missing")
+        else:
+            modeled_amount = round(float(row["amount"]), 2) if row["amount"] is not None else None
+            modeled_amount_for_open_cycle = {
+                "amount": modeled_amount,
+                "amount_status": row["amount_status"],
+                "amount_source": row["amount_source"],
+            }
+            if row["amount_status"] != "confirmed":
+                notes.append(f"open cycle modeled amount is {row['amount_status']}")
+
+    variance = (
+        round(modeled_amount - open_cycle["spend_so_far"], 2)
+        if modeled_amount is not None
+        and open_cycle is not None
+        and open_cycle["spend_so_far"] is not None
+        else None
+    )
+
+    on_track = None
+    if (
+        open_cycle is not None
+        and open_cycle["spend_so_far"] is not None
+        and modeled_amount is not None
+        and modeled_amount != 0
+    ):
+        if not open_cycle["cycle_open_date"] or not open_cycle["cycle_close_date"]:
+            notes.append("on_track unavailable because open cycle dates are missing")
+        else:
+            opened = date.fromisoformat(open_cycle["cycle_open_date"])
+            closed = date.fromisoformat(open_cycle["cycle_close_date"])
+            cycle_days = (closed - opened).days
+            if cycle_days <= 0:
+                notes.append("on_track unavailable because open cycle length is zero")
+            else:
+                elapsed_fraction = max(0.0, min(1.0, (as_of - opened).days / cycle_days))
+                expected_so_far = modeled_amount * elapsed_fraction
+                on_track = "ahead" if open_cycle["spend_so_far"] <= expected_so_far else "behind"
+    elif open_cycle is not None:
+        notes.append("on_track unavailable because open cycle has no spend total or modeled amount")
+
+    return {
+        "obligation_id": obligation_id,
+        "as_of_date": as_of.isoformat(),
+        "closed_statement": closed_statement,
+        "open_cycle": open_cycle,
+        "modeled_amount_for_open_cycle": modeled_amount_for_open_cycle,
+        "variance": variance,
+        "on_track": on_track,
+        "notes": notes,
+    }
+
+
 def recompute_statement_estimates(
     conn: sqlite3.Connection,
     *,

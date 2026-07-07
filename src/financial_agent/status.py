@@ -18,6 +18,12 @@ SCHEMA_VERSION = "finance_status.v1"
 DEFAULT_WINDOWS = [7, 14, 30]
 DEFAULT_FRESHNESS_HOURS = 24
 BALANCE_DATE_STALE_DAYS = 3
+# The working (checking) account gets a tighter staleness bar than other
+# accounts: a 1-day-old checking balance can already hide a payday or a big
+# debit, so cash-danger colors should not trust it. Balance-only feeds like
+# the Apple Card ("Updated Monthly") stay on the general 3-day threshold above
+# so they are not spuriously flagged every day.
+WORKING_BALANCE_STALE_DAYS = 1
 
 
 def default_db_path() -> Path:
@@ -75,6 +81,7 @@ def get_finance_status(
             windows=requested_windows,
             start_date=projection_start_date,
             working_account_id=working_account_id,
+            working_balance_stale_days=WORKING_BALANCE_STALE_DAYS,
         )
         drift_result = detect_drift(conn, as_of_date=projection_start_date, persist=False)
         guardrail_result = evaluate_guardrails(
@@ -209,6 +216,14 @@ def resolve_account_balance(
 
 
 def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> list[dict[str, Any]]:
+    # An app-only DB (obligations seeded, no SimpleFIN sync yet) has no source
+    # tables. Degrade to "no balances" rather than crash, so digest/surface
+    # consumers work on a balances-free DB the same way they tolerate a missing
+    # balance_date column below.
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='balance_snapshots'"
+    ).fetchone():
+        return []
     columns = {row[1] for row in conn.execute("PRAGMA table_info(balance_snapshots)").fetchall()}
     balance_date_select = "bs.balance_date" if "balance_date" in columns else "NULL"
     rows = conn.execute(

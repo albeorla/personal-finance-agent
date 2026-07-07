@@ -28,6 +28,7 @@ def build_cash_flow_projections(
     start_date: date,
     working_account_id: str | None = None,
     working_account_hint: str | None = None,
+    working_balance_stale_days: int = 3,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not has_app_schema(conn):
         return [], ["local obligation schema is not initialized"]
@@ -39,6 +40,17 @@ def build_cash_flow_projections(
     working_account = _select_working_account(accounts, working_account_id, working_account_hint)
     if working_account is None:
         return [], ["no working cash account found for cash-flow projection"]
+
+    # Override the generic per-account staleness flag (status.py's
+    # BALANCE_DATE_STALE_DAYS) with the working account's own, tighter bar
+    # (status.py's WORKING_BALANCE_STALE_DAYS, passed in as
+    # working_balance_stale_days) so a 1-day-old checking balance reads as
+    # stale here even though it would not for e.g. a monthly card feed.
+    age_days = working_account.get("balance_age_days")
+    working_account = {
+        **working_account,
+        "balance_date_stale": bool(age_days is not None and age_days > working_balance_stale_days),
+    }
 
     projections = []
     for window in windows:

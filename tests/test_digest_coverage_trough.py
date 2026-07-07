@@ -79,7 +79,7 @@ def test_coverage_counts_add_up_and_match_seeded_roster(tmp_path):
 
 def test_coverage_block_renders(tmp_path):
     db = _seed_db(tmp_path / "d.sqlite", available=9000.0, obligations=_COVERAGE_ROSTER)
-    md = render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"))
+    md = render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"), verbose=True)
 
     assert "## Coverage" in md
     # Lead line restates the roster census in human terms.
@@ -142,7 +142,7 @@ def test_trough_band_picks_estimated_drivers_before_low_point(tmp_path):
     assert longest["trough_high_estimate"] == 5000.0
 
     # Band line renders with both estimated drivers named.
-    md = render_digest_markdown(digest)
+    md = render_digest_markdown(digest, verbose=True)
     assert "Trough sensitivity" in md
     assert "2 estimated bills" in md
     assert "Apple Card" in md and "Eversource" in md
