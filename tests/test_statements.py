@@ -5,6 +5,7 @@ estimate can be built from real modeled card spend, but a portal/confirmed
 amount must never be overwritten by a rollup guess.
 """
 
+import json
 import sqlite3
 
 from financial_agent.obligations import apply_obligation_instances
@@ -179,6 +180,100 @@ def test_recompute_with_zero_baseline_warns(tmp_path):
         "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
     ).fetchone()
     assert august["amount"] == 600.0  # only the modeled card input
+
+
+def test_recompute_without_baseline_preserves_estimate_and_reports_unbound(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+    # A converted card input with no statement_target_obligation_id: bound to no
+    # cycle, it must be surfaced rather than silently dropped.
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "orphan_card_spend",
+            "name": "Orphan card spend",
+            "kind": "card_spend_input",
+            "status": "active",
+            "source": "seed",
+        },
+        instances=[
+            {
+                "id": "orphan_card_spend:2026-07-08",
+                "due_date": "2026-07-08",
+                "amount": -120.00,
+                "source": "seed",
+                "confidence": "low",
+                "cash_flow_treatment": "card_statement_input",
+            }
+        ],
+    )
+
+    result = recompute_statement_estimates(conn, target_obligation_id="amex_statement_payment")
+
+    # No baseline supplied: the existing $6000 estimate is preserved, not
+    # clobbered down to the $600 of modeled card inputs.
+    august = conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    assert august["amount"] == 6000.0
+    # The unbound card input is reported instead of dropped.
+    assert result["unbound_inputs"] == 1
+    assert "orphan_card_spend:2026-07-08" in result["unbound_instance_ids"]
+
+
+def test_recompute_preserves_prior_baseline_when_inputs_grow(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed(conn)
+
+    # First preserve-mode rollup after an explicit-baseline pass records the
+    # non-modeled baseline (2000) alongside the modeled card inputs (600), so
+    # the August estimate is 2600 with estimation_inputs_json.baseline = 2000.
+    recompute_statement_estimates(
+        conn, target_obligation_id="amex_statement_payment", baseline=2000.0
+    )
+    august = conn.execute(
+        "SELECT amount, amount_source, estimation_inputs_json FROM obligation_instances "
+        "WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    assert august["amount"] == 2600.0
+    assert august["amount_source"] == "statement_input_rollup"
+    assert json.loads(august["estimation_inputs_json"])["baseline"] == 2000.0
+
+    # New card spend lands in the same cycle, pushing modeled inputs to 3000 --
+    # past the old 2600 estimate. Preserve-mode must keep the prior 2000
+    # baseline: 2000 + 3000 = 5000. The buggy subtraction gave max(2600-3000,0)
+    # + 3000 = 3000, silently erasing the non-modeled baseline.
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "gault_card_spend",
+            "name": "Gault Energy",
+            "kind": "card_spend_input",
+            "status": "active",
+            "source": "seed",
+        },
+        instances=[_gault("2026-07-06", -2400.00)],  # 600 + 2400 = 3000 in cycle
+    )
+    aggregate_statement_inputs(conn, target_obligation_id="amex_statement_payment")
+
+    recompute_statement_estimates(conn, target_obligation_id="amex_statement_payment")
+    august = conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    assert august["amount"] == 5000.0
+
+    # Inputs-below-estimate case still preserved: a plain manual estimate with
+    # no prior rollup baseline is never clobbered down to inputs-only.
+    conn.execute(
+        "UPDATE obligation_instances SET amount = -6000.0, amount_source = 'manual_projection', "
+        "estimation_inputs_json = NULL WHERE id = 'amex_statement_payment:2026-08-16'"
+    )
+    recompute_statement_estimates(conn, target_obligation_id="amex_statement_payment")
+    august = conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    # Backed out: baseline 6000 - 3000 inputs = 3000, + 3000 inputs = 6000.
+    assert august["amount"] == 6000.0
 
 
 # --- get_statement_status: current portal-read plus open-cycle pace ----------

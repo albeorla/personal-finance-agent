@@ -21,13 +21,12 @@ import uuid
 from datetime import UTC, date, datetime
 from typing import Any
 
-from .cashflow import build_cash_flow_projections
+from .cashflow import CASH_FLOOR, build_cash_flow_projections
 from .debts import list_debts
 from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
 
-CASH_FLOOR = 2500.0
 DRIFT_THRESHOLD = 200.0
 WINDOW_AGE_MAX_HOURS = 24.0
 

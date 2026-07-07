@@ -197,6 +197,33 @@ def test_server_apply_requires_autopay_classification(tmp_path):
     assert res["obligation_id"] == "x"
 
 
+def test_server_list_obligations_limit_offset_reports_more(tmp_path):
+    import pytest
+
+    pytest.importorskip("mcp", reason="MCP server deps not installed")
+    from financial_agent import server
+
+    db = tmp_path / "fa.sqlite"
+    for i in range(3):
+        server.apply_obligation_instances(
+            {"id": f"bill{i}", "name": f"Bill {i}", "kind": "bill", "autopay": False, "source": "seed"},
+            [{"due_date": "2026-07-01", "amount": -10.0, "source": "seed"}],
+            db_path=str(db),
+        )
+
+    # A limit that truncates the roster carries the full total plus a "more" pointer.
+    page = server.list_obligations(limit=1, db_path=str(db))
+    assert page["count"] == 1
+    assert page["total_items"] == 3
+    assert page["more"] == 2
+
+    # offset pages forward; the last page reports no "more".
+    tail = server.list_obligations(limit=2, offset=2, db_path=str(db))
+    assert tail["count"] == 1
+    assert tail["total_items"] == 3
+    assert "more" not in tail
+
+
 def test_deactivate_obligation_removes_from_runway(tmp_path):
     from financial_agent.obligations import deactivate_obligation
 
@@ -488,24 +515,25 @@ def test_fixed_outflow_instances_project_into_cash_flow(tmp_path):
     assert "cash-flow projection includes only seeded local obligation instances" in warnings[0]
 
 
-def test_past_due_unreconciled_instances_are_counted_not_dropped(tmp_path):
+def test_discretionary_sweep_is_capped_at_cash_floor(tmp_path):
+    from financial_agent.cashflow import CASH_FLOOR
+
     conn = _db(tmp_path / "obligations.sqlite")
+    # An optional debt-paydown sweep the user chooses to make: modeled at $4,000,
+    # but only $2,500 of headroom exists above the cash floor on a $5,000 balance.
     apply_obligation_instances(
         conn,
         obligation={
-            "id": "rent",
-            "name": "Rent check",
-            "kind": "housing",
+            "id": "card_sweep",
+            "name": "Card paydown sweep",
+            "kind": "credit_card_statement",
             "cadence": "monthly",
             "status": "active",
             "source": "obligations_yaml_manual",
+            "amount_discretionary": True,
         },
         instances=[
-            # Predates the projection start and has no transaction match: must be
-            # counted, not silently dropped by the due_date >= start_date filter.
-            {"due_date": "2026-06-15", "amount": -3000.0, "source": "obligations_yaml_manual"},
-            # In-window instance still projects normally.
-            {"due_date": "2026-06-25", "amount": -3000.0, "source": "obligations_yaml_manual"},
+            {"due_date": "2026-06-25", "amount": -4000.0, "source": "obligations_yaml_manual"}
         ],
     )
 
@@ -524,8 +552,151 @@ def test_past_due_unreconciled_instances_are_counted_not_dropped(tmp_path):
         start_date=date(2026, 6, 20),
     )
 
-    assert projections[0]["omitted_past_due_unreconciled_count"] == 1
-    assert [e["due_date"] for e in projections[0]["events"]] == ["2026-06-25"]
+    proj = projections[0]
+    # Sweep is trimmed to the $2,500 headroom (5000 -> 2500), not driven under the
+    # floor to $1,000. The event carries the reduced applied amount.
+    assert proj["ending_balance"] == CASH_FLOOR
+    assert proj["lowest_balance"] == CASH_FLOOR
+    assert proj["events"][0]["signed_amount"] == -2500.0
+    assert proj["events"][0]["running_balance"] == CASH_FLOOR
+
+
+def test_discretionary_sweep_in_roll_forward_gap_is_capped_at_cash_floor(tmp_path):
+    # BUG A regression: a discretionary sweep dated between the balance snapshot
+    # and a later projection start falls into the roll-forward gap. It must be
+    # capped by the same cash-floor rule the in-window loop uses; otherwise it
+    # subtracts its FULL amount and the projection starts below the floor.
+    from financial_agent.cashflow import CASH_FLOOR
+
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "card_sweep",
+            "name": "Card paydown sweep",
+            "kind": "credit_card_statement",
+            "cadence": "monthly",
+            "status": "active",
+            "source": "obligations_yaml_manual",
+            "amount_discretionary": True,
+        },
+        instances=[
+            # $5,000 snapshot on 06-20, sweep on 06-22, projection starts 06-25:
+            # the sweep is in the (snapshot, start) roll-forward gap.
+            {"due_date": "2026-06-22", "amount": -4000.0, "source": "obligations_yaml_manual"}
+        ],
+    )
+
+    projections, _ = build_cash_flow_projections(
+        conn,
+        accounts=[
+            {
+                "account_id": "checking-1",
+                "account_name": "Checking 4321",
+                "kind": "checking",
+                "available": 5000.0,
+                "recorded_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+        windows=[20],
+        start_date=date(2026, 6, 25),
+    )
+
+    proj = projections[0]
+    # Only $2,500 of headroom above the floor: sweep applies $2,500 (5000 -> 2500),
+    # NOT the full $4,000 that would drop the start to $1,000 (below the floor).
+    assert proj["rolled_forward_to_start"] == -2500.0
+    assert proj["starting_balance"] == CASH_FLOOR
+    assert proj["lowest_balance"] >= CASH_FLOOR
+
+
+def test_fixed_outflow_in_roll_forward_gap_applies_full_amount(tmp_path):
+    # Guard the other direction: a NON-discretionary (fixed) outflow in the gap is
+    # not floor-capped and must subtract its full amount from the rolled-forward start.
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "rent",
+            "name": "Rent check",
+            "kind": "housing",
+            "cadence": "monthly",
+            "status": "active",
+            "source": "obligations_yaml_manual",
+        },
+        instances=[
+            {"due_date": "2026-06-22", "amount": -4000.0, "source": "obligations_yaml_manual"}
+        ],
+    )
+
+    projections, _ = build_cash_flow_projections(
+        conn,
+        accounts=[
+            {
+                "account_id": "checking-1",
+                "account_name": "Checking 4321",
+                "kind": "checking",
+                "available": 5000.0,
+                "recorded_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+        windows=[20],
+        start_date=date(2026, 6, 25),
+    )
+
+    proj = projections[0]
+    assert proj["rolled_forward_to_start"] == -4000.0
+    assert proj["starting_balance"] == 1000.0
+
+
+def test_past_due_unreconciled_instances_are_carried_as_due_now(tmp_path):
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "rent",
+            "name": "Rent check",
+            "kind": "housing",
+            "cadence": "monthly",
+            "status": "active",
+            "source": "obligations_yaml_manual",
+        },
+        instances=[
+            # Predates the projection start and has no transaction match: the owed
+            # dollars must be carried onto the runway, not silently dropped by the
+            # due_date >= start_date filter (which overstates cash).
+            {"due_date": "2026-06-15", "amount": -3000.0, "source": "obligations_yaml_manual"},
+            # In-window instance still projects normally.
+            {"due_date": "2026-06-25", "amount": -3000.0, "source": "obligations_yaml_manual"},
+        ],
+    )
+
+    projections, _ = build_cash_flow_projections(
+        conn,
+        accounts=[
+            {
+                "account_id": "checking-1",
+                "account_name": "Checking 4321",
+                "kind": "checking",
+                "available": 5000.0,
+                # Snapshot equals start_date, so roll-forward does not run and the
+                # past-due item is carried here (not double-counted).
+                "recorded_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+        windows=[20],
+        start_date=date(2026, 6, 20),
+    )
+
+    proj = projections[0]
+    # Past due (-3000) + in-window (-3000) both hit the runway: 5000 - 6000 = -1000.
+    assert proj["ending_balance"] == -1000.0
+    assert proj["carried_past_due_unreconciled_count"] == 1
+    assert [c["instance_id"] for c in proj["carried_past_due"]] == ["rent:2026-06-15"]
+    assert proj["carried_past_due"][0]["signed_amount"] == -3000.0
+    # The carried past-due event leads, then the in-window one.
+    assert [e["due_date"] for e in proj["events"]] == ["2026-06-15", "2026-06-25"]
+    assert proj["events"][0]["past_due_carried"] is True
 
 
 def test_seasonal_eversource_estimate_keeps_structured_model_metadata(tmp_path):

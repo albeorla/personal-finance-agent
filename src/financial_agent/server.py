@@ -67,7 +67,7 @@ from .memory import (
     write_memory as write_memory_for_db,
 )
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
-from .card_import import import_card_statement_for_db
+from .card_import import import_card_statement_for_db, import_checking_activity_for_db
 from .migration import apply_obligation_migration as apply_obligation_migration_for_db
 from .sync_simplefin import sync_simplefin as sync_simplefin_for_db
 from .validate import run_live_validation as run_live_validation_for_db
@@ -129,16 +129,26 @@ from .surface_queue import (
 mcp = FastMCP("financial-agent")
 
 
-def _list_result(items) -> dict:
+def _list_result(items, total: int | None = None, more: int | None = None) -> dict:
     """Wrap a list tool's result as one structured block ({items, count}).
 
     Returning a bare list makes FastMCP explode it into one content block per
     item (e.g. 115 blocks for the onboarding queue); a dict returns a single
     clean block and adds a count.
+
+    Pass ``total`` (the count before any limit/offset) and ``more`` (rows left
+    beyond this page) when the collection was capped, so the caller gets an
+    explicit pointer instead of silently seeing a truncated list as if it were
+    the whole set.
     """
 
     items = list(items)
-    return {"items": items, "count": len(items)}
+    result = {"items": items, "count": len(items)}
+    if total is not None:
+        result["total_items"] = total
+    if more:
+        result["more"] = more
+    return result
 
 
 def _resolve_as_of(as_of_date: str | None) -> str:
@@ -616,6 +626,52 @@ def import_card_statement(
 
 
 @mcp.tool()
+def import_checking_activity(
+    text: str,
+    account_query: str = "checking",
+    as_of_date: str | None = None,
+    balance: float | None = None,
+    dry_run: bool = True,
+    db_path: str | None = None,
+) -> dict:
+    """Import pasted checking-account activity (CSV) into the DB.
+
+    The operating checking account is manual-sourced, so its activity is pasted in
+    as a CSV. This parses date/description/amount rows, fuzzy-matches the account,
+    stamps deterministic synthetic ids so a re-paste is idempotent, and upserts the
+    new rows as real transactions (source='checking_paste'). When ``balance`` is
+    given, a sticky manual balance snapshot is recorded for the same account, in
+    the same db transaction as the rows.
+
+    Default dry_run=True: parse + preview only. Re-run with dry_run=false to write.
+    as_of_date defaults to today. An ambiguous account match writes nothing and
+    returns candidates.
+    """
+
+    import datetime as _dt
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    resolved_as_of = as_of_date or _dt.date.today().isoformat()
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = import_checking_activity_for_db(
+            conn,
+            text=text,
+            account_query=account_query,
+            as_of_date=resolved_as_of,
+            balance=balance,
+            dry_run=dry_run,
+        )
+        if not dry_run and result.get("status") == "ok":
+            conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def list_income_sources(db_path: str | None = None) -> dict:
     """List configured income sources, schedule versions, review dates, and generated horizons."""
 
@@ -885,6 +941,8 @@ def list_obligations(
     instances_through: str | None = None,
     compact: bool = False,
     full: bool = False,
+    limit: int | None = None,
+    offset: int | None = None,
     db_path: str | None = None,
 ) -> dict:
     """List local canonical obligations and optionally their dated instances.
@@ -895,7 +953,9 @@ def list_obligations(
     by due date - prefer a window whenever include_instances is true. Instance
     rows are compact by default (due date, amount, status, confidence); set
     full=true for estimation provenance and notes. Set compact=True to replace
-    each obligation's instances array with an instance_count.
+    each obligation's instances array with an instance_count. Use limit/offset
+    to page the roster; when a limit truncates it, the result carries
+    total_items and a "more" count instead of silently dropping the rest.
     """
 
     import sqlite3
@@ -904,7 +964,7 @@ def list_obligations(
     conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     try:
-        return _list_result(list_obligations_for_db(
+        rows = list_obligations_for_db(
             conn,
             obligation_id=obligation_id,
             name_contains=name_contains,
@@ -915,7 +975,17 @@ def list_obligations(
             instances_through=instances_through,
             instances_summary=not full,
             compact=compact,
-        ))
+        )
+        total = len(rows)
+        # ponytail: page in Python after the DB read - the obligation roster is
+        # tens of rows, so slicing here is fine; push LIMIT/OFFSET into the SQL
+        # only if the roster ever grows large enough to matter.
+        start = offset or 0
+        paged = rows[start:]
+        if limit is not None:
+            paged = paged[:limit]
+        more = total - (start + len(paged))
+        return _list_result(paged, total=total, more=more)
     finally:
         conn.close()
 
@@ -1343,7 +1413,7 @@ def get_statement_status(
 @mcp.tool()
 def recompute_statement_estimates(
     target_obligation_id: str,
-    baseline: float = 0.0,
+    baseline: float | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Fill unconfirmed statement estimates from the card-input rollup, guarded.
@@ -1351,7 +1421,8 @@ def recompute_statement_estimates(
     Only statement instances whose amount is an unconfirmed projection are
     recomputed, as baseline (expected non-modeled card spend) plus the rolled-up
     modeled card inputs for that cycle. Portal/observed amounts are never
-    overwritten. Idempotent.
+    overwritten. With no baseline the existing estimate is preserved (not lowered
+    to inputs-only). Idempotent.
     """
 
     import sqlite3

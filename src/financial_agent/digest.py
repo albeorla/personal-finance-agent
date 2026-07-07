@@ -137,7 +137,7 @@ def build_daily_digest(
         "cash_flow": [
             {"window_days": p["window_days"], "ending_balance": p["ending_balance"],
              "lowest_balance": p["lowest_balance"], "lowest_balance_date": p["lowest_balance_date"],
-             "omitted_past_due_unreconciled_count": p.get("omitted_past_due_unreconciled_count", 0),
+             "carried_past_due_unreconciled_count": p.get("carried_past_due_unreconciled_count", 0),
              "trough_low_estimate": b["trough_low_estimate"],
              "trough_high_estimate": b["trough_high_estimate"],
              "trough_band_drivers": b["trough_band_drivers"],
@@ -422,11 +422,11 @@ def render_digest_markdown(digest: dict[str, Any], verbose: bool = False) -> str
         lines.append(f"| {c['window_days']}d | ${_money(c['ending_balance'])} | ${_money(c['lowest_balance'])} | {c['lowest_balance_date']} |")
     if not digest["cash_flow"]:
         lines.append("| - | (no projection) | - | - |")
-    omitted = max((c.get("omitted_past_due_unreconciled_count", 0) for c in digest["cash_flow"]), default=0)
-    if omitted:
+    carried = max((c.get("carried_past_due_unreconciled_count", 0) for c in digest["cash_flow"]), default=0)
+    if carried:
         lines.append(
-            f"> {omitted} past-due unreconciled obligation instance(s) predate the projection window "
-            f"and are excluded - reconcile or re-date them so the runway is not overstated."
+            f"> {carried} past-due unreconciled obligation instance(s) predate the projection window "
+            f"and are carried into the runway as due-now - reconcile or re-date them so the runway is accurate."
         )
     _render_trough_sensitivity(digest, lines)
     lines.append("")
@@ -435,7 +435,13 @@ def render_digest_markdown(digest: dict[str, Any], verbose: bool = False) -> str
     for o in digest["upcoming_obligations"]:
         sign = "-" if o["direction"] == "outflow" else "+"
         est = " (est)" if o.get("amount_status") == "estimated" else ""
-        lines.append(f"- {o['due_date']}  {sign}${_money(o['amount'])}{est}  {o['obligation_name']} ({o['status']}, {o['confidence'] or 'n/a'}) -> ${_money(o['running_balance'])}")
+        # Render the APPLIED amount (magnitude of signed_amount) so the line
+        # reconciles with running_balance. A discretionary sweep capped at the
+        # cash floor applies less than its planned amount; show planned vs applied.
+        applied = abs(o["signed_amount"])
+        planned = o["amount"]
+        cap = f" (planned ${_money(planned)}, capped to floor)" if abs(applied - planned) > 0.01 else ""
+        lines.append(f"- {o['due_date']}  {sign}${_money(applied)}{est}{cap}  {o['obligation_name']} ({o['status']}, {o['confidence'] or 'n/a'}) -> ${_money(o['running_balance'])}")
     if not digest["upcoming_obligations"]:
         lines.append("- none in window")
     lines.append("")

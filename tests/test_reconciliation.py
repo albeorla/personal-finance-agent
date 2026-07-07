@@ -4,6 +4,7 @@ import sqlite3
 
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.reconciliation import (
+    confirm_reconciliation_match,
     list_matched_obligation_instances,
     list_unmatched_obligation_instances,
     reconcile_obligation_instances,
@@ -122,6 +123,100 @@ def test_reconcile_is_idempotent(tmp_path):
     reconcile_obligation_instances(conn, as_of_date="2026-06-30")
     reconcile_obligation_instances(conn, as_of_date="2026-06-30")
     assert conn.execute("SELECT COUNT(*) FROM transaction_obligation_matches").fetchone()[0] == 1
+
+
+def test_one_transaction_covering_a_group_of_instances_shared_matches(tmp_path):
+    # A single lump payment settles two separate bills from the SAME vendor at
+    # once: the transaction amount equals the SUM of two same-direction,
+    # nearby-date instances that neither match 1:1, AND the transaction shares
+    # merchant evidence with each member (a real group, not a coincidence). Both
+    # instances should record the SAME transaction as a shared needs_review match
+    # (not merged, not auto-paid), so neither keeps projecting as a phantom outflow.
+    conn = _db(
+        tmp_path / "r.sqlite",
+        transactions=[("t-lump", "ACT-chk", "2026-06-16T08:00:00", -75.00, "Acme Streaming", "ACME STREAMING DRAFT")],
+    )
+    _obligation(conn, "svc_a", "Acme Streaming line one", "subscription",
+                [{"id": "svc_a:2026-06-15", "due_date": "2026-06-15", "amount": -30.00, "source": "seed"}])
+    _obligation(conn, "svc_b", "Acme Streaming line two", "subscription",
+                [{"id": "svc_b:2026-06-15", "due_date": "2026-06-15", "amount": -45.00, "source": "seed"}])
+
+    summary = reconcile_obligation_instances(conn, as_of_date="2026-06-20")
+    assert summary["matched_shared"] == 2
+    assert summary["unmatched"] == 0
+    assert summary["matched_auto"] == 0
+
+    matched = list_matched_obligation_instances(conn)
+    assert {m["transaction_id"] for m in matched} == {"t-lump"}
+    assert all(m["match_type"] == "needs_review" for m in matched)
+    assert len(matched) == 2
+    ev = next(m["evidence"] for m in matched if m["obligation_instance_id"] == "svc_a:2026-06-15")
+    assert ev["group"]["shared_transaction"] is True
+    assert ev["group"]["group_instance_ids"] == ["svc_a:2026-06-15", "svc_b:2026-06-15"]
+
+
+def test_shared_group_requires_merchant_evidence_not_amount_coincidence(tmp_path):
+    # BUG A regression: a transaction whose amount merely EQUALS the sum of two
+    # unrelated bills, with ZERO merchant overlap with either, must NOT group. A
+    # $75 car wash that happens to equal internet ($30) + phone ($45) is a
+    # coincidence; grouping it would record match rows that then hide both bills
+    # from the cash-flow past-due carry and overstate runway.
+    conn = _db(
+        tmp_path / "r.sqlite",
+        transactions=[("t-wash", "ACT-chk", "2026-06-16T08:00:00", -75.00, "Sparkle Car Wash", "CAR WASH")],
+    )
+    _obligation(conn, "internet", "Internet subscription", "subscription",
+                [{"id": "internet:2026-06-15", "due_date": "2026-06-15", "amount": -30.00, "source": "seed"}])
+    _obligation(conn, "phone", "Phone subscription", "subscription",
+                [{"id": "phone:2026-06-15", "due_date": "2026-06-15", "amount": -45.00, "source": "seed"}])
+
+    summary = reconcile_obligation_instances(conn, as_of_date="2026-06-20")
+    assert summary["matched_shared"] == 0
+    assert summary["matched_needs_review"] == 0
+    assert summary["unmatched"] == 2
+    # No coincidental match rows -> both bills stay visible to the past-due carry.
+    assert conn.execute("SELECT COUNT(*) FROM transaction_obligation_matches").fetchone()[0] == 0
+
+
+def test_shared_group_does_not_reuse_an_already_matched_transaction(tmp_path):
+    # BUG B regression: a transaction already settling (confirmed/paid against)
+    # one obligation must not be reused to invent a group for two still-open
+    # obligations, which would suppress real owed dollars. Here the two open
+    # bills DO share merchant evidence with the transaction (so BUG A's evidence
+    # gate would let them through) - only the already-matched exclusion stops the
+    # false group.
+    conn = _db(
+        tmp_path / "r.sqlite",
+        transactions=[("t-big", "ACT-chk", "2026-06-16T08:00:00", -2500.00, "Acme Payment", "ACME")],
+    )
+    _obligation(conn, "acme_paid", "Acme big bill", "housing",
+                [{"id": "acme_paid:2026-06-15", "due_date": "2026-06-15", "amount": -2500.00, "source": "seed"}])
+
+    # First pass: t-big auto-matches the $2,500 bill 1:1; confirm it paid.
+    reconcile_obligation_instances(conn, as_of_date="2026-06-20")
+    confirm_reconciliation_match(conn, "acme_paid:2026-06-15")
+    assert conn.execute(
+        "SELECT status FROM obligation_instances WHERE id = 'acme_paid:2026-06-15'"
+    ).fetchone()[0] == "paid"
+
+    # Two still-open Acme bills summing to the same $2,500 appear later.
+    _obligation(conn, "acme_a", "Acme service a", "subscription",
+                [{"id": "acme_a:2026-06-15", "due_date": "2026-06-15", "amount": -1000.00, "source": "seed"}])
+    _obligation(conn, "acme_b", "Acme service b", "subscription",
+                [{"id": "acme_b:2026-06-15", "due_date": "2026-06-15", "amount": -1500.00, "source": "seed"}])
+
+    summary = reconcile_obligation_instances(conn, as_of_date="2026-06-20")
+    # t-big is spent; it must not back a group for the two open bills.
+    assert summary["matched_shared"] == 0
+    open_matches = conn.execute(
+        "SELECT COUNT(*) FROM transaction_obligation_matches WHERE obligation_instance_id IN "
+        "('acme_a:2026-06-15','acme_b:2026-06-15')"
+    ).fetchone()[0]
+    assert open_matches == 0
+    open_unmatched = {
+        u["obligation_instance_id"] for u in list_unmatched_obligation_instances(conn)
+    }
+    assert {"acme_a:2026-06-15", "acme_b:2026-06-15"} <= open_unmatched
 
 
 def test_auto_mark_paid_sets_paid_with_evidence(tmp_path):

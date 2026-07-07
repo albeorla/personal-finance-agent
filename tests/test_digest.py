@@ -107,6 +107,35 @@ def test_estimated_amount_marked_in_render(tmp_path):
     assert "(est)" in render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"), verbose=True)
 
 
+def test_capped_discretionary_sweep_renders_applied_amount(tmp_path):
+    # BUG B regression: a discretionary sweep capped at the cash floor must DISPLAY
+    # the applied (capped) figure so it reconciles with the running balance. On a
+    # $5,000 balance a $4,000 sweep applies only $2,500 (5000 -> 2500); the line
+    # must not show "-$4,000.00 ... -> $2,500.00" (a visible wrong dollar figure).
+    db = _status_db(tmp_path / "d.sqlite", available=5000.0, obligations=[
+        ("sweep", "Card paydown sweep", "credit_card_statement",
+         [{"id": "sweep:2026-06-25", "due_date": "2026-06-25", "amount": -4000.0, "source": "seed"}]),
+    ])
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE obligations SET amount_discretionary=1 WHERE id='sweep'")
+    conn.commit()
+    conn.close()
+
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+    o = next(o for o in digest["upcoming_obligations"] if o["obligation_name"] == "Card paydown sweep")
+    assert o["signed_amount"] == -2500.0
+    assert o["running_balance"] == 2500.0
+
+    md = render_digest_markdown(digest, verbose=True)
+    line = next(ln for ln in md.splitlines() if "Card paydown sweep" in ln)
+    # Applied amount is the primary figure and it ties to the running balance.
+    assert "-$2,500.00" in line
+    assert "-> $2,500.00" in line
+    # Original planned amount is preserved as an annotation, never the headline.
+    assert "planned $4,000.00" in line
+    assert "-$4,000.00" not in line
+
+
 def test_status_render_uses_cash_runway_label(tmp_path):
     db = _status_db(tmp_path / "d.sqlite", available=9000.0)
     assert "Cash runway (modeled bills only): GREEN" in render_digest_markdown(build_daily_digest(db, as_of_date="2026-06-20"))

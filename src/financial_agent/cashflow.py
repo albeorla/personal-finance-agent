@@ -19,6 +19,12 @@ PROJECTABLE_STATUSES = {"expected", "needs_review", "partially_paid"}
 # the auto-suppression status; only ``active`` obligations project.
 NON_PROJECTABLE_OBLIGATION_STATUSES = {"dormant_suppressed"}
 
+# Minimum working-cash balance the projection protects. An optional discretionary
+# sweep (a debt paydown the user chooses to make) is capped so it never drives the
+# projected balance below this floor. Single source of truth: guardrails imports it
+# from here (guardrails already imports cashflow, so cashflow cannot import it back).
+CASH_FLOOR = 2500.0
+
 
 def build_cash_flow_projections(
     conn: sqlite3.Connection,
@@ -80,7 +86,11 @@ def _date_part(value: str | None) -> date | None:
 
 
 def _roll_forward_to_start(
-    conn: sqlite3.Connection, *, snapshot_date: date, start_date: date
+    conn: sqlite3.Connection,
+    *,
+    snapshot_date: date,
+    start_date: date,
+    snapshot_balance: float,
 ) -> float:
     """Net signed amount of instances dated between the balance snapshot and the
     projection start, used to carry the snapshot balance forward to ``start_date``.
@@ -91,11 +101,19 @@ def _roll_forward_to_start(
     ``due_date >= start_date`` filter and silently vanishes, so the run starts
     from today's cash with no upcoming income and trips a false cash-floor breach.
     Netting that gap back into the starting balance is the fix.
+
+    A discretionary sweep dated in this gap is capped by the SAME cash-floor rule
+    the in-window loop applies (``_discretionary_capped_signed_amount``), walking a
+    running balance from ``snapshot_balance`` in due-date order. Without this a
+    pre-window sweep subtracted its full amount here and the cap only ran later, so
+    the projection could start below the floor. Non-discretionary items are unchanged.
     """
+    running = round(float(snapshot_balance), 2)
     total = 0.0
     for r in conn.execute(
         """
-        SELECT oi.amount, oi.direction
+        SELECT oi.amount, oi.direction, oi.estimation_inputs_json,
+               o.amount_discretionary AS amount_discretionary
         FROM obligation_instances oi
         JOIN obligations o ON o.id = oi.obligation_id
         WHERE oi.due_date > ?
@@ -104,22 +122,53 @@ def _roll_forward_to_start(
           AND o.status = 'active'
           AND (o.active_until IS NULL OR oi.due_date <= o.active_until)
           AND COALESCE(oi.cash_flow_treatment, 'direct_checking') = 'direct_checking'
+        ORDER BY oi.due_date, oi.id
         """,
         (snapshot_date.isoformat(), start_date.isoformat()),
     ).fetchall():
-        total += _signed_amount(float(r["amount"]), r["direction"])
+        signed = _discretionary_capped_signed_amount(r, running)
+        running = round(running + signed, 2)
+        total += signed
     return round(total, 2)
 
 
-def _count_past_due_unreconciled(conn: sqlite3.Connection, *, start_date: date) -> int:
-    """Count active, direct-checking obligation instances dated before the
-    projection start that are still projectable and have no confirmed transaction
-    match. These fall outside the window's ``due_date >= start_date`` filter, so
-    without surfacing this count a genuinely missed obligation disappears from the
-    projection silently instead of being flagged for reconcile-or-re-date."""
-    row = conn.execute(
+def _select_past_due_unreconciled(
+    conn: sqlite3.Connection, *, before_date: date
+) -> list[sqlite3.Row]:
+    """Active, direct-checking obligation instances dated before ``before_date``
+    that are still projectable and have no confirmed transaction match. These
+    past-due, unpaid items fall outside the window's ``due_date >= start_date``
+    filter; carrying them into the runway as due-now events keeps a genuinely
+    missed obligation counted instead of silently dropped (which overstates the
+    runway) and flags it for reconcile-or-re-date.
+
+    ``before_date`` is the snapshot day (plus one) rather than ``start_date`` when
+    the roll-forward already netted the ``(snapshot, start)`` gap, so an instance
+    counted there is not carried here as well (no double-count)."""
+    return conn.execute(
         """
-        SELECT COUNT(*) AS n
+        SELECT
+            oi.id AS instance_id,
+            oi.obligation_id,
+            o.name AS obligation_name,
+            o.kind AS obligation_kind,
+            oi.due_date,
+            oi.amount,
+            oi.direction,
+            oi.status,
+            oi.source,
+            oi.confidence,
+            oi.notes,
+            oi.amount_status,
+            oi.amount_source,
+            oi.amount_observed_at,
+            oi.statement_close_date,
+            oi.review_after,
+            oi.estimation_method,
+            oi.estimation_inputs_json,
+            oi.cash_flow_treatment,
+            oi.statement_target_obligation_id,
+            o.amount_discretionary AS amount_discretionary
         FROM obligation_instances oi
         JOIN obligations o ON o.id = oi.obligation_id
         WHERE oi.due_date < ?
@@ -131,10 +180,10 @@ def _count_past_due_unreconciled(conn: sqlite3.Connection, *, start_date: date) 
               SELECT 1 FROM transaction_obligation_matches m
               WHERE m.obligation_instance_id = oi.id
           )
+        ORDER BY oi.due_date, oi.id
         """,
-        (start_date.isoformat(),),
-    ).fetchone()
-    return int(row["n"]) if row else 0
+        (before_date.isoformat(),),
+    ).fetchall()
 
 
 def _build_window_projection(
@@ -155,7 +204,10 @@ def _build_window_projection(
     rolled_forward = 0.0
     if snapshot_date is not None and snapshot_date < start_date:
         rolled_forward = _roll_forward_to_start(
-            conn, snapshot_date=snapshot_date, start_date=start_date
+            conn,
+            snapshot_date=snapshot_date,
+            start_date=start_date,
+            snapshot_balance=snapshot_balance,
         )
     starting_balance = round(snapshot_balance + rolled_forward, 2)
 
@@ -181,7 +233,8 @@ def _build_window_projection(
             oi.estimation_method,
             oi.estimation_inputs_json,
             oi.cash_flow_treatment,
-            oi.statement_target_obligation_id
+            oi.statement_target_obligation_id,
+            o.amount_discretionary AS amount_discretionary
         FROM obligation_instances oi
         JOIN obligations o ON o.id = oi.obligation_id
         WHERE oi.due_date >= ?
@@ -195,21 +248,31 @@ def _build_window_projection(
         (start_date.isoformat(), end_date_exclusive.isoformat()),
     ).fetchall()
 
-    omitted_past_due = _count_past_due_unreconciled(conn, start_date=start_date)
+    # Past-due, unpaid, unreconciled instances predate the window and so are absent
+    # from ``rows``. Carry them as due-now events at start_date so the owed dollars
+    # stay on the runway. When the roll-forward netted the (snapshot, start) gap,
+    # cap the carry at the snapshot day so those items are not counted twice.
+    carry_before = (
+        snapshot_date + timedelta(days=1)
+        if snapshot_date is not None and snapshot_date < start_date
+        else start_date
+    )
+    past_due_rows = _select_past_due_unreconciled(conn, before_date=carry_before)
 
     running_balance = round(float(starting_balance), 2)
     lowest_balance = running_balance
     lowest_balance_date = start_date.isoformat()
     events = []
+    carried_past_due: list[dict[str, Any]] = []
 
-    for row in rows:
-        signed_amount = _signed_amount(float(row["amount"]), row["direction"])
+    for is_past_due, row in [(True, r) for r in past_due_rows] + [(False, r) for r in rows]:
+        signed_amount = _discretionary_capped_signed_amount(row, running_balance)
         running_balance = round(running_balance + signed_amount, 2)
         if running_balance < lowest_balance:
             lowest_balance = running_balance
-            lowest_balance_date = row["due_date"]
-        events.append(
-            {
+            # A carried item is due now, so its trough dates to start_date.
+            lowest_balance_date = start_date.isoformat() if is_past_due else row["due_date"]
+        event = {
                 "instance_id": row["instance_id"],
                 "obligation_id": row["obligation_id"],
                 "obligation_name": row["obligation_name"],
@@ -233,7 +296,17 @@ def _build_window_projection(
                 "statement_target_obligation_id": row["statement_target_obligation_id"],
                 "running_balance": running_balance,
             }
-        )
+        if is_past_due:
+            event["past_due_carried"] = True
+            carried_past_due.append(
+                {
+                    "instance_id": row["instance_id"],
+                    "amount": event["amount"],
+                    "signed_amount": event["signed_amount"],
+                    "due_date": row["due_date"],
+                }
+            )
+        events.append(event)
 
     return {
         "window_days": window_days,
@@ -254,7 +327,8 @@ def _build_window_projection(
         "ending_balance": running_balance,
         "lowest_balance": round(lowest_balance, 2),
         "lowest_balance_date": lowest_balance_date,
-        "omitted_past_due_unreconciled_count": omitted_past_due,
+        "carried_past_due_unreconciled_count": len(carried_past_due),
+        "carried_past_due": carried_past_due,
         "events": events,
         "provenance": {
             "tables": ["obligations", "obligation_instances", "balance_snapshots"],
@@ -292,6 +366,47 @@ def _signed_amount(amount: float, direction: str) -> float:
     if direction == "inflow":
         return amount
     return -amount
+
+
+def _discretionary_capped_signed_amount(row: sqlite3.Row, running_balance: float) -> float:
+    """Signed amount for one event, capping an optional discretionary sweep.
+
+    A discretionary outflow (an optional debt-paydown sweep the user chooses to
+    make) is split into a required minimum, always applied, and an optional sweep,
+    applied only up to the headroom above ``CASH_FLOOR``. So the sweep never drives
+    the projected balance below the cash floor -- the user tops it up by hand
+    instead of the runway silently dipping under the floor. The required minimum
+    defaults to 0 (the whole modeled amount is optional) and can be pinned per
+    instance via ``estimation_inputs.required_minimum``. Fixed/required
+    obligations and inflows are unaffected.
+    """
+
+    amount = float(row["amount"])
+    direction = row["direction"]
+    if direction != "outflow" or not _row_discretionary(row):
+        return _signed_amount(amount, direction)
+    required = min(amount, _required_minimum(row))
+    headroom = running_balance - required - CASH_FLOOR
+    optional_applied = min(amount - required, max(0.0, headroom))
+    return -round(required + optional_applied, 2)
+
+
+def _row_discretionary(row: sqlite3.Row) -> bool:
+    try:
+        return bool(row["amount_discretionary"])
+    except (IndexError, KeyError):
+        return False
+
+
+def _required_minimum(row: sqlite3.Row) -> float:
+    """Required-minimum floor for a discretionary instance, from estimation_inputs."""
+    inputs = _decode_json(row["estimation_inputs_json"])
+    if not isinstance(inputs, dict):
+        return 0.0
+    try:
+        return max(0.0, float(inputs.get("required_minimum") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _decode_json(value: str | None) -> Any:

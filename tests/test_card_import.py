@@ -17,6 +17,7 @@ from financial_agent.card_import import (
     assign_synthetic_ids,
     detect_format,
     import_card_statement_for_db,
+    import_checking_activity_for_db,
     parse_apple_csv,
     parse_apple_statement,
     parse_text,
@@ -262,6 +263,131 @@ def test_dry_run_preview_after_apply_reports_all_duplicate(tmp_path):
     preview = import_card_statement_for_db(conn, text=APPLE_CSV, as_of_date="2026-06-26")
     assert preview["dry_run"] is True
     assert preview["new"] == 0 and preview["duplicate"] == 5
+
+
+# --- checking activity paste (manual-sourced operating account) -------------
+
+
+# A checking-activity CSV: a payroll deposit (inflow) and two same-amount coffee
+# withdrawals on different days (distinct synthetic ids by date).
+CHECKING_CSV = """Date,Description,Amount
+06/05/2026,PAYROLL DEPOSIT,2500.00
+06/06/2026,CORNER STORE,-42.10
+06/07/2026,CORNER STORE,-42.10
+"""
+
+
+def test_checking_import_writes_txns_and_balance_and_is_idempotent(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed_accounts(conn)
+    # Dry run (default) parses but writes nothing.
+    preview = import_checking_activity_for_db(
+        conn, text=CHECKING_CSV, account_query="PREMIER PLUS CKG", as_of_date="2026-06-08"
+    )
+    assert preview["dry_run"] is True and preview["new"] == 3
+    assert preview["account"]["account_id"] == "ACT-chk"  # not the Apple Card
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+    # Apply writes 3 checking txns under the checking source + a manual balance.
+    applied = import_checking_activity_for_db(
+        conn,
+        text=CHECKING_CSV,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2026-06-08",
+        balance=3200.00,
+        dry_run=False,
+    )
+    assert applied["status"] == "ok" and applied["new"] == 3
+    rows = conn.execute(
+        "SELECT source, amount FROM transactions WHERE account_id = 'ACT-chk' ORDER BY amount"
+    ).fetchall()
+    assert len(rows) == 3 and all(r["source"] == "checking_paste" for r in rows)
+    snap = conn.execute(
+        "SELECT balance FROM balance_snapshots WHERE account_id = 'ACT-chk' AND source = 'manual'"
+    ).fetchone()
+    assert snap["balance"] == 3200.00
+
+    # Re-paste reproduces the same synthetic ids -> nothing new, no duplicate rows.
+    again = import_checking_activity_for_db(
+        conn,
+        text=CHECKING_CSV,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2026-06-09",
+        dry_run=False,
+    )
+    assert again["new"] == 0 and again["duplicate"] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE account_id = 'ACT-chk'"
+    ).fetchone()[0] == 3
+
+
+# A bank export with separate Debit/Credit columns (no signed Amount column).
+# A Debit is money out (rent, an outflow), a Credit is money in (a deposit).
+DEBIT_CREDIT_CSV = """Date,Description,Debit,Credit
+06/01/2026,RENT,3000.00,
+06/02/2026,PAYCHECK,,2500.00
+"""
+
+
+def test_debit_credit_columns_sign_outflows_negative_and_inflows_positive():
+    # Regression: parse_generic_csv used to lump a "Debit" column into the
+    # signed-amount candidates, so Debit=3000 (an outflow) imported as +3000
+    # inflow - a $6,000 sign error - and the Credit row was dropped entirely.
+    parsed = ci.parse_generic_csv(DEBIT_CREDIT_CSV)
+    by_merchant = {t["merchant"]: t for t in parsed["txns"]}
+    assert len(parsed["txns"]) == 2  # neither row is silently skipped
+    assert by_merchant["RENT"]["amount"] == -3000.00
+    assert by_merchant["RENT"]["inflow"] is False
+    assert by_merchant["PAYCHECK"]["amount"] == 2500.00
+    assert by_merchant["PAYCHECK"]["inflow"] is True
+
+
+def test_debit_credit_ambiguous_row_is_skipped_not_silently_netted():
+    # A row with BOTH Debit and Credit non-zero is contradictory. It must be
+    # skipped (and counted), never silently netted to credit - debit, which
+    # would invent a sign. A 0.00 in the unused column is NOT ambiguous.
+    csv_text = (
+        "Date,Description,Debit,Credit\n"
+        "06/01/2026,AMBIGUOUS,20.00,50.00\n"   # both populated -> skip loudly
+        "06/02/2026,CLEAN OUTFLOW,42.00,0.00\n"  # zero credit -> still a clean -42
+    )
+    parsed = ci.parse_generic_csv(csv_text)
+    by_merchant = {t["merchant"]: t for t in parsed["txns"]}
+    assert "AMBIGUOUS" not in by_merchant  # not netted into a +30 phantom
+    assert parsed["skipped"] == 1
+    assert by_merchant["CLEAN OUTFLOW"]["amount"] == -42.00
+
+
+def test_signed_amount_column_still_wins_and_is_unchanged():
+    # The real Chase export uses a single signed Amount column; must not regress.
+    parsed = ci.parse_generic_csv(CHECKING_CSV)
+    by_merchant = {t["merchant"]: t for t in parsed["txns"]}
+    assert by_merchant["PAYROLL DEPOSIT"]["amount"] == 2500.00
+    assert by_merchant["PAYROLL DEPOSIT"]["inflow"] is True
+    assert by_merchant["CORNER STORE"]["amount"] == -42.10
+    assert by_merchant["CORNER STORE"]["inflow"] is False
+
+
+def test_checking_import_end_to_end_with_debit_credit_columns(tmp_path):
+    # End-to-end through the checking importer (which calls parse_generic_csv
+    # directly): the outflow lands as a negative transaction, not a positive one.
+    conn = _db(tmp_path / "s.sqlite")
+    _seed_accounts(conn)
+    applied = import_checking_activity_for_db(
+        conn,
+        text=DEBIT_CREDIT_CSV,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2026-06-03",
+        dry_run=False,
+    )
+    assert applied["status"] == "ok" and applied["new"] == 2
+    rows = dict(
+        conn.execute(
+            "SELECT payee, amount FROM transactions WHERE account_id = 'ACT-chk'"
+        ).fetchall()
+    )
+    assert rows["RENT"] == -3000.00
+    assert rows["PAYCHECK"] == 2500.00
 
 
 # --- digest board-health: apple_card_stale flips ---------------------------

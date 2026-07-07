@@ -76,6 +76,20 @@ def aggregate_statement_inputs(
         (CARD_STATEMENT_INPUT, target_obligation_id, *PROJECTABLE_INPUT_STATUSES),
     ).fetchall()
 
+    # Converted card inputs with no statement_target_obligation_id are bound to
+    # no cycle; surface them so they are not silently invisible to projections.
+    unbound = conn.execute(
+        f"""
+        SELECT id
+        FROM obligation_instances
+        WHERE cash_flow_treatment = ?
+          AND statement_target_obligation_id IS NULL
+          AND status IN ({",".join("?" for _ in PROJECTABLE_INPUT_STATUSES)})
+        ORDER BY due_date, id
+        """,
+        (CARD_STATEMENT_INPUT, *PROJECTABLE_INPUT_STATUSES),
+    ).fetchall()
+
     assignments: dict[str, list[sqlite3.Row]] = defaultdict(list)
     unrolled: list[sqlite3.Row] = []
     for inp in inputs:
@@ -122,6 +136,8 @@ def aggregate_statement_inputs(
         "inputs_assigned": sum(len(v) for v in assignments.values()),
         "unrolled_inputs": len(unrolled),
         "unrolled_instance_ids": [i["id"] for i in unrolled],
+        "unbound_inputs": len(unbound),
+        "unbound_instance_ids": [i["id"] for i in unbound],
     }
 
 
@@ -307,11 +323,32 @@ def get_statement_status(
     }
 
 
+def _prior_rollup_baseline(inst: sqlite3.Row) -> float | None:
+    """Return the non-modeled baseline recorded by a previous rollup, or None.
+
+    Only trusted when the prior estimate itself came from this rollup source;
+    otherwise the caller falls back to backing the baseline out of the amount.
+    """
+    if (inst["amount_source"] or "") != ROLLUP_AMOUNT_SOURCE:
+        return None
+    raw = inst["estimation_inputs_json"]
+    if not raw:
+        return None
+    try:
+        prior = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    baseline = prior.get("baseline") if isinstance(prior, dict) else None
+    if isinstance(baseline, bool) or not isinstance(baseline, (int, float)):
+        return None
+    return round(float(baseline), 2)
+
+
 def recompute_statement_estimates(
     conn: sqlite3.Connection,
     *,
     target_obligation_id: str,
-    baseline: float = 0.0,
+    baseline: float | None = None,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fill unconfirmed statement estimates from the card-input rollup.
@@ -321,12 +358,18 @@ def recompute_statement_estimates(
     source are recomputed, as ``baseline`` (the caller's expected non-modeled
     card spend) plus the rolled-up modeled card inputs for that cycle. Portal and
     confirmed amounts are left untouched. Idempotent.
+
+    When no ``baseline`` is supplied, the existing estimate is preserved rather
+    than clobbered down to inputs-only: the non-modeled portion is backed out of
+    the current amount so the recompute never lowers an estimate it cannot
+    improve (money-safe default).
     """
 
     ensure_app_schema(conn)
-    aggregate_statement_inputs(conn, target_obligation_id=target_obligation_id)
+    agg = aggregate_statement_inputs(conn, target_obligation_id=target_obligation_id)
     now = _now()
-    baseline = round(float(baseline), 2)
+    explicit_baseline = baseline is not None
+    baseline = round(float(baseline), 2) if explicit_baseline else 0.0
 
     cycles_by_instance = {
         row["statement_instance_id"]: row
@@ -339,7 +382,7 @@ def recompute_statement_estimates(
 
     statement_instances = conn.execute(
         """
-        SELECT id, amount, amount_status, amount_source
+        SELECT id, amount, amount_status, amount_source, estimation_inputs_json
         FROM obligation_instances
         WHERE obligation_id = ?
           AND statement_close_date IS NOT NULL
@@ -362,10 +405,24 @@ def recompute_statement_estimates(
         if cycle is None:
             skipped_no_cycle += 1
             continue
-        new_amount = round(baseline + float(cycle["input_sum"]), 2)
+        input_sum = round(float(cycle["input_sum"]), 2)
+        if explicit_baseline:
+            inst_baseline = baseline
+        else:
+            # Prefer the non-modeled baseline recorded the last time this
+            # estimate was rolled up. Backing it out of the current amount
+            # (existing - input_sum) silently drops the baseline to 0 once the
+            # card-input total grows past the old estimate, so a rising input
+            # sum would erase real non-modeled spend. The stored baseline is
+            # stable across input growth.
+            inst_baseline = _prior_rollup_baseline(inst)
+            if inst_baseline is None:
+                existing = round(abs(float(inst["amount"])), 2) if inst["amount"] is not None else 0.0
+                inst_baseline = max(round(existing - input_sum, 2), 0.0)
+        new_amount = round(inst_baseline + input_sum, 2)
         estimation_inputs = {
-            "baseline": baseline,
-            "card_input_sum": round(float(cycle["input_sum"]), 2),
+            "baseline": inst_baseline,
+            "card_input_sum": input_sum,
             "input_count": cycle["input_count"],
             "cycle_close_date": cycle["cycle_close_date"],
         }
@@ -388,17 +445,24 @@ def recompute_statement_estimates(
         details.append({"instance_id": inst["id"], "amount": new_amount, "card_input_sum": estimation_inputs["card_input_sum"]})
 
     warnings: list[str] = []
-    if baseline == 0.0 and updated:
+    if explicit_baseline and baseline == 0.0 and updated:
         warnings.append(
             "baseline is 0, so recomputed estimates reflect only modeled card inputs and likely "
             "underestimate the full statement; pass a baseline for normal non-modeled card spend"
         )
+    if agg["unbound_inputs"]:
+        warnings.append(
+            f"{agg['unbound_inputs']} converted card input(s) have no statement target and are "
+            "excluded from every statement rollup; bind them to the paying statement obligation"
+        )
     return {
         "target_obligation_id": target_obligation_id,
-        "baseline": baseline,
+        "baseline": baseline if explicit_baseline else None,
         "updated": updated,
         "skipped_protected": skipped_protected,
         "skipped_no_cycle": skipped_no_cycle,
+        "unbound_inputs": agg["unbound_inputs"],
+        "unbound_instance_ids": agg["unbound_instance_ids"],
         "details": details,
         "warnings": warnings,
     }

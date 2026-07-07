@@ -18,6 +18,7 @@ on the same data produces the same matches and the same review state.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import sqlite3
@@ -80,6 +81,7 @@ def reconcile_obligation_instances(
         "considered": len(instances),
         "matched_auto": 0,
         "matched_needs_review": 0,
+        "matched_shared": 0,
         "unmatched": 0,
         "marked_paid": 0,
         "flagged_needs_review": 0,
@@ -89,8 +91,16 @@ def reconcile_obligation_instances(
     # A transaction can settle at most one obligation instance. Process in due
     # order and let the earliest instance claim a transaction, so two obligations
     # with the same amount/merchant cannot both match the same transaction.
-    claimed: set[str] = set()
+    # Pre-pass: one bank transaction that settles a GROUP of instances at once (a
+    # single lump payment equal to the summed amount of several same-direction,
+    # nearby-date bills). Records that transaction against each group member so it
+    # stops projecting as a phantom future outflow. Runs before the 1:1 loop and
+    # claims its transactions so they are not reused below.
+    grouped, group_claimed = _match_shared_transactions(conn, instances, opts, as_of, now, summary)
+    claimed: set[str] = set(group_claimed)
     for inst in instances:
+        if inst["id"] in grouped:
+            continue  # already recorded by the shared-transaction pre-pass
         best = _best_match(conn, inst, opts, claimed)
         if best is not None and best["match_type"] in {"auto", "needs_review"}:
             claimed.add(best["transaction_id"])
@@ -116,6 +126,168 @@ def reconcile_obligation_instances(
                 summary["flagged_needs_review"] += 1
 
     return summary
+
+
+# Bound the subset search so a wide unmatched window can never blow up
+# combinatorially. ponytail: naive combinations scan, capped; if real groups ever
+# exceed these sizes, raise the caps or switch to a subset-sum DP.
+_SHARED_MAX_GROUP = 4
+_SHARED_MAX_POOL = 12
+
+
+def _match_shared_transactions(
+    conn: sqlite3.Connection,
+    instances: list[sqlite3.Row],
+    opts: dict[str, Any],
+    as_of: date,
+    now: str,
+    summary: dict[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Match one transaction to a group of instances whose amounts sum to it.
+
+    Only considers instances that would NOT reconcile 1:1 on their own (otherwise
+    the normal path owns them), same-direction and within the date window of the
+    transaction, and only acts when EXACTLY ONE subset sums to the amount (an
+    ambiguous set is skipped). This is a shared-transaction match, not a merge: the
+    obligations stay separate; each member gets its own needs_review match row
+    pointing at the shared transaction. Returns (grouped_instance_ids, claimed_txn_ids).
+    """
+
+    if not _has_transactions_table(conn):
+        return set(), set()
+    window = int(opts["date_window_days"])
+
+    # Eligible = reconcilable instances with no individual (1:1) match. Grouping is
+    # only for the phantom-outflow case the 1:1 loop cannot resolve.
+    eligible = [inst for inst in instances if not _individually_matchable(conn, inst, opts)]
+    if len(eligible) < 2:
+        return set(), set()
+
+    # BUG B guard: a transaction already recorded against another obligation (a
+    # confirmed/paid match, or a 1:1 match on an instance we are not regrouping)
+    # must not be reused to invent a group. Excludes matches on instances OUTSIDE
+    # the eligible set only, so a prior shared match re-groups idempotently.
+    eligible_ids = {inst["id"] for inst in eligible}
+    already_matched: set[str] = {
+        tid
+        for tid, oiid in conn.execute(
+            "SELECT transaction_id, obligation_instance_id FROM transaction_obligation_matches WHERE transaction_id IS NOT NULL"
+        )
+        if oiid not in eligible_ids
+    }
+    already_matched.update(
+        tid
+        for (tid,) in conn.execute(
+            "SELECT matched_transaction_id FROM obligation_instances WHERE matched_transaction_id IS NOT NULL"
+        )
+    )
+
+    dues = {inst["id"]: _coerce_date(inst["due_date"]) for inst in eligible}
+    start = min(dues.values()).toordinal() - window
+    end = max(dues.values()).toordinal() + window
+    txns = conn.execute(
+        """
+        SELECT id, posted, transacted_at, amount, payee, description
+        FROM transactions
+        WHERE substr(COALESCE(posted, transacted_at), 1, 10) >= ?
+          AND substr(COALESCE(posted, transacted_at), 1, 10) <= ?
+        ORDER BY substr(COALESCE(posted, transacted_at), 1, 10), id
+        """,
+        (date.fromordinal(start).isoformat(), date.fromordinal(end).isoformat()),
+    ).fetchall()
+
+    grouped: set[str] = set()
+    claimed: set[str] = set()
+    used: set[str] = set()
+    for txn in txns:
+        if txn["id"] in already_matched:
+            continue  # BUG B: already settles another obligation, cannot back a new group
+        posted = (txn["posted"] or txn["transacted_at"] or "")[:10]
+        if not posted:
+            continue
+        txn_amount = float(txn["amount"])
+        txn_direction = "inflow" if txn_amount > 0 else "outflow"
+        txn_date = date.fromisoformat(posted)
+        target = round(abs(txn_amount), 2)
+        tol = max(float(opts["amount_abs_tolerance"]), target * float(opts["amount_pct_tolerance"]))
+        txn_tokens = _tokens(f"{txn['payee'] or ''} {txn['description'] or ''}")
+
+        # BUG A: grouping requires real merchant evidence, not amount+date alone. A
+        # member with zero merchant overlap with the transaction is a coincidence
+        # (a $75 car wash "summing" to internet + phone), so drop it from the pool
+        # before subset-summing. Parallels the 1:1 path's zero-merchant weak guard.
+        pool = [
+            inst for inst in eligible
+            if inst["id"] not in used
+            and inst["direction"] == txn_direction
+            and abs((txn_date - dues[inst["id"]]).days) <= window
+            and _merchant_score(_tokens(inst["obligation_name"] or ""), txn_tokens) > 0.0
+        ]
+        if len(pool) < 2 or len(pool) > _SHARED_MAX_POOL:
+            continue  # too few to group, or too many to search safely
+
+        combo = _unique_summing_subset(pool, target, tol)
+        if combo is None:
+            continue
+
+        group_sum = round(sum(abs(float(i["amount"])) for i in combo), 2)
+        amount_score = 1.0 if abs(group_sum - target) <= 0.005 else 0.7
+        group_ids = sorted(i["id"] for i in combo)
+        for inst in combo:
+            date_delta = abs((txn_date - dues[inst["id"]]).days)
+            date_score = 1.0 if date_delta <= 1 else max(0.0, 1.0 - (date_delta - 1) / max(window, 1))
+            merchant_score = _merchant_score(_tokens(inst["obligation_name"] or ""), txn_tokens)
+            best = {
+                "transaction_id": txn["id"],
+                "match_type": "needs_review",  # shared matches are never auto-marked paid
+                "match_score": round(amount_score * 0.5 + date_score * 0.3 + merchant_score * 0.2, 3),
+                "amount_score": amount_score,
+                "date_score": round(date_score, 3),
+                "merchant_score": merchant_score,
+                "amount_delta": round(abs(group_sum - target), 2),
+                "date_delta_days": (txn_date - dues[inst["id"]]).days,
+                "txn_amount": round(txn_amount, 2),
+                "txn_payee": txn["payee"],
+                "txn_date": posted,
+                "group_evidence": {
+                    "shared_transaction": True,
+                    "group_instance_ids": group_ids,
+                    "group_amount": group_sum,
+                    "member_amount": round(abs(float(inst["amount"])), 2),
+                },
+            }
+            _record_match(conn, inst, best, as_of, now)
+            _clear_unmatched(conn, inst["id"])
+            grouped.add(inst["id"])
+            used.add(inst["id"])
+            summary["matched_needs_review"] += 1
+            summary["matched_shared"] += 1
+        claimed.add(txn["id"])
+
+    return grouped, claimed
+
+
+def _unique_summing_subset(
+    pool: list[sqlite3.Row], target: float, tol: float
+) -> tuple[sqlite3.Row, ...] | None:
+    """The one subset (size >= 2) of pool that sums to target within tol, or None.
+
+    Returns None if no subset matches OR if more than one does (ambiguous group).
+    """
+
+    found: tuple[sqlite3.Row, ...] | None = None
+    for size in range(2, min(_SHARED_MAX_GROUP, len(pool)) + 1):
+        for combo in itertools.combinations(pool, size):
+            if abs(round(sum(abs(float(i["amount"])) for i in combo), 2) - target) <= tol:
+                if found is not None:
+                    return None  # ambiguous: two distinct subsets both sum to target
+                found = combo
+    return found
+
+
+def _individually_matchable(conn: sqlite3.Connection, inst: sqlite3.Row, opts: dict[str, Any]) -> bool:
+    best = _best_match(conn, inst, opts)
+    return best is not None and best["match_type"] in {"auto", "needs_review"}
 
 
 def confirm_reconciliation_match(
@@ -524,6 +696,8 @@ def _record_match(conn: sqlite3.Connection, inst: sqlite3.Row, best: dict[str, A
         "instance_amount": round(abs(float(inst["amount"])), 2),
         "instance_due_date": inst["due_date"],
     }
+    if best.get("group_evidence"):
+        evidence["group"] = best["group_evidence"]
     conn.execute(
         """
         INSERT INTO transaction_obligation_matches (

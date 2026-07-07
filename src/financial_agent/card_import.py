@@ -40,6 +40,10 @@ from .manual_balance import _MATCH_FLOOR, _TIE_BAND, _score, set_manual_balance
 from .schema import ensure_app_schema
 
 PASTE_SOURCE = "apple_card_paste"
+# The operating checking account is manual-sourced (no reliable live feed), so its
+# activity is pasted in as a CSV. Its transactions land under this source, kept
+# distinct from the card-paste lane and the SimpleFIN feed.
+CHECKING_SOURCE = "checking_paste"
 
 # Card org -> the canonical statement-payment obligation its charges roll into.
 # Mirrors onboarding.ORG_TO_STATEMENT_TARGET for the Apple Card only (this module
@@ -188,21 +192,41 @@ def parse_generic_csv(text: str) -> dict[str, Any]:
     """Best-effort date/desc/amount mapping for non-Apple card exports.
 
     Other cards (Amex/Citi) land here later; v1 keeps it minimal and never
-    promotes a statement total. Sign is preserved from the source amount.
+    promotes a statement total. Sign comes from a signed Amount column when
+    present, else from Debit (outflow) / Credit (inflow) columns.
     """
 
     reader = csv.DictReader(io.StringIO(text.lstrip()))
     fields = {(f or "").strip().lower(): f for f in (reader.fieldnames or [])}
     date_col = _first_match(fields, ("transaction date", "date", "posted date"))
-    amount_col = _first_match(fields, ("amount (usd)", "amount", "debit"))
+    # A single signed Amount column wins (our real Chase export). Otherwise fall
+    # back to separate Debit/Credit columns with the checking sign convention:
+    # a Debit is money out (negative), a Credit is money in (positive). Never
+    # treat a Debit as a signed amount - that inverts every outflow.
+    amount_col = _first_match(fields, ("amount (usd)", "amount"))
+    debit_col = _first_match(fields, ("debit",))
+    credit_col = _first_match(fields, ("credit",))
     desc_col = _first_match(fields, ("merchant", "description", "payee", "name"))
     txns: list[dict[str, Any]] = []
     skipped = 0
-    if date_col is None or amount_col is None:
+    if date_col is None or (amount_col is None and debit_col is None and credit_col is None):
         return {"txns": [], "skipped": 0, "statement_total": None, "statement_close_date": None}
     for row in reader:
         iso = _to_iso_date((row.get(date_col) or "").strip())
-        amount = _parse_money((row.get(amount_col) or "").strip())
+        if amount_col is not None:
+            amount = _parse_money((row.get(amount_col) or "").strip())
+        else:
+            debit = _parse_money((row.get(debit_col) or "").strip()) if debit_col else None
+            credit = _parse_money((row.get(credit_col) or "").strip()) if credit_col else None
+            if debit is None and credit is None:
+                amount = None
+            elif debit and credit:
+                # Ambiguous: a row is a debit OR a credit, never both non-zero.
+                # Skip loudly (counted in `skipped`) rather than silently net a
+                # wrong sign via credit - debit.
+                amount = None
+            else:
+                amount = (abs(credit) if credit is not None else 0.0) - (abs(debit) if debit is not None else 0.0)
         if iso is None or amount is None:
             skipped += 1
             continue
@@ -239,13 +263,15 @@ def synthetic_txn_id(
     amount: float,
     merchant: str,
     ordinal: int,
+    prefix: str = "applecard",
 ) -> str:
-    """Deterministic id for a pasted card txn (Apple supplies none).
+    """Deterministic id for a pasted txn (the source supplies none).
 
-    ``id = applecard:sha1(account_id|transacted_date|signed_amount|merchant_slug|ordinal)``.
+    ``id = {prefix}:sha1(account_id|transacted_date|signed_amount|merchant_slug|ordinal)``.
     ``ordinal`` disambiguates genuine same-day / same-merchant / same-amount
     charges within one paste. Re-pasting reproduces the same ids, so the upsert is
-    idempotent and overlap is absorbed.
+    idempotent and overlap is absorbed. ``prefix`` namespaces the id per source
+    (``applecard`` for card pastes, ``checking`` for checking activity).
     """
 
     payload = "|".join(
@@ -258,10 +284,12 @@ def synthetic_txn_id(
         ]
     )
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
-    return f"applecard:{digest}"
+    return f"{prefix}:{digest}"
 
 
-def assign_synthetic_ids(account_id: str, txns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def assign_synthetic_ids(
+    account_id: str, txns: list[dict[str, Any]], prefix: str = "applecard"
+) -> list[dict[str, Any]]:
     """Stamp each parsed txn with its synthetic id, ordinal-disambiguated.
 
     The ordinal counts prior identical (date, signed amount, merchant slug) rows
@@ -275,7 +303,7 @@ def assign_synthetic_ids(account_id: str, txns: list[dict[str, Any]]) -> list[di
         key = (txn["transacted_date"], f"{txn['amount']:.2f}", _merchant_slug(txn["merchant"]))
         ordinal = seen.get(key, 0)
         seen[key] = ordinal + 1
-        out.append({**txn, "id": synthetic_txn_id(account_id, txn["transacted_date"], txn["amount"], txn["merchant"], ordinal), "ordinal": ordinal})
+        out.append({**txn, "id": synthetic_txn_id(account_id, txn["transacted_date"], txn["amount"], txn["merchant"], ordinal, prefix), "ordinal": ordinal})
     return out
 
 
@@ -425,6 +453,125 @@ def import_card_statement_for_db(
 
     result["preview"] = _render_preview(result)
     return result
+
+
+def import_checking_activity_for_db(
+    conn: sqlite3.Connection,
+    *,
+    text: str,
+    account_query: str = "checking",
+    as_of_date: str,
+    balance: float | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Parse pasted checking-account activity (CSV) and (unless dry-run) write it.
+
+    The operating checking account is manual-sourced, so activity is pasted in as
+    a CSV. This reuses the generic CSV parser, resolves the account (fuzzy,
+    unambiguous), stamps deterministic synthetic ids (``checking:`` prefix) so a
+    re-paste is idempotent, and upserts the new rows as ``transactions``
+    (``source='checking_paste'``). When ``balance`` is given, a sticky manual
+    balance snapshot is recorded for the same account. The caller owns
+    commit/rollback, so the transaction rows and the balance snapshot land in one
+    db transaction.
+    """
+
+    ensure_app_schema(conn)
+    now = _now()
+    warnings: list[str] = []
+
+    parsed = parse_generic_csv(text)
+    if not parsed["txns"]:
+        return {
+            "status": "unparsed",
+            "dry_run": dry_run,
+            "message": "Could not parse a date/amount CSV. Expect a header with date and amount columns.",
+            "skipped_rows": parsed["skipped"],
+            "preview": "import_checking_activity: unparsed - paste a CSV with date and amount columns.",
+        }
+
+    account = _resolve_account(conn, account_query)
+    if account["status"] != "ok":
+        return {
+            "status": account["status"],
+            "dry_run": dry_run,
+            "candidates": account.get("candidates"),
+            "message": account.get("message"),
+            "preview": f"import_checking_activity: {account['status']} - {account.get('message','')}",
+        }
+
+    account_id = account["account_id"]
+    txns = assign_synthetic_ids(account_id, parsed["txns"], prefix="checking")
+
+    new_rows: list[dict[str, Any]] = []
+    duplicate = 0
+    for txn in txns:
+        exists = conn.execute("SELECT 1 FROM transactions WHERE id = ?", (txn["id"],)).fetchone()
+        if exists:
+            duplicate += 1
+        else:
+            new_rows.append(txn)
+
+    inflow_rows = [t for t in txns if t["inflow"]]
+    outflow_rows = [t for t in txns if not t["inflow"]]
+    if parsed["skipped"]:
+        warnings.append(f"{parsed['skipped']} row(s) skipped (unparsable date/amount).")
+
+    result: dict[str, Any] = {
+        "status": "preview" if dry_run else "ok",
+        "dry_run": dry_run,
+        "account": {
+            "account_id": account_id,
+            "account_name": account["account_name"],
+            "org": account["org"],
+            "score": account["score"],
+        },
+        "rows_parsed": len(txns),
+        "inflow_rows": len(inflow_rows),
+        "outflow_rows": len(outflow_rows),
+        "skipped_rows": parsed["skipped"],
+        "new": len(new_rows),
+        "duplicate": duplicate,
+        "balance": round(float(balance), 2) if balance is not None else None,
+        "balance_snapshot": None,
+        "warnings": warnings,
+    }
+
+    if dry_run:
+        result["preview"] = _render_checking_preview(result)
+        return result
+
+    # --- commit path (caller owns the transaction) ---
+    for txn in new_rows:
+        _insert_paste_transaction(conn, account_id, txn, now, source=CHECKING_SOURCE)
+
+    if balance is not None:
+        result["balance_snapshot"] = set_manual_balance(
+            conn,
+            account_query,
+            float(balance),
+            as_of_date,
+            note="Checking balance snapshot from activity paste.",
+        )
+
+    result["preview"] = _render_checking_preview(result)
+    return result
+
+
+def _render_checking_preview(result: dict[str, Any]) -> str:
+    tag = "DRY RUN" if result["dry_run"] else "APPLIED"
+    acct = result.get("account") or {}
+    lines = [
+        f"import_checking_activity ({tag}) - {acct.get('account_name', '?')}",
+        f"rows parsed: {result['rows_parsed']}   deposits: {result['inflow_rows']}   "
+        f"withdrawals: {result['outflow_rows']}",
+        f"new: {result['new']}   duplicate (already imported): {result['duplicate']}",
+        f"balance snapshot: {_money(result['balance']) if result['balance'] is not None else 'n/a'}",
+    ]
+    for w in result.get("warnings", []):
+        lines.append(f"note: {w}")
+    lines.append("Re-run with dry_run=false to write." if result["dry_run"] else "Written.")
+    return "\n".join(lines)
 
 
 def apple_card_paste_freshness(
@@ -597,11 +744,14 @@ def _plan_promotion(
     }
 
 
-def _insert_paste_transaction(conn: sqlite3.Connection, account_id: str, txn: dict[str, Any], now: str) -> None:
+def _insert_paste_transaction(
+    conn: sqlite3.Connection, account_id: str, txn: dict[str, Any], now: str, source: str = PASTE_SOURCE
+) -> None:
     """Insert one pasted txn as a transactions row (ISO dates, source=paste).
 
     New rows only: dedup already filtered out ids that exist, and a re-paste
-    reproduces the same id so this path never double-inserts.
+    reproduces the same id so this path never double-inserts. ``source`` tags the
+    lane (``apple_card_paste`` for cards, ``checking_paste`` for checking).
     """
 
     posted = f"{txn['transacted_date']}T00:00:00"
@@ -614,7 +764,7 @@ def _insert_paste_transaction(conn: sqlite3.Connection, account_id: str, txn: di
         """,
         (
             txn["id"], account_id, posted, posted, txn["amount"],
-            txn["merchant"], txn["description"], PASTE_SOURCE, now, now, now,
+            txn["merchant"], txn["description"], source, now, now, now,
         ),
     )
 

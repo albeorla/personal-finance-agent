@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from .onboarding import CANDIDATE_TYPE_PRIORITY_WEIGHT
@@ -46,6 +46,10 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "grace_period_days": 7,
     "critical_age_days": 30,
     "amount_change_threshold": 0.20,
+    # deposit_arrived: how far back to look for surprise inflows, and the floor
+    # under which a credit is treated as noise (interest, cashback, tiny refunds).
+    "deposit_lookback_days": 14,
+    "deposit_min_amount": 50.0,
 }
 
 # Same-charge gate for amount_changed. To call a past-due obligation "paid but at
@@ -91,6 +95,7 @@ def detect_drift(
     findings += find_payment_drift(conn, as_of, opts)
     findings += find_stale_estimates(conn, as_of, opts)
     findings += find_unexpected_recurring(conn, opts)
+    findings += find_arrived_deposits(conn, as_of, opts)
     findings.sort(key=lambda f: (-SEVERITY_RANK[f["severity"]], f["finding_type"], f["id"]))
 
     if persist:
@@ -335,6 +340,97 @@ def find_unexpected_recurring(
                     "estimated_monthly_impact": _recurring_monthly_impact(row),
                 },
                 "recommended_action": "Review this discovered recurring charge in the onboarding queue and apply it if it should be modeled.",
+            }
+        )
+    return findings
+
+
+# Wording that means an internal account-to-account move (savings->checking),
+# not new money. A reimbursement via Zelle/Venmo/check is real inflow and must
+# NOT be filtered, so the list stays deliberately narrow.
+# ponytail: keyword heuristic; upgrade to a matched-transfer pair check if
+# internal transfers ever slip through as false deposits.
+_TRANSFER_HINTS = ("transfer", "xfer")
+
+
+def _looks_like_transfer(payee: str | None, description: str | None) -> bool:
+    text = f"{payee or ''} {description or ''}".lower()
+    return any(hint in text for hint in _TRANSFER_HINTS)
+
+
+def find_arrived_deposits(
+    conn: sqlite3.Connection, as_of: date, opts: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Flag recent positive deposits to the working account that are NOT matched
+    to scheduled payroll/income.
+
+    This is an OBSERVED event ("a deposit arrived"), not a new projected income
+    stream: a one-off reimbursement should be noticed, not extrapolated into a
+    recurring paycheck. Conservative by construction - only the account income is
+    tied to, only unmatched inflows (scheduled payroll reconciles and drops out),
+    above a noise floor, and internal transfers are filtered.
+    """
+
+    if not _has_table(conn, "transactions"):
+        return []
+    accounts = [
+        r["working_account_id"]
+        for r in conn.execute(
+            "SELECT DISTINCT working_account_id FROM income_sources "
+            "WHERE working_account_id IS NOT NULL"
+        ).fetchall()
+    ]
+    if not accounts:
+        return []
+
+    lookback = int(opts["deposit_lookback_days"])
+    min_amount = float(opts["deposit_min_amount"])
+    start = (as_of - timedelta(days=lookback)).isoformat()
+    placeholders = ",".join("?" for _ in accounts)
+    rows = conn.execute(
+        f"""
+        SELECT t.id, t.account_id, t.posted, t.transacted_at, t.amount, t.payee,
+               t.description
+        FROM transactions t
+        WHERE t.account_id IN ({placeholders})
+          AND t.amount >= ?
+          AND COALESCE(t.pending, 0) = 0
+          AND substr(COALESCE(t.posted, t.transacted_at), 1, 10) >= ?
+          AND substr(COALESCE(t.posted, t.transacted_at), 1, 10) <= ?
+          AND t.id NOT IN (
+              SELECT matched_transaction_id FROM obligation_instances
+              WHERE matched_transaction_id IS NOT NULL
+          )
+          AND t.id NOT IN (SELECT transaction_id FROM transaction_obligation_matches)
+        ORDER BY substr(COALESCE(t.posted, t.transacted_at), 1, 10) DESC, t.id
+        """,
+        (*accounts, min_amount, start, as_of.isoformat()),
+    ).fetchall()
+
+    findings: list[dict[str, Any]] = []
+    for txn in rows:
+        if _looks_like_transfer(txn["payee"], txn["description"]):
+            continue
+        amount = round(float(txn["amount"]), 2)
+        posted_date = str(txn["posted"] or txn["transacted_at"] or "")[:10]
+        findings.append(
+            {
+                "id": f"drift:deposit_arrived:{txn['id']}",
+                "finding_type": "deposit_arrived",
+                "severity": "low",
+                "obligation_id": None,
+                "obligation_instance_id": None,
+                "related_transaction_ids": [txn["id"]],
+                "cash_flow_impact": amount,
+                "confidence": "medium",
+                "evidence": {
+                    "transaction_id": txn["id"],
+                    "account_id": txn["account_id"],
+                    "payee": txn["payee"],
+                    "amount": amount,
+                    "posted_date": posted_date,
+                },
+                "recommended_action": "A deposit arrived that isn't scheduled income. Confirm what it is; do not model it as recurring income.",
             }
         )
     return findings

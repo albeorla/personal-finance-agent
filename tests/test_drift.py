@@ -240,6 +240,41 @@ def test_unexpected_recurring_surfaces_when_linked_obligation_is_dead(tmp_path):
     assert any("Volvo" in (f["evidence"].get("merchant") or "") for f in recurring)
 
 
+def test_deposit_arrived_flags_unscheduled_inflow_not_payroll_or_transfer(tmp_path):
+    # A one-off reimbursement lands in the working account. It must surface as an
+    # observed "deposit arrived" event (low severity, positive impact) - NOT get
+    # extrapolated into a recurring income stream. Scheduled payroll (matched to an
+    # income instance) and an internal transfer must stay silent.
+    conn = _db(
+        tmp_path / "d.sqlite",
+        transactions=[
+            ("t-reimb", "ACT-chk", "2026-06-28T08:00:00", 240.00, "Anthem", "REIMBURSEMENT"),
+            ("t-pay", "ACT-chk", "2026-06-26T08:00:00", 3000.00, "Employer Payroll", "DIRECT DEP"),
+            ("t-xfer", "ACT-chk", "2026-06-27T08:00:00", 500.00, "Online Transfer", "TRANSFER FROM SAV"),
+        ],
+    )
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "INSERT INTO income_sources (id,person,employer,display_name,status,default_amount,"
+        "working_account_id,source,confidence,active_from,created_at,updated_at) "
+        "VALUES ('inc','P','Employer','Payroll','active',3000.0,'ACT-chk','seed','high','2026-01-01',?,?)",
+        (now, now),
+    )
+    # Scheduled payroll instance that reconciled to the payroll transaction.
+    _ob(conn, "inc", "Payroll", "income",
+        [{"id": "inc:2026-06-26", "due_date": "2026-06-26", "amount": 3000.0,
+          "direction": "inflow", "source": "seed"}])
+    conn.execute("UPDATE obligation_instances SET matched_transaction_id='t-pay' WHERE id='inc:2026-06-26'")
+    conn.commit()
+
+    result = detect_drift(conn, as_of_date="2026-06-30", persist=False)
+    deposits = [f for f in result["findings"] if f["finding_type"] == "deposit_arrived"]
+    assert len(deposits) == 1
+    assert deposits[0]["related_transaction_ids"] == ["t-reimb"]
+    assert deposits[0]["severity"] == "low"
+    assert deposits[0]["cash_flow_impact"] == 240.00
+
+
 def test_detect_drift_persists_and_resolves(tmp_path):
     conn = _db(tmp_path / "d.sqlite")
     _ob(conn, "rent", "Rent check", "housing",
