@@ -1,5 +1,6 @@
 """Tests for SimpleFIN sync (slice K). No network: fetch is fixture/monkeypatched."""
 
+import json
 import sqlite3
 
 from financial_agent import sync_simplefin as sfin
@@ -8,6 +9,7 @@ import datetime as dt
 
 from financial_agent.sync_simplefin import (
     _epoch_to_iso,
+    _epoch_to_iso_date,
     incremental_start_date,
     normalize_accounts,
     store_accounts,
@@ -48,6 +50,20 @@ def _db(path):
     return conn
 
 
+def test_ensure_source_tables_adds_balance_date_to_existing_snapshots(tmp_path):
+    conn = sqlite3.connect(tmp_path / "s.sqlite")
+    conn.execute(
+        "CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, "
+        "balance REAL, available REAL, recorded_at TEXT, source TEXT)"
+    )
+
+    ensure_source_tables(conn)
+    ensure_source_tables(conn)
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(balance_snapshots)").fetchall()}
+    assert "balance_date" in columns
+
+
 def test_normalize_accounts_mirrors_legacy_shape():
     norm = normalize_accounts(SAMPLE["accounts"], "2026-06-21T08:00:00")
     a = norm[0]
@@ -63,6 +79,10 @@ def test_store_writes_accounts_balances_and_iso_transactions(tmp_path):
     store_accounts(conn, normalize_accounts(SAMPLE["accounts"], "2026-06-21T08:00:00"))
     assert conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM balance_snapshots").fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT balance_date FROM balance_snapshots").fetchone()["balance_date"]
+        == _epoch_to_iso_date(1718000000)
+    )
     txns = conn.execute("SELECT id, posted, amount FROM transactions ORDER BY id").fetchall()
     assert len(txns) == 2
     # posted epoch is stored as an ISO string (matches the copied DB format).
@@ -163,10 +183,13 @@ def test_sync_splits_balance_only_notes_from_warnings(tmp_path, monkeypatch):
     # The permanent Apple Card balance-only state is an expected note, not a warning.
     assert len(result["notes"]) == 1 and "Apple Card" in result["notes"][0]
     assert "expected: balance-only" in result["notes"][0]
-    # The real feed problem is an actionable warning and lands on the sync run.
+    # The real feed problem is an actionable warning, but a per-connection warning
+    # does NOT promote the whole sync to an error (other accounts synced fine).
     assert result["warnings"] == ["Connection to Chase Bank failed: timeout"]
-    assert result["error"] == "Connection to Chase Bank failed: timeout"
-    assert conn.execute("SELECT error FROM sync_runs").fetchone()[0] == result["error"]
+    assert result["error"] is None
+    assert conn.execute("SELECT error FROM sync_runs").fetchone()[0] is None
+    stored_warnings = conn.execute("SELECT warnings_json FROM sync_runs").fetchone()[0]
+    assert json.loads(stored_warnings) == result["warnings"]
 
 
 def test_sync_only_expected_notes_means_no_error(tmp_path, monkeypatch):
@@ -176,6 +199,24 @@ def test_sync_only_expected_notes_means_no_error(tmp_path, monkeypatch):
     result = sync_simplefin(conn, access_url="https://u:p@host/simplefin")
     assert result["warnings"] == [] and result["error"] is None
     assert len(result["notes"]) == 1
+
+
+def test_sync_warning_reports_freshness_warning_not_error(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    from financial_agent.status import _source_freshness
+
+    conn = _db(tmp_path / "s.sqlite")
+    errors = ["Connection to Chase Bank failed: timeout"]
+    monkeypatch.setattr(sfin, "fetch_simplefin_accounts", lambda *a, **k: ([], errors))
+    result = sync_simplefin(conn, access_url="https://u:p@host/simplefin")
+    assert result["error"] is None and result["warnings"] == errors
+
+    fresh = _source_freshness(conn, datetime.now(UTC))["simplefin"]
+    # A per-connection warning surfaces as its own state, not "error".
+    assert fresh["status"] == "warning"
+    assert fresh["error"] is None
+    assert fresh["warnings"] == errors
 
 
 def test_config_loads_env_without_mutating_environ(tmp_path):

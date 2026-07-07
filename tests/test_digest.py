@@ -1,5 +1,6 @@
 """Tests for the daily digest (slice P). Composition over grounded status; no network."""
 
+import datetime as dt
 import sqlite3
 
 from financial_agent.digest import build_daily_digest, render_digest_markdown, summarize_daily_digest
@@ -7,19 +8,34 @@ from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
 
 
-def _status_db(path, *, available, obligations=()):
+def _status_db(
+    path,
+    *,
+    available,
+    obligations=(),
+    balance_date=None,
+    recorded_at="2026-06-20T00:00:00+00:00",
+    sync_started_at="2026-06-20T09:58:00+00:00",
+    sync_finished_at="2026-06-20T10:00:00+00:00",
+):
     conn = sqlite3.connect(path)
     conn.executescript(
         """
         CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT, org TEXT, kind TEXT, currency TEXT);
-        CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL, recorded_at TEXT, source TEXT);
+        CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL, recorded_at TEXT, source TEXT, balance_date TEXT);
         CREATE TABLE sync_runs (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT, accounts_seen INT, transactions_inserted INT, transactions_updated INT, error TEXT);
         CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT, amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);
         """
     )
     conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
-    conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('chk',?,?,'2026-06-20T00:00:00+00:00','simplefin')", (available, available))
-    conn.execute("INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) VALUES ('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00','i',1,0,0,NULL)")
+    conn.execute(
+        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source,balance_date) VALUES ('chk',?,?,?,'simplefin',?)",
+        (available, available, recorded_at, balance_date),
+    )
+    conn.execute(
+        "INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) VALUES (?,?,'i',1,0,0,NULL)",
+        (sync_started_at, sync_finished_at),
+    )
     conn.row_factory = sqlite3.Row
     ensure_app_schema(conn)
     for oid, name, kind, instances in obligations:
@@ -150,6 +166,31 @@ def test_balance_freshness_stamp_renders(tmp_path):
     assert all("recorded_at" in a for a in digest["balances"]["accounts"])
     # ...and the markdown stamps how old each balance is, so a stale feed is visible
     assert "as of" in render_digest_markdown(digest)
+
+
+def test_stale_simplefin_balance_date_warns_even_when_sync_succeeds(tmp_path):
+    db = _status_db(
+        tmp_path / "d.sqlite",
+        available=1234.56,
+        balance_date="2026-07-02",
+        recorded_at="2026-07-06T00:00:00+00:00",
+        sync_started_at="2026-07-06T00:00:00+00:00",
+        sync_finished_at="2026-07-06T00:02:00+00:00",
+    )
+
+    digest = build_daily_digest(
+        db,
+        as_of_date="2026-07-06",
+        now=dt.datetime(2026, 7, 6, 1, 0, tzinfo=dt.timezone.utc),
+    )
+
+    assert digest["source_freshness"]["simplefin"] == "fresh"
+    assert digest["balances"]["working_account_balance_date"] == "2026-07-02"
+    assert digest["balances"]["working_account_balance_age_days"] == 4
+    assert digest["balances"]["working_account_balance_date_stale"] is True
+    assert any("Working account balance date is 4 days old" in w for w in digest["warnings"])
+    md = render_digest_markdown(digest)
+    assert "WARNING: balance date is 4 days old" in md
 
 
 def test_status_color_green_when_healthy(tmp_path):

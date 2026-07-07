@@ -488,6 +488,46 @@ def test_fixed_outflow_instances_project_into_cash_flow(tmp_path):
     assert "cash-flow projection includes only seeded local obligation instances" in warnings[0]
 
 
+def test_past_due_unreconciled_instances_are_counted_not_dropped(tmp_path):
+    conn = _db(tmp_path / "obligations.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "rent",
+            "name": "Rent check",
+            "kind": "housing",
+            "cadence": "monthly",
+            "status": "active",
+            "source": "obligations_yaml_manual",
+        },
+        instances=[
+            # Predates the projection start and has no transaction match: must be
+            # counted, not silently dropped by the due_date >= start_date filter.
+            {"due_date": "2026-06-15", "amount": -3000.0, "source": "obligations_yaml_manual"},
+            # In-window instance still projects normally.
+            {"due_date": "2026-06-25", "amount": -3000.0, "source": "obligations_yaml_manual"},
+        ],
+    )
+
+    projections, _ = build_cash_flow_projections(
+        conn,
+        accounts=[
+            {
+                "account_id": "checking-1",
+                "account_name": "Checking 4321",
+                "kind": "checking",
+                "available": 5000.0,
+                "recorded_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+        windows=[20],
+        start_date=date(2026, 6, 20),
+    )
+
+    assert projections[0]["omitted_past_due_unreconciled_count"] == 1
+    assert [e["due_date"] for e in projections[0]["events"]] == ["2026-06-25"]
+
+
 def test_seasonal_eversource_estimate_keeps_structured_model_metadata(tmp_path):
     conn = _db(tmp_path / "obligations.sqlite")
     apply_obligation_instances(

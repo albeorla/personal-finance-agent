@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import uuid
@@ -16,6 +17,7 @@ from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 SCHEMA_VERSION = "finance_status.v1"
 DEFAULT_WINDOWS = [7, 14, 30]
 DEFAULT_FRESHNESS_HOURS = 24
+BALANCE_DATE_STALE_DAYS = 3
 
 
 def default_db_path() -> Path:
@@ -65,7 +67,7 @@ def get_finance_status(
     balances_result_id = _new_id("result")
 
     with _connect(resolved_db_path) as conn:
-        accounts = _latest_balances(conn)
+        accounts = _latest_balances(conn, as_of=projection_start_date)
         source_freshness = _source_freshness(conn, observed_at)
         cash_flow_projections, cash_flow_warnings = build_cash_flow_projections(
             conn,
@@ -206,7 +208,9 @@ def resolve_account_balance(
     return round(float(row["balance"]), 2)
 
 
-def _latest_balances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> list[dict[str, Any]]:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(balance_snapshots)").fetchall()}
+    balance_date_select = "bs.balance_date" if "balance_date" in columns else "NULL"
     rows = conn.execute(
         f"""
         SELECT
@@ -218,7 +222,8 @@ def _latest_balances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             bs.balance,
             bs.available,
             bs.recorded_at,
-            bs.source
+            bs.source,
+            {balance_date_select} AS balance_date
         FROM balance_snapshots bs
         JOIN accounts a ON a.id = bs.account_id
         WHERE bs.id = (
@@ -231,37 +236,63 @@ def _latest_balances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         ORDER BY a.name COLLATE NOCASE
         """
     ).fetchall()
-    return [
-        {
-            "account_id": row["account_id"],
-            "account_name": row["account_name"],
-            "org": row["org"],
-            "kind": row["kind"],
-            "currency": row["currency"],
-            "balance": round(float(row["balance"]), 2),
-            "available": round(float(row["available"]), 2),
-            "recorded_at": row["recorded_at"],
-            "source": row["source"],
-        }
-        for row in rows
-    ]
+    as_of_date = as_of or date.today()
+    accounts = []
+    for row in rows:
+        balance_date = _snapshot_date(row["balance_date"]) or _snapshot_date(row["recorded_at"])
+        age_days = (as_of_date - balance_date).days if balance_date else None
+        accounts.append(
+            {
+                "account_id": row["account_id"],
+                "account_name": row["account_name"],
+                "org": row["org"],
+                "kind": row["kind"],
+                "currency": row["currency"],
+                "balance": round(float(row["balance"]), 2),
+                "available": round(float(row["available"]), 2),
+                "recorded_at": row["recorded_at"],
+                "balance_date": balance_date.isoformat() if balance_date else None,
+                "balance_age_days": age_days,
+                "balance_date_stale": bool(age_days is not None and age_days > BALANCE_DATE_STALE_DAYS),
+                "source": row["source"],
+            }
+        )
+    return accounts
+
+
+def _snapshot_date(value: Any) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _source_freshness(conn: sqlite3.Connection, now: datetime) -> dict[str, Any]:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sync_runs)").fetchall()}
+    warnings_select = "warnings_json" if "warnings_json" in columns else "NULL AS warnings_json"
     latest_sync = conn.execute(
-        """
+        f"""
         SELECT finished_at, mode, accounts_seen, transactions_inserted,
-               transactions_updated, error
+               transactions_updated, error, {warnings_select}
         FROM sync_runs
         ORDER BY finished_at DESC, id DESC
         LIMIT 1
         """
     ).fetchone()
+    warnings: list[str] = []
+    if latest_sync is not None and latest_sync["warnings_json"]:
+        try:
+            warnings = json.loads(latest_sync["warnings_json"]) or []
+        except (ValueError, TypeError):
+            warnings = []
     return {
         "simplefin": _freshness_record(
             latest_sync,
             now,
             extra_fields=["mode", "accounts_seen", "transactions_inserted", "transactions_updated"],
+            warnings=warnings,
         ),
     }
 
@@ -271,6 +302,7 @@ def _freshness_record(
     now: datetime,
     *,
     extra_fields: list[str],
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     if row is None:
         return {
@@ -280,11 +312,21 @@ def _freshness_record(
             "error": "no sync run recorded",
         }
 
+    warnings = warnings or []
     finished_at = _parse_datetime(row["finished_at"])
     age_hours = round((now - finished_at).total_seconds() / 3600, 2)
-    status = "error" if row["error"] else "fresh"
-    if status == "fresh" and age_hours > DEFAULT_FRESHNESS_HOURS:
+    # A per-connection warning (one feed needs attention) is NOT a failed sync:
+    # reserve "error" for a sync that actually threw or returned no usable data,
+    # so a single flaky feed does not turn the whole source red. Warnings surface
+    # as their own state instead of being promoted to error.
+    if row["error"]:
+        status = "error"
+    elif warnings:
+        status = "warning"
+    elif age_hours > DEFAULT_FRESHNESS_HOURS:
         status = "stale"
+    else:
+        status = "fresh"
 
     record = {
         "status": status,
@@ -292,6 +334,7 @@ def _freshness_record(
         "age_hours": age_hours,
         "max_fresh_age_hours": DEFAULT_FRESHNESS_HOURS,
         "error": row["error"],
+        "warnings": warnings,
     }
     for field in extra_fields:
         record[field] = row[field]

@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE TABLE IF NOT EXISTS balance_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, balance REAL NOT NULL,
-    available REAL NOT NULL, recorded_at TEXT NOT NULL, source TEXT NOT NULL
+    available REAL NOT NULL, recorded_at TEXT NOT NULL, source TEXT NOT NULL,
+    balance_date TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_balance_snapshots_account_recorded
     ON balance_snapshots(account_id, recorded_at);
@@ -123,7 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_transactions_payee ON transactions(payee);
 CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
     mode TEXT NOT NULL, accounts_seen INTEGER NOT NULL, transactions_inserted INTEGER NOT NULL,
-    transactions_updated INTEGER NOT NULL, error TEXT
+    transactions_updated INTEGER NOT NULL, error TEXT, warnings_json TEXT
 );
 """
 
@@ -132,3 +133,17 @@ def ensure_source_tables(conn: sqlite3.Connection) -> None:
     """Create the SimpleFIN/Todoist source tables if absent (idempotent)."""
 
     conn.executescript(SOURCE_SCHEMA)
+    _ensure_balance_date_column(conn)
+    _ensure_sync_runs_warnings_column(conn)
+
+
+def _ensure_balance_date_column(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(balance_snapshots)").fetchall()}
+    if "balance_date" not in columns:
+        conn.execute("ALTER TABLE balance_snapshots ADD COLUMN balance_date TEXT")
+
+
+def _ensure_sync_runs_warnings_column(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sync_runs)").fetchall()}
+    if "warnings_json" not in columns:
+        conn.execute("ALTER TABLE sync_runs ADD COLUMN warnings_json TEXT")

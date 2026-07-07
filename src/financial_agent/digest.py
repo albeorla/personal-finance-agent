@@ -44,6 +44,7 @@ def build_daily_digest(
     db_path: str | None = None,
     *,
     as_of_date: str | None = None,
+    now: dt.datetime | None = None,
     windows: tuple[int, ...] = (7, 14, 30, 60),
     max_recurring: int = 15,
 ) -> dict[str, Any]:
@@ -54,6 +55,7 @@ def build_daily_digest(
         db_path=resolved_db_path,
         windows=list(windows),
         start_date=as_of_date,
+        now=now,
     )
     projections = status["cash_flow_projections"]
     as_of = projections[0]["start_date"] if projections else (as_of_date or status["observed_at"][:10])
@@ -79,6 +81,15 @@ def build_daily_digest(
     # Working cash (the operating checking account) is the number that matters
     # day to day; total_available sums every account, including card debt.
     working_account = projections[0].get("working_account") if projections else None
+    working_balance_warning = None
+    if working_account and working_account.get("balance_date_stale"):
+        age = working_account.get("balance_age_days")
+        day = working_account.get("balance_date")
+        date_text = f" ({day})" if day else ""
+        working_balance_warning = (
+            f"Working account balance date is {age} days old{date_text}; "
+            "SimpleFIN synced, but the reported balance itself is stale."
+        )
     # Liquid cash = available across DEPOSIT accounts only. account.kind is empty
     # in the source, so deposit is inferred by a non-negative balance (cards/loans
     # carry a negative balance). Summing raw total_available would fold a card's
@@ -96,6 +107,13 @@ def build_daily_digest(
         "balances": {
             "working_cash": working_account["available"] if working_account else None,
             "working_account": working_account["account_name"] if working_account else None,
+            "working_account_balance_date": working_account.get("balance_date")
+            if working_account else None,
+            "working_account_balance_age_days": working_account.get("balance_age_days")
+            if working_account else None,
+            "working_account_balance_date_stale": bool(
+                working_account and working_account.get("balance_date_stale")
+            ),
             # True net worth across all accounts (sum of balances, so card/loan debt
             # is included as negative). total_available sums only `available`, which
             # is 0 for cards/loans - it is deposit liquidity, NOT net.
@@ -108,6 +126,9 @@ def build_daily_digest(
                     "balance": a["balance"],
                     "available": a["available"],
                     "recorded_at": a.get("recorded_at"),
+                    "balance_date": a.get("balance_date"),
+                    "balance_age_days": a.get("balance_age_days"),
+                    "balance_date_stale": a.get("balance_date_stale", False),
                 }
                 for a in status["balances"]["accounts"]
             ],
@@ -116,6 +137,7 @@ def build_daily_digest(
         "cash_flow": [
             {"window_days": p["window_days"], "ending_balance": p["ending_balance"],
              "lowest_balance": p["lowest_balance"], "lowest_balance_date": p["lowest_balance_date"],
+             "omitted_past_due_unreconciled_count": p.get("omitted_past_due_unreconciled_count", 0),
              "trough_low_estimate": b["trough_low_estimate"],
              "trough_high_estimate": b["trough_high_estimate"],
              "trough_band_drivers": b["trough_band_drivers"],
@@ -133,7 +155,10 @@ def build_daily_digest(
         "recently_cleared": _recently_cleared(resolved_db_path, as_of),
         **_recurring_summary(status["recurring_candidates"], max_recurring),
         "guardrails": status["guardrail_findings"],
-        "warnings": status["warnings"],
+        "warnings": [
+            *status["warnings"],
+            *([working_balance_warning] if working_balance_warning else []),
+        ],
         "provenance": {
             "balances": "accounts + balance_snapshots (SimpleFIN sync)",
             "cash_flow": "deterministic projection over obligation_instances",
@@ -282,6 +307,9 @@ def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
         "balances": {
             "working_cash": bal.get("working_cash"),
             "working_account": bal.get("working_account"),
+            "working_account_balance_date": bal.get("working_account_balance_date"),
+            "working_account_balance_age_days": bal.get("working_account_balance_age_days"),
+            "working_account_balance_date_stale": bal.get("working_account_balance_date_stale"),
             "net_across_accounts": bal.get("net_across_accounts"),
             "liquid_available": bal.get("liquid_available"),
             "accounts": [
@@ -290,6 +318,9 @@ def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
                     "balance": a.get("balance"),
                     "available": a.get("available"),
                     "recorded_at": a.get("recorded_at"),
+                    "balance_date": a.get("balance_date"),
+                    "balance_age_days": a.get("balance_age_days"),
+                    "balance_date_stale": a.get("balance_date_stale"),
                 }
                 for a in bal.get("accounts", [])
             ],
@@ -350,7 +381,17 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
     lines.append("")
 
     lines.append("## Balances")
-    lines.append(f"Working cash ({bal.get('working_account') or 'operating account'}, available): ${_money(bal.get('working_cash'))}")
+    working_stale = ""
+    if bal.get("working_account_balance_date_stale"):
+        age = bal.get("working_account_balance_age_days")
+        day = bal.get("working_account_balance_date")
+        working_stale = f" WARNING: balance date is {age} days old"
+        if day:
+            working_stale += f" ({day})"
+    lines.append(
+        f"Working cash ({bal.get('working_account') or 'operating account'}, available): "
+        f"${_money(bal.get('working_cash'))}{working_stale}"
+    )
     lines.append(f"Net across all accounts (incl. card debt): ${_money(bal['net_across_accounts'])}")
     lines.append(f"Liquid available (deposit accounts): ${_money(bal['liquid_available'])}")
     for a in bal["accounts"]:
@@ -360,9 +401,10 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
         bal_v, avail_v = a.get("balance"), a.get("available")
         if bal_v is not None and avail_v is not None and bal_v >= 0 and abs(avail_v - bal_v) > 0.01:
             note = f" (avail ${_money(avail_v)})"
-        # Freshness: how old this balance is, so a stale balance-only feed (e.g. an
-        # "Updated Monthly" card weeks out of date) is visibly stale, not implied live.
-        fresh = f" _(as of {_relative_time(a.get('recorded_at'))})_" if a.get("recorded_at") else ""
+        # Freshness: how old this balance is, so a stale balance-only feed is
+        # visibly stale, not implied live.
+        fresh_at = a.get("balance_date") or a.get("recorded_at")
+        fresh = f" _(as of {_relative_time(fresh_at)})_" if fresh_at else ""
         lines.append(f"- {_account_label(a)}: ${_money(bal_v)}{note}{fresh}")
     lines.append("")
 
@@ -373,6 +415,12 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
         lines.append(f"| {c['window_days']}d | ${_money(c['ending_balance'])} | ${_money(c['lowest_balance'])} | {c['lowest_balance_date']} |")
     if not digest["cash_flow"]:
         lines.append("| - | (no projection) | - | - |")
+    omitted = max((c.get("omitted_past_due_unreconciled_count", 0) for c in digest["cash_flow"]), default=0)
+    if omitted:
+        lines.append(
+            f"> {omitted} past-due unreconciled obligation instance(s) predate the projection window "
+            f"and are excluded - reconcile or re-date them so the runway is not overstated."
+        )
     _render_trough_sensitivity(digest, lines)
     lines.append("")
 

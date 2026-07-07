@@ -99,6 +99,32 @@ def _roll_forward_to_start(
     return round(total, 2)
 
 
+def _count_past_due_unreconciled(conn: sqlite3.Connection, *, start_date: date) -> int:
+    """Count active, direct-checking obligation instances dated before the
+    projection start that are still projectable and have no confirmed transaction
+    match. These fall outside the window's ``due_date >= start_date`` filter, so
+    without surfacing this count a genuinely missed obligation disappears from the
+    projection silently instead of being flagged for reconcile-or-re-date."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM obligation_instances oi
+        JOIN obligations o ON o.id = oi.obligation_id
+        WHERE oi.due_date < ?
+          AND oi.status IN ('expected', 'needs_review', 'partially_paid')
+          AND o.status = 'active'
+          AND (o.active_until IS NULL OR oi.due_date <= o.active_until)
+          AND COALESCE(oi.cash_flow_treatment, 'direct_checking') = 'direct_checking'
+          AND NOT EXISTS (
+              SELECT 1 FROM transaction_obligation_matches m
+              WHERE m.obligation_instance_id = oi.id
+          )
+        """,
+        (start_date.isoformat(),),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def _build_window_projection(
     conn: sqlite3.Connection,
     *,
@@ -157,6 +183,8 @@ def _build_window_projection(
         (start_date.isoformat(), end_date_exclusive.isoformat()),
     ).fetchall()
 
+    omitted_past_due = _count_past_due_unreconciled(conn, start_date=start_date)
+
     running_balance = round(float(starting_balance), 2)
     lowest_balance = running_balance
     lowest_balance_date = start_date.isoformat()
@@ -204,6 +232,9 @@ def _build_window_projection(
             "account_name": working_account["account_name"],
             "available": working_account["available"],
             "recorded_at": working_account["recorded_at"],
+            "balance_date": working_account.get("balance_date"),
+            "balance_age_days": working_account.get("balance_age_days"),
+            "balance_date_stale": working_account.get("balance_date_stale", False),
         },
         "starting_balance": round(float(starting_balance), 2),
         "snapshot_balance": snapshot_balance,
@@ -211,6 +242,7 @@ def _build_window_projection(
         "ending_balance": running_balance,
         "lowest_balance": round(lowest_balance, 2),
         "lowest_balance_date": lowest_balance_date,
+        "omitted_past_due_unreconciled_count": omitted_past_due,
         "events": events,
         "provenance": {
             "tables": ["obligations", "obligation_instances", "balance_snapshots"],

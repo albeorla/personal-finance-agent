@@ -100,13 +100,12 @@ def sync_simplefin(
     stored = store_accounts(conn, normalized, source=source)
     finished_at = _now()
     warnings, notes = _split_connection_errors(errors)
-    if warnings and error is None:
-        error = "; ".join(warnings)
 
     if record_run:
         _record_sync_run(
             conn, started_at=started_at, finished_at=finished_at, mode="incremental",
-            accounts_seen=stored["accounts"], inserted=stored["inserted"], updated=stored["updated"], error=error,
+            accounts_seen=stored["accounts"], inserted=stored["inserted"], updated=stored["updated"],
+            error=error, warnings=warnings,
         )
 
     return {
@@ -248,6 +247,12 @@ def _epoch_to_iso(value: int) -> str | None:
     return dt.datetime.fromtimestamp(value).isoformat()
 
 
+def _epoch_to_iso_date(value: int | None) -> str | None:
+    if not value:
+        return None
+    return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).date().isoformat()
+
+
 def _upsert_account(conn: sqlite3.Connection, account: dict[str, Any]) -> None:
     existing = conn.execute("SELECT id FROM accounts WHERE id = ?", (account["id"],)).fetchone()
     if existing:
@@ -264,8 +269,15 @@ def _upsert_account(conn: sqlite3.Connection, account: dict[str, Any]) -> None:
 
 def _insert_balance_snapshot(conn: sqlite3.Connection, account: dict[str, Any], source: str) -> None:
     conn.execute(
-        "INSERT INTO balance_snapshots (account_id, balance, available, recorded_at, source) VALUES (?, ?, ?, ?, ?)",
-        (account["id"], account["balance"], account["available_balance"], account["fetched_at"], source),
+        "INSERT INTO balance_snapshots (account_id, balance, available, recorded_at, source, balance_date) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            account["id"],
+            account["balance"],
+            account["available_balance"],
+            account["fetched_at"],
+            source,
+            _epoch_to_iso_date(account.get("balance_date")),
+        ),
     )
 
 
@@ -298,13 +310,14 @@ def _upsert_transaction(conn: sqlite3.Connection, account_id: str, txn: dict[str
     return "inserted"
 
 
-def _record_sync_run(conn, *, started_at, finished_at, mode, accounts_seen, inserted, updated, error) -> None:
+def _record_sync_run(conn, *, started_at, finished_at, mode, accounts_seen, inserted, updated, error, warnings=None) -> None:
     conn.execute(
         """
-        INSERT INTO sync_runs (started_at, finished_at, mode, accounts_seen, transactions_inserted, transactions_updated, error)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sync_runs (started_at, finished_at, mode, accounts_seen, transactions_inserted, transactions_updated, error, warnings_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (started_at, finished_at, mode, accounts_seen, inserted, updated, error),
+        (started_at, finished_at, mode, accounts_seen, inserted, updated, error,
+         json.dumps(warnings) if warnings else None),
     )
 
 
