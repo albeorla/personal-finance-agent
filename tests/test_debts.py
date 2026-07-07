@@ -56,7 +56,7 @@ def test_debts_table_exists(tmp_path):
 
 def test_set_and_list_round_trip_with_account_balance(tmp_path):
     conn = _db(tmp_path / "d.sqlite")
-    _seed_account(conn, account_id="acct_apple", name="Albert", org="Apple Card (Updated Monthly)")
+    _seed_account(conn, account_id="acct_apple", name="Alex", org="Apple Card (Updated Monthly)")
     _seed_balance(conn, account_id="acct_apple", balance=-5949.32)
 
     result = set_debt_terms(
@@ -187,7 +187,7 @@ def test_list_debts_balance_matches_get_finance_status_apple_card(tmp_path):
     db_path = tmp_path / "d.sqlite"
     conn = _db(db_path)
     acct = "ACT-apple"
-    _seed_account(conn, account_id=acct, name="Albert", org="Apple Card (Updated Monthly)")
+    _seed_account(conn, account_id=acct, name="Alex", org="Apple Card (Updated Monthly)")
     # Same calendar day: a manual correction recorded EARLIER than a later
     # SimpleFIN sync. Recency alone would pick the stale -5949.32; the canonical
     # precedence must pick the manual -6122.03.
@@ -233,7 +233,7 @@ def test_list_debts_sticky_manual_wins_over_next_day_feed(tmp_path):
     db_path = tmp_path / "d.sqlite"
     conn = _db(db_path)
     acct = "ACT-apple"
-    _seed_account(conn, account_id=acct, name="Albert", org="Apple Card (Updated Monthly)")
+    _seed_account(conn, account_id=acct, name="Alex", org="Apple Card (Updated Monthly)")
     # Manual correction on day D.
     _seed_balance(conn, account_id=acct, balance=-6122.03,
                   recorded_at="2026-06-24T14:56:47+00:00")
