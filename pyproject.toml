@@ -1,6 +1,6 @@
 [project]
 name = "financial-agent"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local finance MCP server for grounded cash-flow and Todoist workflows."
 requires-python = ">=3.11"
 dependencies = [

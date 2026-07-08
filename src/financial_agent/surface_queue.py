@@ -28,6 +28,7 @@ daily job can poll it safely.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -380,6 +381,28 @@ def _manual_obligation_due_surface_items(
     return items
 
 
+def _short_title(text: str, *, limit: int = 80) -> str:
+    """A scannable Todoist title from a possibly-long follow-up note.
+
+    A follow-up note can be a paragraph (context, internal ids, a stray dev
+    note). Todoist shows the title as one line, so dumping the whole note there
+    reads as a wall of text. This takes the first line's first sentence and caps
+    it at a word boundary; the full note still lands in the description. Keeping
+    notes clean at the source is the primary discipline (see the finance skill's
+    "Todoist task style"); this is the defensive backstop so an over-long note
+    can never produce an ugly title.
+    """
+    head = text.strip().splitlines()[0].strip() if text.strip() else text.strip()
+    first = re.split(r"(?<=[.!?])\s+", head, maxsplit=1)[0].strip()
+    # A title reads better without a trailing sentence period.
+    if first.endswith("."):
+        first = first[:-1]
+    if len(first) <= limit:
+        return first
+    cut = first[:limit].rsplit(" ", 1)[0].rstrip(",;:")
+    return f"{cut}..."
+
+
 def _followup_surface_items(conn: sqlite3.Connection, as_of: date) -> list[dict[str, Any]]:
     try:
         rows = list_due_followups(conn, as_of_date=as_of.isoformat())
@@ -388,13 +411,14 @@ def _followup_surface_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
     items: list[dict[str, Any]] = []
     for r in rows:
         by = r["surface_when"]
-        # The follow-up text IS the action verb/instruction; render it on the
-        # standard dated line so the deadline is explicit.
+        # The follow-up text IS the action verb/instruction; render the full text
+        # on the standard dated line (description) so the deadline is explicit,
+        # and derive a short one-line title so the board stays scannable.
         action = render_next_action(NextAction(verb=r["text"], by=by))
         items.append(
             {
                 "surface_key": f"followup:{r['id']}",
-                "content": r["text"],
+                "content": _short_title(r["text"]),
                 "description": action,
                 "due_date": by,
             }
