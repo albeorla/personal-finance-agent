@@ -120,6 +120,36 @@ def _list_tasks_request(
     return json.loads(raw) if raw else {"results": [], "next_cursor": None}
 
 
+def _list_all_tasks_request(
+    token: str,
+    *,
+    cursor: str | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """GET one page of active tasks across ALL projects (no project filter).
+
+    Same paginated envelope and headers as ``_list_tasks_request``; omitting
+    ``project_id`` lists every project's active tasks so a due-date filter can run
+    over all of them. Read-only.
+    """
+
+    url = f"{TODOIST_BASE_URL}/tasks"
+    if cursor:
+        url = f"{url}?cursor={cursor}"
+    req = urllib.request.Request(  # noqa: S310 - token is the user's own .env credential
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "financial-agent-mcp/0.1",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw) if raw else {"results": [], "next_cursor": None}
+
+
 def _delete_request(
     token: str,
     task_id: str,
@@ -1484,6 +1514,77 @@ def list_todoist_project_for_db(
         list_func=list_func,
         delete_func=_forbidden_delete,
     )
+
+
+_TODAY_TASKS_MAX_PAGES = 50
+
+
+def list_today_tasks_all_projects_for_db(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str,
+    token: str | None = None,
+    finance_project_id: str | None = None,
+    env_path: str | None = None,
+    list_func: Callable[..., dict[str, Any]] = _list_all_tasks_request,
+) -> dict[str, Any]:
+    """Read-only: active tasks due on or before ``as_of_date`` across ALL projects.
+
+    Closes a board blind spot: ``list_todoist_project`` reads only the Finance
+    project, so a finance task filed under Personal/other projects (a bill, a
+    money to-do) was invisible to the daily read. This pages every project's
+    active tasks and returns those due today or overdue, each tagged with its
+    project id and an ``is_finance_project`` flag, so the daily read can catch
+    finance items filed elsewhere. Relevance is left to the caller: over-filtering
+    by keyword would risk re-hiding the exact task this closes. No writes, no
+    classification, no delete path.
+
+    ISO date strings compare lexicographically, so ``due.date[:10] <= as_of``
+    selects today plus anything overdue. Tasks with no due date are skipped.
+    """
+
+    ensure_app_schema(conn)  # parity with the other readers; reads no local tables
+    if token is None or finance_project_id is None:
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+        finance_project_id = finance_project_id if finance_project_id is not None else cfg["todoist_project_id"]
+    if not token:
+        return {"status": "no_token", "as_of_date": as_of_date, "tasks": [], "count": 0}
+
+    tasks: list[dict[str, Any]] = []
+    cursor: str | None = None
+    truncated = False
+    for _ in range(_TODAY_TASKS_MAX_PAGES):
+        page = list_func(token, cursor=cursor)
+        for t in page.get("results", []):
+            due = (t.get("due") or {}).get("date")
+            if due and due[:10] <= as_of_date:
+                tasks.append(
+                    {
+                        "id": t.get("id"),
+                        "content": t.get("content"),
+                        "project_id": t.get("project_id"),
+                        "due_date": due[:10],
+                        "is_finance_project": t.get("project_id") == finance_project_id,
+                        "labels": t.get("labels") or [],
+                    }
+                )
+        cursor = page.get("next_cursor")
+        if not cursor:
+            break
+    else:
+        truncated = True
+
+    tasks.sort(key=lambda x: (x["due_date"], x["content"] or ""))
+    return {
+        "status": "ok",
+        "as_of_date": as_of_date,
+        "finance_project_id": finance_project_id,
+        "tasks": tasks,
+        "count": len(tasks),
+        "truncated": truncated,
+        "provenance": "GET /tasks (all projects), filtered to due.date <= as_of; read-only, no classification",
+    }
 
 
 def execute_action_outbox(

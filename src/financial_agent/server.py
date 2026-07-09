@@ -94,6 +94,7 @@ from .todoist_outbox import (
     list_action_outbox as list_action_outbox_for_db,
     reconcile_emission as reconcile_emission_for_db,
     reconcile_todoist_completions as reconcile_todoist_completions_for_db,
+    list_today_tasks_all_projects_for_db,
     list_todoist_project_for_db,
     reconcile_todoist_project_for_db,
     reopen_todoist_task as reopen_todoist_task_impl,
@@ -1957,6 +1958,34 @@ def list_todoist_project(
     conn.row_factory = sqlite3.Row
     try:
         return list_todoist_project_for_db(conn, as_of_date=as_of_date)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_today_tasks_all_projects(
+    as_of_date: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """READ-ONLY: Todoist tasks due today or overdue across ALL projects.
+
+    Companion to ``list_todoist_project`` (which reads only the Finance project):
+    this catches finance-relevant tasks filed under Personal or other projects,
+    which the Finance-only board read cannot see. Each task carries ``content``,
+    ``project_id``, ``due_date``, ``labels``, and an ``is_finance_project`` flag.
+    Relevance is left to you to judge from the content, so a finance task filed
+    elsewhere is never re-hidden by an over-eager keyword filter. No writes.
+    """
+
+    as_of_date = _resolve_as_of(as_of_date)
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list_today_tasks_all_projects_for_db(conn, as_of_date=as_of_date)
     finally:
         conn.close()
 

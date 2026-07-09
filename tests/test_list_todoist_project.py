@@ -19,6 +19,7 @@ import financial_agent.todoist_outbox as tb
 from financial_agent.schema import ensure_app_schema
 from financial_agent.todoist_outbox import (
     FA_AUTO_LABEL,
+    list_today_tasks_all_projects_for_db,
     list_todoist_project_for_db,
     reconcile_todoist_project_for_db,
     surface_marker,
@@ -26,6 +27,49 @@ from financial_agent.todoist_outbox import (
 
 AS_OF = "2026-06-25"
 _NOW = "2026-06-01T00:00:00+00:00"
+
+
+def test_list_today_tasks_all_projects_surfaces_finance_items_filed_elsewhere(tmp_path):
+    # IMP-20260708-6: list_todoist_project reads only the Finance project, so a
+    # finance task filed under Personal/other projects was invisible. This
+    # cross-project read must return today + overdue tasks from every project.
+    conn = _db(tmp_path / "cross.sqlite")
+    page = {
+        "results": [
+            {"id": "1", "content": "Pay Amex", "project_id": "PERSONAL", "due": {"date": "2026-06-25"}, "labels": []},
+            {"id": "2", "content": "Board task", "project_id": "FIN", "due": {"date": "2026-06-25"}, "labels": [FA_AUTO_LABEL]},
+            {"id": "3", "content": "Future thing", "project_id": "PERSONAL", "due": {"date": "2026-06-30"}, "labels": []},
+            {"id": "4", "content": "Someday, no due", "project_id": "PERSONAL", "due": None, "labels": []},
+            {"id": "5", "content": "Overdue water bill", "project_id": "WORK", "due": {"date": "2026-06-20"}, "labels": []},
+        ],
+        "next_cursor": None,
+    }
+
+    def fake_list(token, *, cursor=None, timeout=30):
+        assert token == "tok"
+        return page
+
+    result = list_today_tasks_all_projects_for_db(
+        conn, as_of_date=AS_OF, token="tok", finance_project_id="FIN", list_func=fake_list,
+    )
+
+    assert result["status"] == "ok"
+    by_id = {t["id"]: t for t in result["tasks"]}
+    # due<=as_of only: future (#3) and no-due (#4) excluded; overdue (#5) included.
+    assert set(by_id) == {"1", "2", "5"}
+    assert result["count"] == 3
+    assert by_id["1"]["is_finance_project"] is False
+    assert by_id["2"]["is_finance_project"] is True
+    assert by_id["5"]["due_date"] == "2026-06-20"
+
+
+def test_list_today_tasks_all_projects_no_token(tmp_path):
+    conn = _db(tmp_path / "notoken.sqlite")
+    result = list_today_tasks_all_projects_for_db(
+        conn, as_of_date=AS_OF, token="", finance_project_id="FIN",
+    )
+    assert result["status"] == "no_token"
+    assert result["tasks"] == []
 
 
 def _db(path):
