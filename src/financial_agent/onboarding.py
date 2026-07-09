@@ -97,6 +97,14 @@ FIXED_CADENCE_INTERVAL_DAYS: dict[str, int] = {"weekly": 7, "biweekly": 14, "qua
 SCHEDULABLE_CADENCES: frozenset[str] = frozenset({"weekly", "biweekly", "monthly", "quarterly"})
 MIN_CONSISTENT_INTERVALS = 3
 
+# ~30.44 days per month (365.25 / 12); used to translate an evidence span into
+# months of *elapsed* coverage rather than distinct calendar months touched.
+DAYS_PER_MONTH = 30.44
+
+# Charges closer together than this are a burst (multiple gas fills, a night
+# out), not a weekly schedule, so their median interval never earns a cadence.
+MIN_WEEKLY_INTERVAL_DAYS = 4
+
 DEFAULT_APPLY_HORIZON_DAYS = 180
 
 
@@ -545,8 +553,11 @@ def _build_candidate(
     intervals = [(dates[i] - dates[i - 1]).days for i in range(1, n)]
     median_interval = float(_stat_median(intervals)) if intervals else None
     days = [d.day for d in dates]
-    months = {(d.year, d.month) for d in dates}
     span_months = (dates[-1].year - dates[0].year) * 12 + (dates[-1].month - dates[0].month) + 1
+    # Months of elapsed evidence, from the actual day span rather than distinct
+    # calendar months touched: 4 charges over 5 days that cross a month boundary
+    # cover 1 month, not 2.
+    months_covered = round((dates[-1] - dates[0]).days / DAYS_PER_MONTH) + 1
 
     descriptions = [it["description"] for it in items]
     payee_display = _mode([it["payee"] for it in items])
@@ -563,7 +574,7 @@ def _build_candidate(
         "day_spread": max(days) - min(days),
         "median_interval_days": round(median_interval, 1) if median_interval is not None else None,
         "occurrences": n,
-        "months_covered": len(months),
+        "months_covered": months_covered,
         "first_date": dates[0].isoformat(),
         "last_date": dates[-1].isoformat(),
         "next_expected_date": (
@@ -584,9 +595,9 @@ def _build_candidate(
         "affects_checking": treatment in {"direct_checking", "inflow"},
     }
 
-    confidence = _confidence(n=n, months_covered=len(months), cv=cv, cadence=cadence)
+    confidence = _confidence(n=n, months_covered=months_covered, cv=cv, cadence=cadence)
     missing_evidence = _missing_evidence(
-        n=n, months_covered=len(months), cv=cv, treatment=treatment,
+        n=n, months_covered=months_covered, cv=cv, treatment=treatment,
         amount_method=amount_policy["method"], cadence=cadence,
     )
 
@@ -631,7 +642,7 @@ def _build_candidate(
         "amount_cv": round(cv, 3),
         "first_date": dates[0].isoformat(),
         "last_date": dates[-1].isoformat(),
-        "months_covered": len(months),
+        "months_covered": months_covered,
         "cadence": cadence,
         "sample_amounts": amounts,
         "accounts": sorted({it["account_name"] for it in items}),
@@ -723,6 +734,9 @@ def _cadence_label(median_interval: float | None, intervals: list[int] | None = 
 
 def _interval_bucket(median_interval: float | None) -> str:
     if median_interval is None:
+        return "unknown"
+    if median_interval < MIN_WEEKLY_INTERVAL_DAYS:
+        # Sub-weekly gaps are a clustered burst, not a schedulable cadence.
         return "unknown"
     if median_interval <= 10:
         return "weekly"

@@ -174,6 +174,8 @@ def test_cadence_needs_three_consistent_intervals():
     assert _cadence_label(43.5, [39, 48]) == "irregular_multiweek"
     # Backward-compat: no intervals passed keeps the raw bucket.
     assert _cadence_label(30.0) == "monthly"
+    # A sub-weekly median (charges a day or two apart) is a burst, not weekly.
+    assert _cadence_label(2.0, [2, 2, 1]) != "weekly"
 
 
 def test_account_class_infers_from_name_and_org_when_kind_empty():
@@ -291,6 +293,31 @@ def test_scan_never_proposes_weekly_from_two_consecutive_charges(tmp_path):
     # One observed interval is not a schedule: no cadence, low confidence.
     assert exxon["proposed_schedule_policy"]["cadence"] == "unknown"
     assert exxon["confidence"] == "low"
+
+
+def test_scan_burst_over_five_days_is_not_weekly(tmp_path):
+    # Port Chester Beer (INC / IMP-20260708-2): 4 charges over 5 days that
+    # straddle a month boundary (Jun 26 - Jul 1) used to detect as a "weekly"
+    # candidate with months_covered=2 (counting the June/July calendar touch,
+    # not elapsed time). A 5-day burst is neither weekly nor two months.
+    beer_rows = [
+        ("beer-1", "ACT-amex", "2026-06-26T12:00:00", -14.38, "Port Chester Beer", "PORT CHESTER BEER DIST"),
+        ("beer-2", "ACT-amex", "2026-06-28T12:00:00", -17.36, "Port Chester Beer", "PORT CHESTER BEER DIST"),
+        ("beer-3", "ACT-amex", "2026-06-30T12:00:00", -14.38, "Port Chester Beer", "PORT CHESTER BEER DIST"),
+        ("beer-4", "ACT-amex", "2026-07-01T12:00:00", -15.00, "Port Chester Beer", "PORT CHESTER BEER DIST"),
+    ]
+    conn = _seed_source_db(tmp_path / "src.sqlite", accounts=[AMEX], transactions=beer_rows)
+
+    scan_charge_onboarding_candidates(conn)
+
+    beer = _find(list_charge_onboarding_queue(conn), "port_chester_beer")
+    assert beer is not None
+    sched = beer["proposed_schedule_policy"]
+    # 5-day elapsed span is 1 month of evidence, not 2 calendar months touched.
+    assert sched["months_covered"] == 1
+    assert beer["evidence_summary"]["months_covered"] == 1
+    # A ~2-day median interval is a burst, not a weekly schedule.
+    assert sched["cadence"] != "weekly"
 
 
 def test_scan_parks_card_spend_absorbed_by_modeled_statement(tmp_path):
