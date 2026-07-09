@@ -31,7 +31,7 @@ from .reconciliation import reconcile_obligation_instances
 from .schema import ensure_app_schema
 from .surface_queue import build_surface_items, build_surface_retire_keys
 from .sync_simplefin import sync_simplefin
-from .todoist_outbox import surface_to_todoist
+from .todoist_outbox import reconcile_todoist_completions, surface_to_todoist
 from .verification import run_verification
 
 
@@ -154,6 +154,19 @@ def run_background_sync(
         *adversarial_steps,
         ("surface_due_items", lambda: _summarize_surface(_surface_due_items_step(
             conn, as_of_date, opts))),
+        # Read task completions back so a charge the user already CONFIRMED via
+        # its Todoist task is closed out unattended (the emission + linked
+        # follow-up resolve), instead of waiting for an interactive session to
+        # sweep it. This NEVER marks a charge paid: the awaited charge is matched
+        # with transaction evidence by the `reconcile` step above; this leg only
+        # finishes the loop on the board side. Live-gated by config exactly like
+        # surfacing (TODOIST_WRITE_ENABLED + token) so the real daily run fires it
+        # and offline/tests are a hermetic no-op. Idempotent: it only touches OPEN
+        # emissions, so a replay finds the just-resolved rows already closed and
+        # no-ops. A caller may force the gate / inject a fake reader via
+        # options["reconcile_completions"] (mirrors the adversarial-runner hook).
+        ("reconcile_todoist_completions", lambda: _summarize_completions(
+            _reconcile_completions_step(conn, as_of_date, opts))),
     ]
 
     summary: dict[str, Any] = {}
@@ -493,6 +506,37 @@ def _surface_due_items_step(
         env_path=surface_opts.get("env_path", opts.get("env_path")),
         retire_keys=retire_keys,
     )
+
+
+def _reconcile_completions_step(
+    conn: sqlite3.Connection, as_of_date: str, opts: dict[str, Any]
+) -> dict[str, Any]:
+    """Map user-completed/deleted Todoist tasks back to the local ledger.
+
+    By default the gate is resolved from config (``write_enabled=None`` ->
+    TODOIST_WRITE_ENABLED + token), so the live daily run reads completions back
+    and the offline/test run is a hermetic no-op. Tests (or an explicit caller)
+    can force the gate and inject a fake reader via
+    ``options["reconcile_completions"]`` = ``{"write_enabled", "token",
+    "read_func"}``.
+    """
+
+    completion_opts = opts.get("reconcile_completions")
+    kwargs: dict[str, Any] = {"env_path": opts.get("env_path")}
+    if isinstance(completion_opts, dict):
+        for key in ("write_enabled", "token", "read_func"):
+            if key in completion_opts:
+                kwargs[key] = completion_opts[key]
+    return reconcile_todoist_completions(conn, as_of_date=as_of_date, **kwargs)
+
+
+def _summarize_completions(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: result[k]
+        for k in ("status", "integration_enabled", "checked", "resolved",
+                  "followups_resolved", "still_open", "failed")
+        if k in result
+    }
 
 
 def _summarize_verification(result: dict[str, Any]) -> dict[str, Any]:

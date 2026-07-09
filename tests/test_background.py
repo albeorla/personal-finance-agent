@@ -61,6 +61,7 @@ _EXPECTED_SEQUENCE = [
     "suppress_dormant_estimates", "suppress_contradicted_estimates",
     "verify",
     "surface_due_items",
+    "reconcile_todoist_completions",
     "run_finished",
 ]
 
@@ -81,6 +82,7 @@ def test_run_background_sync_records_run_and_ordered_events(tmp_path):
         "suppress_dormant_estimates", "suppress_contradicted_estimates",
         "verify",
         "surface_due_items",
+        "reconcile_todoist_completions",
     }
     assert result["result_summary"]["suppress_contradicted_estimates"]["mode"] == "enforce"
     assert result["result_summary"]["scan_charge_candidates"]["created"] == 1
@@ -211,6 +213,7 @@ _EXPECTED_WITH_SYNC = [
     "run_started", "sync_simplefin", "scan_charge_candidates",
     "reconcile", "detect_drift", "suppress_dormant_estimates",
     "suppress_contradicted_estimates", "verify", "surface_due_items",
+    "reconcile_todoist_completions",
     "run_finished",
 ]
 
@@ -430,3 +433,76 @@ def test_in_progress_run_does_not_count_as_heartbeat(tmp_path):
     health = get_job_health(conn, as_of_date="2026-06-30")
     assert health["is_stale"] is True
     assert health["last_run_id"] is None
+
+
+# --- task-linked charge close-out in the unattended run (IMP-20260708-7) ----
+
+
+def _seed_open_followup_emission(conn, followup_id, task_id):
+    """Surface a due follow-up to Todoist (ledger only, no network) so the run
+    has an OPEN emission linked to a followup:<id> to close out."""
+
+    from financial_agent.todoist_outbox import surface_to_todoist
+
+    key = f"followup:{followup_id}"
+    surface_to_todoist(
+        conn,
+        [{"surface_key": key, "content": "Match the $30.30 NYT charge when it posts"}],
+        "2026-06-30",
+        write_enabled=True,
+        token="tok",
+        project_id="proj",
+        send_func=lambda token, path, body, **kw: {"id": task_id},
+    )
+    return key
+
+
+def test_unattended_run_closes_out_task_confirmed_charge_and_is_idempotent(tmp_path):
+    """The daily background run reads task completions back itself: a charge the
+    user confirmed by checking its Todoist task is closed out (emission resolved,
+    linked follow-up resolved) without an interactive session, it NEVER marks the
+    charge paid (no transaction match written), and a replay is a clean no-op."""
+
+    from financial_agent.follow_ups import capture_followup, list_due_followups
+
+    conn = _db(tmp_path / "b.sqlite")
+    fup = capture_followup(conn, "Match the $30.30 NYT charge when it posts", "2026-06-30")
+    key = _seed_open_followup_emission(conn, fup["id"], "T1")
+    assert list_due_followups(conn, as_of_date="2026-06-30")  # due before the run
+
+    # Todoist reports the task checked off (the user confirmed the charge). The
+    # gate is forced on and the reader injected, so no live network call is made.
+    reads: list[str] = []
+
+    def read(token, task_id):
+        reads.append(task_id)
+        return {"id": task_id, "checked": True}
+
+    opts = {"reconcile_completions": {"write_enabled": True, "token": "tok", "read_func": read}}
+
+    first = run_background_sync(conn, as_of_date="2026-06-30", options=opts)
+    step = first["result_summary"]["reconcile_todoist_completions"]
+    assert step["resolved"] == 1 and step["followups_resolved"] == 1 and step["failed"] == 0
+    assert reads == ["T1"]  # the open emission was checked exactly once
+
+    # Close-out took effect: emission completed, follow-up resolved (no re-nag).
+    assert conn.execute(
+        "SELECT status FROM todoist_emissions WHERE surface_key = ?", (key,)
+    ).fetchone()["status"] == "completed"
+    assert not list_due_followups(conn, as_of_date="2026-06-30")
+
+    # Evidence invariant: the close-out marks NOTHING paid. No obligation instance
+    # gained a transaction match from reading the task back.
+    matched = conn.execute(
+        "SELECT COUNT(*) FROM obligation_instances WHERE matched_transaction_id IS NOT NULL"
+    ).fetchone()[0]
+    assert matched == 0
+
+    # Idempotent replay: the emission is already closed, so the second run finds
+    # no open row to check (no read, nothing re-resolved) and does not error.
+    reads.clear()
+    second = run_background_sync(conn, as_of_date="2026-06-30", options=opts)
+    assert second["status"] == "succeeded"
+    step2 = second["result_summary"]["reconcile_todoist_completions"]
+    assert step2["checked"] == 0 and step2["resolved"] == 0 and step2["failed"] == 0
+    assert reads == []
