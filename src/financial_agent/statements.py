@@ -394,6 +394,8 @@ def recompute_statement_estimates(
     updated = 0
     skipped_protected = 0
     skipped_no_cycle = 0
+    floored = 0
+    warnings_floored: list[str] = []
     details: list[dict[str, Any]] = []
     for inst in statement_instances:
         if inst["amount_status"] != "estimated":
@@ -405,6 +407,7 @@ def recompute_statement_estimates(
         if cycle is None:
             skipped_no_cycle += 1
             continue
+        prior_amount = round(abs(float(inst["amount"])), 2) if inst["amount"] is not None else 0.0
         input_sum = round(float(cycle["input_sum"]), 2)
         if explicit_baseline:
             inst_baseline = baseline
@@ -420,6 +423,21 @@ def recompute_statement_estimates(
                 existing = round(abs(float(inst["amount"])), 2) if inst["amount"] is not None else 0.0
                 inst_baseline = max(round(existing - input_sum, 2), 0.0)
         new_amount = round(inst_baseline + input_sum, 2)
+        if not explicit_baseline and new_amount < prior_amount:
+            # Money-safe floor: an auto-recompute (no explicit baseline) never
+            # silently lowers a standing estimate. A shrinking modeled input_sum
+            # means charges moved cycle or unbound (evidence lost), not that
+            # spend fell, so the smaller number is corruption, not a correction.
+            # INC-20260708-3: a no-baseline recompute once dropped $6,156.66 to
+            # ~$1,604. Leave the instance untouched and surface it; only an
+            # explicit baseline (an authoritative caller decision) may lower it.
+            floored += 1
+            warnings_floored.append(
+                f"recompute would have lowered {inst['id']} from {prior_amount} to "
+                f"{new_amount} (modeled inputs shrank); kept the prior estimate. Pass an "
+                f"explicit baseline to authorize a lower amount."
+            )
+            continue
         estimation_inputs = {
             "baseline": inst_baseline,
             "card_input_sum": input_sum,
@@ -444,7 +462,7 @@ def recompute_statement_estimates(
         updated += 1
         details.append({"instance_id": inst["id"], "amount": new_amount, "card_input_sum": estimation_inputs["card_input_sum"]})
 
-    warnings: list[str] = []
+    warnings: list[str] = list(warnings_floored)
     if explicit_baseline and baseline == 0.0 and updated:
         warnings.append(
             "baseline is 0, so recomputed estimates reflect only modeled card inputs and likely "
@@ -461,6 +479,7 @@ def recompute_statement_estimates(
         "updated": updated,
         "skipped_protected": skipped_protected,
         "skipped_no_cycle": skipped_no_cycle,
+        "floored": floored,
         "unbound_inputs": agg["unbound_inputs"],
         "unbound_instance_ids": agg["unbound_instance_ids"],
         "details": details,

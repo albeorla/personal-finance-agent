@@ -276,6 +276,81 @@ def test_recompute_preserves_prior_baseline_when_inputs_grow(tmp_path):
     assert august["amount"] == 6000.0
 
 
+def test_recompute_without_baseline_never_drops_rollup_estimate_when_inputs_shrink(tmp_path):
+    # Regression for INC-20260708-3: a no-baseline auto-recompute on 2026-07-06
+    # silently dropped the $6,156.66 Amex estimate to ~$1,604 (inputs-only), a
+    # ~$4,500 swing on the largest outflow. A rollup estimate whose stored
+    # baseline is 0 (built when the whole statement was modeled card spend) has
+    # no floor against its prior amount, so when charges get mis-assigned out of
+    # the cycle (the INC-20260708-3 cycle-boundary bug) the shrinking input_sum
+    # collapses the standing estimate. Fixed cycle baseline pins the exact drop.
+    conn = _db(tmp_path / "s.sqlite")
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "amex_statement_payment",
+            "name": "Amex statement payment",
+            "kind": "credit_card_statement",
+            "status": "active",
+            "source": "seed",
+        },
+        instances=[
+            {
+                "id": "amex_statement_payment:2026-08-16",
+                "due_date": "2026-08-16",
+                "amount": -6156.66,
+                "source": "seed",
+                "amount_status": "estimated",
+                "amount_source": "manual_projection",
+                "statement_close_date": "2026-07-21",
+            }
+        ],
+    )
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "gault_card_spend",
+            "name": "Gault Energy",
+            "kind": "card_spend_input",
+            "status": "active",
+            "source": "seed",
+        },
+        instances=[_gault("2026-07-01", -4552.66), _gault("2026-07-05", -1604.00)],
+    )
+
+    # A legitimate baseline=0 rollup: the whole $6,156.66 statement is modeled
+    # card spend, so the estimate is stored as a rollup with baseline 0.
+    aggregate_statement_inputs(conn, target_obligation_id="amex_statement_payment")
+    recompute_statement_estimates(
+        conn, target_obligation_id="amex_statement_payment", baseline=0.0
+    )
+    august = conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    assert august["amount"] == 6156.66  # correct standing estimate
+
+    # The $4,552.66 charge gets mis-assigned out of this cycle (unbound), so the
+    # cycle input_sum shrinks to $1,604. A no-baseline auto-recompute now runs.
+    conn.execute(
+        "UPDATE obligation_instances SET statement_target_obligation_id = NULL "
+        "WHERE id = 'gault_card_spend:2026-07-01'"
+    )
+    aggregate_statement_inputs(conn, target_obligation_id="amex_statement_payment")
+    result = recompute_statement_estimates(
+        conn, target_obligation_id="amex_statement_payment"
+    )
+
+    august = conn.execute(
+        "SELECT amount FROM obligation_instances WHERE id = 'amex_statement_payment:2026-08-16'"
+    ).fetchone()
+    # Money-safe invariant: a no-baseline recompute never silently lowers a
+    # standing estimate below its prior amount. It must NOT collapse to $1,604.
+    assert august["amount"] == 6156.66
+    # The attempted lowering is surfaced, not silent.
+    assert result["floored"] == 1
+    assert any("would have lowered" in w for w in result["warnings"])
+
+
 # --- get_statement_status: current portal-read plus open-cycle pace ----------
 
 
