@@ -574,7 +574,7 @@ def _summarize_adversarial(result: dict[str, Any]) -> dict[str, Any]:
     # Counts only in the run summary; the per-finding detail lives in
     # verification_findings (source='adversarial'), queryable via
     # list_verification_findings, and surfaces in the daily digest.
-    return {
+    summary = {
         "available": result.get("available"),
         "ok": result.get("ok"),
         "reviewed_count": result.get("reviewed_count"),
@@ -582,6 +582,9 @@ def _summarize_adversarial(result: dict[str, Any]) -> dict[str, Any]:
         "by_severity": result.get("by_severity"),
         "skipped": result.get("skipped"),
     }
+    if result.get("available") is False:
+        summary["warnings"] = ["Fable advisory review unavailable"]
+    return summary
 
 
 def _summarize_surface(result: dict[str, Any]) -> dict[str, Any]:

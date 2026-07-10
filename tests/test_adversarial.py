@@ -181,7 +181,7 @@ def test_forced_on_runner_that_raises_fails_open(tmp_path):
     )
 
     # The run still finishes; the broken reviewer is recorded as unavailable.
-    assert result["status"] in ("succeeded", "partial_success")
+    assert result["status"] == "succeeded_with_warnings"
     summary = result["result_summary"]["adversarial_review"]
     assert summary["available"] is False
     assert summary["skipped"]
