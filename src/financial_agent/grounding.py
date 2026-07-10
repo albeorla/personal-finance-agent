@@ -20,7 +20,7 @@ from typing import Any
 
 from .config import get_finance_config
 from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
-from .status import default_db_path
+from .status import default_db_path, get_finance_status
 
 DEFAULT_TOLERANCE = 0.02
 
@@ -36,7 +36,24 @@ def verify_grounding(
 
     norm = _normalize(payload)
     as_of = as_of_date or norm["as_of_date"]
-    conn = sqlite3.connect(db_path or str(default_db_path()))
+    resolved_db_path = db_path or str(default_db_path())
+    window_days = [int(w["window_days"]) for w in norm["windows"]]
+    canonical = get_finance_status(
+        db_path=resolved_db_path,
+        windows=window_days,
+        start_date=as_of,
+    ) if window_days else {"cash_flow_projections": []}
+    canonical_projections = canonical["cash_flow_projections"]
+    canonical_longest = max(canonical_projections, key=lambda p: p["window_days"], default=None)
+    canonical_upcoming = list(canonical_longest["events"] if canonical_longest else [])
+    if norm["obligation_scope_days"] is not None and as_of:
+        cutoff = dt.date.fromisoformat(as_of[:10]) + dt.timedelta(days=norm["obligation_scope_days"])
+        canonical_upcoming = [
+            event for event in canonical_upcoming
+            if dt.date.fromisoformat(event["due_date"]) <= cutoff
+        ]
+
+    conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     checks: list[dict[str, Any]] = []
     try:
@@ -91,6 +108,19 @@ def verify_grounding(
                 round(float(liq_row[0]), 2) if liq_row else None,
                 "SUM(available) over deposit accounts (balance >= 0)", tolerance))
 
+        if norm["headline"] is not None and norm["status_color"] is not None:
+            headline_color = str(norm["headline"]).partition(":")[0].strip().upper()
+            checks.append(_exact_check(
+                "headline_status", headline_color, str(norm["status_color"]).upper(),
+                "structured status_color"))
+
+        include_signed = norm["obligations_include_signed_amount"]
+        claimed_events = sorted(_event_key(event, include_signed) for event in norm["upcoming"])
+        canonical_events = sorted(_event_key(event, include_signed) for event in canonical_upcoming)
+        checks.append(_exact_check(
+            "upcoming_obligation_set", claimed_events, canonical_events,
+            "canonical finance-status projection events"))
+
         # 2. Each upcoming obligation -> its obligation_instances row (name + due date).
         for o in norm["upcoming"]:
             inst = conn.execute(
@@ -103,20 +133,15 @@ def verify_grounding(
                 abs(inst["amount"]) if inst is not None else None,
                 "obligation_instances row (obligation name + due_date)", tolerance))
 
-        # 3. Each projection endpoint -> working cash + signed events inside the window.
+        # 3. Each projection endpoint -> the independently rebuilt canonical projection.
         if norm["working_cash"] is not None and as_of:
-            start = dt.date.fromisoformat(as_of[:10])
+            canonical_by_window = {p["window_days"]: p for p in canonical_projections}
             for w in norm["windows"]:
-                # Match the projection's window semantics exactly: start inclusive,
-                # end EXCLUSIVE (cashflow.py uses due_date < start + window_days).
-                horizon = start + dt.timedelta(days=int(w["window_days"]))
-                recomputed = norm["working_cash"] + sum(
-                    e["signed_amount"] for e in norm["upcoming"]
-                    if e["signed_amount"] is not None and dt.date.fromisoformat(e["due_date"]) < horizon
-                )
+                source_projection = canonical_by_window.get(w["window_days"])
                 checks.append(_num_check(
-                    f"ending_balance_{w['window_days']}d", w["ending"], round(recomputed, 2),
-                    "working_cash + sum(signed obligation events in [start, start+window))", max(tolerance, 0.5)))
+                    f"ending_balance_{w['window_days']}d", w["ending"],
+                    source_projection["ending_balance"] if source_projection else None,
+                    "canonical finance-status projection endpoint", max(tolerance, 0.5)))
     finally:
         conn.close()
 
@@ -141,9 +166,11 @@ def _normalize(payload: dict[str, Any]) -> dict[str, Any]:
     balances = payload.get("balances", {})
     # Digest shape: balances.working_cash + upcoming_obligations + cash_flow.
     if "working_cash" in balances or "upcoming_obligations" in payload:
+        compact = "upcoming_obligations" not in payload and "upcoming_14d" in payload
+        obligation_rows = payload.get("upcoming_14d", []) if compact else payload.get("upcoming_obligations", [])
         upcoming = [
             {"name": o["obligation_name"], "due_date": o["due_date"], "amount": o["amount"], "signed_amount": o.get("signed_amount")}
-            for o in payload.get("upcoming_obligations", [])
+            for o in obligation_rows
         ]
         windows = [{"window_days": c["window_days"], "ending": c["ending_balance"]} for c in payload.get("cash_flow", [])]
         return {
@@ -154,12 +181,16 @@ def _normalize(payload: dict[str, Any]) -> dict[str, Any]:
             "liquid_available": balances.get("liquid_available"),
             "upcoming": upcoming,
             "windows": windows,
+            "obligation_scope_days": 14 if compact else None,
+            "obligations_include_signed_amount": not compact,
+            "headline": payload.get("headline"),
+            "status_color": payload.get("status_color"),
         }
 
     # Status shape: cash_flow_projections[].working_account / .events / .ending_balance.
     projections = payload.get("cash_flow_projections", [])
     working_account = projections[0].get("working_account") if projections else None
-    longest = projections[-1] if projections else None
+    longest = max(projections, key=lambda p: p["window_days"], default=None)
     upcoming = [
         {"name": e["obligation_name"], "due_date": e["due_date"], "amount": e["amount"], "signed_amount": e.get("signed_amount")}
         for e in (longest["events"] if longest else [])
@@ -170,8 +201,37 @@ def _normalize(payload: dict[str, Any]) -> dict[str, Any]:
         "as_of_date": (projections[0].get("start_date") if projections else None),
         "working_cash": working_account["available"] if working_account else None,
         "net_across_accounts": payload.get("balances", {}).get("total_balance"),
+        "liquid_available": payload.get("balances", {}).get(
+            "liquid_available", payload.get("balances", {}).get("total_available")),
         "upcoming": upcoming,
         "windows": windows,
+        "obligation_scope_days": None,
+        "obligations_include_signed_amount": True,
+        "headline": payload.get("headline"),
+        "status_color": payload.get("status_color"),
+    }
+
+
+def _event_key(event: dict[str, Any], include_signed: bool) -> tuple[Any, ...]:
+    key: tuple[Any, ...] = (
+        str(event["name"] if "name" in event else event["obligation_name"]),
+        str(event["due_date"]),
+        round(abs(float(event["amount"])), 2),
+    )
+    if include_signed:
+        signed_amount = event.get("signed_amount")
+        key += (round(float(signed_amount), 2) if signed_amount is not None else None,)
+    return key
+
+
+def _exact_check(claim: str, claimed: Any, source_value: Any, source: str) -> dict[str, Any]:
+    return {
+        "claim": claim,
+        "claimed_value": claimed,
+        "source_value": source_value,
+        "source": source,
+        "delta": None,
+        "grounded": claimed == source_value,
     }
 
 
