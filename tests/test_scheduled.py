@@ -3,6 +3,7 @@
 import fcntl
 import os
 import sqlite3
+import sys
 
 import financial_agent.scheduled as scheduled
 from financial_agent.scheduled import LOCK_FILENAME, run_scheduled_daily_sync
@@ -174,3 +175,27 @@ def test_dry_run_reports_every_phase_without_running_background(tmp_path, monkey
     assert result["status"] == "dry_run"
     assert result["semantic_status"] == "ok"
     assert set(result["phases"]) == {"sync", "pipeline", "surface", "reconcile_completions"}
+
+
+def test_cli_forwards_explicit_lock_directory(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {
+            "status": "dry_run",
+            "semantic_status": "ok",
+            "fresh_for_exports": False,
+            "as_of_date": "2026-07-10",
+            "phases": {},
+        }
+
+    monkeypatch.setattr(scheduled, "run_scheduled_daily_sync", fake)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["financial-agent-daily", "--dry-run", "--lock-dir", str(tmp_path / "state")],
+    )
+    scheduled.main()
+    assert seen["lock_dir"] == str(tmp_path / "state")
+    assert '"semantic_status":"ok"' in capsys.readouterr().out

@@ -164,12 +164,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the deterministic daily finance pipeline.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--db")
+    parser.add_argument("--lock-dir")
     parser.add_argument("--as-of-date")
     parser.add_argument("--no-sync", action="store_true")
     parser.add_argument("--no-surface", action="store_true")
     args = parser.parse_args()
     result = run_scheduled_daily_sync(
         db_path=args.db,
+        lock_dir=args.lock_dir,
         as_of_date=args.as_of_date,
         dry_run=args.dry_run,
         sync=not args.no_sync,
