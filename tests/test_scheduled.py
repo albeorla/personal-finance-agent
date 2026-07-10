@@ -127,6 +127,35 @@ def test_sync_error_is_a_visible_warning_and_not_fresh(tmp_path, monkeypatch):
     assert result["fresh_for_exports"] is False
 
 
+def test_sync_warning_can_still_be_fresh_for_exports(tmp_path, monkeypatch):
+    db = _db(tmp_path / "s.sqlite")
+    monkeypatch.setattr(
+        scheduled,
+        "run_background_sync",
+        lambda conn, **kwargs: {
+            "run_id": "run_warn_fresh",
+            "status": "succeeded_with_warnings",
+            "duration_ms": 10,
+            "result_summary": {
+                "sync_simplefin": {"accounts": 2, "inserted": 3, "warnings": ["range advisory"]},
+                "surface_due_items": {"status": "ok", "created": 0, "failed": 0},
+                "reconcile_todoist_completions": {"status": "ok", "resolved": 0, "failed": 0},
+            },
+        },
+    )
+    result = run_scheduled_daily_sync(
+        db,
+        lock_dir=str(tmp_path),
+        as_of_date="2026-07-09",
+        sync=True,
+        surface=True,
+    )
+    assert result["semantic_status"] == "warn"
+    assert result["phases"]["sync"]["status"] == "warn"
+    assert result["phases"]["sync"]["fresh"] is True
+    assert result["fresh_for_exports"] is True
+
+
 def test_dry_run_reports_every_phase_without_running_background(tmp_path, monkeypatch):
     db = _db(tmp_path / "s.sqlite")
     monkeypatch.setattr(

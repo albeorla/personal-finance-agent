@@ -95,7 +95,7 @@ def run_scheduled_daily_sync(
         return {
             "status": "completed",
             "semantic_status": semantic_status,
-            "fresh_for_exports": phases["sync"]["status"] == "ok",
+            "fresh_for_exports": bool(phases["sync"].get("fresh")),
             "as_of_date": as_of,
             "run": run,
             "phases": phases,
@@ -118,14 +118,17 @@ def _phase_summary(run: dict[str, Any], *, sync: bool, surface: bool) -> dict[st
     summary = run.get("result_summary") or {}
     sync_result = summary.get("sync_simplefin") or {}
     if not sync:
-        sync_phase = {"status": "skipped", "reason": "sync disabled"}
+        sync_phase = {"status": "skipped", "fresh": False, "reason": "sync disabled"}
     elif sync_result.get("error"):
-        sync_phase = {"status": "failed", "error": str(sync_result["error"])[:200]}
-    elif sync_result.get("warnings") or sync_result.get("skipped"):
-        sync_phase = {"status": "warn"}
+        sync_phase = {"status": "failed", "fresh": False, "error": str(sync_result["error"])[:200]}
+    elif sync_result.get("skipped"):
+        sync_phase = {"status": "warn", "fresh": False}
+    elif sync_result.get("warnings"):
+        sync_phase = {"status": "warn", "fresh": True}
     else:
         sync_phase = {
             "status": "ok",
+            "fresh": True,
             **{key: sync_result[key] for key in ("accounts", "inserted", "updated") if key in sync_result},
         }
 
