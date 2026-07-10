@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from financial_agent.digest import build_daily_digest
+from financial_agent.digest import build_daily_digest, summarize_daily_digest
 from financial_agent.grounding import verify_grounding
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
@@ -106,3 +106,68 @@ def test_grounding_on_status_payload(tmp_path):
     report = verify_grounding(status, db, as_of_date="2026-06-20")
     assert report["payload_kind"] == "status"
     assert report["grounded"] is True
+
+
+def test_grounding_rejects_an_omitted_canonical_obligation_even_when_endpoints_were_adjusted_self_consistently(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0, obligations=_OBS)
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+    omitted = next(
+        obligation
+        for obligation in digest["upcoming_obligations"]
+        if obligation["obligation_name"] == "Rent check"
+    )
+    digest["upcoming_obligations"].remove(omitted)
+    for window in digest["cash_flow"]:
+        if window["window_days"] >= 14:
+            window["ending_balance"] -= omitted["signed_amount"]
+
+    report = verify_grounding(digest, db, as_of_date="2026-06-20")
+
+    assert report["grounded"] is False
+
+
+def test_grounding_rejects_a_headline_contradicting_structured_status(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0)
+    summary = summarize_daily_digest(build_daily_digest(db, as_of_date="2026-06-20"))
+    assert summary["status_color"] == "GREEN"
+    summary["headline"] = "RED: modeled bills push the balance below zero"
+
+    report = verify_grounding(summary, db, as_of_date="2026-06-20")
+
+    assert report["grounded"] is False
+
+
+def test_grounding_flags_tampered_status_liquid_available(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", available=9000.0, obligations=_OBS)
+    status = get_finance_status(db_path=db, windows=[7, 30, 60], start_date="2026-06-20")
+    status["balances"]["liquid_available"] = 12345.0
+
+    report = verify_grounding(status, db, as_of_date="2026-06-20")
+
+    assert report["grounded"] is False
+
+
+def test_grounding_accepts_compact_digest_obligations_through_inclusive_14d_cutoff(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", obligations=[
+        ("day13", "Day 13 bill", "utility", [{"id": "day13:2026-07-03", "due_date": "2026-07-03", "amount": -130.0, "source": "seed"}]),
+        ("day14", "Day 14 bill", "utility", [{"id": "day14:2026-07-04", "due_date": "2026-07-04", "amount": -140.0, "source": "seed"}]),
+    ])
+    summary = summarize_daily_digest(build_daily_digest(db, as_of_date="2026-06-20"))
+
+    assert [o["obligation_name"] for o in summary["upcoming_14d"]] == [
+        "Day 13 bill",
+        "Day 14 bill",
+    ]
+    assert verify_grounding(summary, db, as_of_date="2026-06-20")["grounded"] is True
+
+
+def test_grounding_accepts_unsorted_status_windows_and_traces_longest_window_obligations(tmp_path):
+    db = _status_db(tmp_path / "d.sqlite", obligations=[
+        ("day20", "Day 20 bill", "utility", [{"id": "day20:2026-07-10", "due_date": "2026-07-10", "amount": -200.0, "source": "seed"}]),
+    ])
+    status = get_finance_status(db_path=db, windows=[30, 7], start_date="2026-06-20")
+
+    report = verify_grounding(status, db, as_of_date="2026-06-20")
+
+    assert report["grounded"] is True
+    assert any(c["claim"] == "obligation:Day 20 bill@2026-07-10" for c in report["checks"])

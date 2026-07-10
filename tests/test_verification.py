@@ -468,6 +468,29 @@ def test_digest_includes_verification_block(tmp_path):
     assert list_verification_findings(check, status=None) == []
 
 
+def test_digest_status_cannot_remain_green_when_deterministic_verification_has_an_error(tmp_path):
+    db = str(tmp_path / "digest_error.sqlite")
+    conn = _clean_db(db)
+    conn.execute(
+        "CREATE TABLE sync_runs (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT, "
+        "accounts_seen INT, transactions_inserted INT, transactions_updated INT, error TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,"
+        "transactions_updated,error) VALUES ('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00','i',1,0,0,NULL)"
+    )
+    _insert_obligation(conn, "card", "Apple Card")
+    _insert_instance(conn, iid="card:a", obligation_id="card", due_date="2026-07-15", amount=100.0)
+    _insert_instance(conn, iid="card:b", obligation_id="card", due_date="2026-07-15", amount=100.0)
+    conn.commit()
+    conn.close()
+
+    digest = build_daily_digest(db, as_of_date="2026-06-20")
+
+    assert digest["verification"]["by_severity"]["error"] >= 1
+    assert digest["status_color"] != "GREEN"
+
+
 # --- reconcile (resolve-on-fix, no duplicate-on-rerun) ----------------------
 
 

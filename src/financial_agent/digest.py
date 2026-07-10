@@ -186,13 +186,13 @@ def build_daily_digest(
         drift_warnings=status["drift_warnings"],
         longest_projection=longest,
     )
-    digest["status_color"], digest["status_reason"] = _status_color(digest)
     # Deterministic self-checks: does the model tie out internally? Read-only
     # here (persist=False), so the digest reports the live consistency state
     # without writing findings. The grounding gate proves each number traces to
     # a row; this proves the rows add up. A compact summary plus any open
     # findings so a broken identity is visible alongside the numbers it affects.
     digest["verification"] = _verification_block(resolved_db_path, as_of)
+    digest["status_color"], digest["status_reason"] = _status_color(digest)
     # Advisory adversarial review: persisted findings from the independent
     # reviewer, read-only here (no subprocess is ever spawned in the digest, so
     # this stays hermetic). Clearly labeled attention-routing, not verdicts, and
@@ -1043,6 +1043,10 @@ def _status_color(digest: dict[str, Any]) -> tuple[str, str]:
     """Return (color, reason). The reason names WHY, so a reader can tell a cash
     danger (RED: dip below the floor) from a review chore (YELLOW: reconcile drift)
     without the color alone carrying both meanings."""
+    verification_severity = (digest.get("verification") or {}).get("by_severity") or {}
+    if verification_severity.get("error", 0):
+        return "RED", "deterministic verification found an error in the finance model"
+
     # A stale working (checking) balance (WORKING_BALANCE_STALE_DAYS in
     # status.py, tighter than the general per-account threshold) means every
     # RED/YELLOW gate below - lowest_balance < 0, trough estimate < 0, the
@@ -1093,6 +1097,8 @@ def _status_color(digest: dict[str, Any]) -> tuple[str, str]:
     # run well above the estimate, so confident GREEN is unwarranted - cap at YELLOW.
     if digest.get("estimated_material"):
         return "YELLOW", "a large bill is still an estimate, not a confirmed amount"
+    if verification_severity.get("warning", 0):
+        return "YELLOW", "deterministic verification found a warning in the finance model"
     return "GREEN", "modeled runway clears the cash floor"
 
 
