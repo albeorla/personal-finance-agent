@@ -35,6 +35,10 @@ from test_background import _EXPECTED_SEQUENCE, _db
 from test_verification import _clean_db
 
 
+def test_default_advisor_model_is_fable():
+    assert adversarial._default_model() == "fable"
+
+
 def _seed_candidate(conn, *, candidate_id="cand-1", merchant="acme"):
     """Insert one active recurring-charge candidate so _gather_targets is non-empty."""
 

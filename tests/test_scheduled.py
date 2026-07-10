@@ -4,6 +4,7 @@ import fcntl
 import os
 import sqlite3
 
+import financial_agent.scheduled as scheduled
 from financial_agent.scheduled import LOCK_FILENAME, run_scheduled_daily_sync
 from financial_agent.schema import ensure_app_schema
 
@@ -60,3 +61,87 @@ def test_lock_is_released_so_a_second_run_succeeds(tmp_path):
     second = run_scheduled_daily_sync(db, lock_dir=str(tmp_path), as_of_date="2026-06-22")
     assert second["status"] == "completed"  # lock from the first run was released
     assert sqlite3.connect(db).execute("SELECT COUNT(*) FROM background_runs").fetchone()[0] == 2
+
+
+def test_live_runner_enables_sync_surface_and_completion_reconciliation(tmp_path, monkeypatch):
+    db = _db(tmp_path / "s.sqlite")
+    seen = {}
+
+    def fake_background(conn, **kwargs):
+        seen.update(kwargs)
+        return {
+            "run_id": "run_test",
+            "status": "succeeded",
+            "duration_ms": 12,
+            "result_summary": {
+                "sync_simplefin": {"accounts": 2, "inserted": 3, "updated": 0},
+                "surface_due_items": {"status": "ok", "created": 1, "failed": 0},
+                "reconcile_todoist_completions": {"status": "ok", "resolved": 1, "failed": 0},
+            },
+        }
+
+    monkeypatch.setattr(scheduled, "run_background_sync", fake_background)
+    result = run_scheduled_daily_sync(
+        db,
+        lock_dir=str(tmp_path),
+        as_of_date="2026-07-09",
+        sync=True,
+        surface=True,
+    )
+
+    assert seen["options"]["sync"] is True
+    assert seen["options"]["surface"] == {"write_enabled": None}
+    assert result["semantic_status"] == "ok"
+    assert result["phases"]["sync"]["status"] == "ok"
+    assert result["phases"]["surface"]["status"] == "ok"
+    assert result["phases"]["reconcile_completions"]["status"] == "ok"
+
+
+def test_sync_error_is_a_visible_warning_and_not_fresh(tmp_path, monkeypatch):
+    db = _db(tmp_path / "s.sqlite")
+
+    monkeypatch.setattr(
+        scheduled,
+        "run_background_sync",
+        lambda conn, **kwargs: {
+            "run_id": "run_warn",
+            "status": "succeeded_with_warnings",
+            "duration_ms": 10,
+            "result_summary": {
+                "sync_simplefin": {"error": "source unavailable"},
+                "surface_due_items": {"status": "ok", "created": 0, "failed": 0},
+                "reconcile_todoist_completions": {"status": "ok", "resolved": 0, "failed": 0},
+            },
+        },
+    )
+    result = run_scheduled_daily_sync(
+        db,
+        lock_dir=str(tmp_path),
+        as_of_date="2026-07-09",
+        sync=True,
+        surface=True,
+    )
+
+    assert result["semantic_status"] == "warn"
+    assert result["phases"]["sync"]["status"] == "failed"
+    assert result["fresh_for_exports"] is False
+
+
+def test_dry_run_reports_every_phase_without_running_background(tmp_path, monkeypatch):
+    db = _db(tmp_path / "s.sqlite")
+    monkeypatch.setattr(
+        scheduled,
+        "run_background_sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("background ran")),
+    )
+    result = run_scheduled_daily_sync(
+        db,
+        lock_dir=str(tmp_path),
+        as_of_date="2026-07-09",
+        dry_run=True,
+        sync=True,
+        surface=True,
+    )
+    assert result["status"] == "dry_run"
+    assert result["semantic_status"] == "ok"
+    assert set(result["phases"]) == {"sync", "pipeline", "surface", "reconcile_completions"}
