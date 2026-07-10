@@ -49,10 +49,12 @@ SEVERITY_WARN = "warn"
 COVERAGE_HORIZON_DAYS = 90
 _RECURRING_CADENCES = ("monthly", "weekly", "biweekly", "quarterly", "semimonthly")
 
-# Overlap check gates: two same-kind same-month obligations only pair when their
-# names read alike OR their median amounts are within this fraction of the larger.
-# Same-month same-kind alone flagged unrelated subscriptions (Claude vs Optimum).
+# Overlap check gates: two same-kind same-month obligations only pair when both
+# their character and token similarity pass, and their median amounts are within
+# this fraction of the larger. The token gate keeps shared category words such as
+# "subscription" from making unrelated merchants look alike.
 _OVERLAP_NAME_SIMILARITY = 0.6
+_OVERLAP_TOKEN_SIMILARITY = 0.4
 _OVERLAP_AMOUNT_PCT = 0.15
 
 
@@ -503,8 +505,9 @@ def _check_cross_obligation_overlap(conn: sqlite3.Connection, as_of_date: str) -
     retired-then-replaced bill (an old lease and its replacement) lives as two
     separate rows and double-counts. This surfaces pairs of same-kind active
     obligations with projectable instances in a shared month whose names read
-    alike or whose amounts sit within ~15% of each other, for a human to confirm
-    - WARN, review-only, never auto-deactivates.
+    alike and whose amounts sit within ~15% of each other. An exact normalized
+    name remains suspicious even when the amount changes. This is WARN,
+    review-only, and never auto-deactivates.
     """
 
     rows = conn.execute(
@@ -536,12 +539,19 @@ def _check_cross_obligation_overlap(conn: sqlite3.Connection, as_of_date: str) -
             amt_a = sorted(a["amts"])[len(a["amts"]) // 2]  # median
             amt_b = sorted(b["amts"])[len(b["amts"]) // 2]
             larger = max(amt_a, amt_b)
+            name_a = a["name"].strip().casefold()
+            name_b = b["name"].strip().casefold()
+            names_exact = name_a == name_b
+            tokens_a = set(name_a.split())
+            tokens_b = set(name_b.split())
+            token_union = tokens_a | tokens_b
+            token_similarity = len(tokens_a & tokens_b) / len(token_union) if token_union else 0.0
             names_alike = (
-                SequenceMatcher(None, a["name"].lower(), b["name"].lower()).ratio()
-                >= _OVERLAP_NAME_SIMILARITY
+                SequenceMatcher(None, name_a, name_b).ratio() >= _OVERLAP_NAME_SIMILARITY
+                and token_similarity >= _OVERLAP_TOKEN_SIMILARITY
             )
             amounts_alike = larger > 0 and abs(amt_a - amt_b) <= _OVERLAP_AMOUNT_PCT * larger
-            if not (names_alike or amounts_alike):
+            if not names_exact and not (names_alike and amounts_alike):
                 continue
             findings.append(
                 _finding(

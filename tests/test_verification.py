@@ -302,6 +302,39 @@ def test_cross_obligation_overlap_ignores_unrelated_same_kind_bills(tmp_path):
                 if f["check_id"] == "cross_obligation_overlap"]
 
 
+def test_cross_obligation_overlap_ignores_unrelated_similar_amounts(tmp_path):
+    conn = _clean_db(tmp_path / "ov3.sqlite")
+    for oid, name in [("github", "GitHub subscription"), ("nyt", "New York Times subscription")]:
+        conn.execute(
+            "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
+            "VALUES (?,?,'subscription','active','seed','t','t')",
+            (oid, name),
+        )
+    _insert_instance(conn, iid="github:2026-08-05", obligation_id="github", due_date="2026-08-05", amount=100.0)
+    _insert_instance(conn, iid="nyt:2026-08-12", obligation_id="nyt", due_date="2026-08-12", amount=105.0)
+    conn.commit()
+
+    assert not [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+                if f["check_id"] == "cross_obligation_overlap"]
+
+
+def test_cross_obligation_overlap_keeps_exact_name_even_when_amount_changes(tmp_path):
+    conn = _clean_db(tmp_path / "ov4.sqlite")
+    for oid, name in [("gym_old", "Gym membership"), ("gym_new", "gym membership")]:
+        conn.execute(
+            "INSERT INTO obligations (id,name,kind,status,source,created_at,updated_at) "
+            "VALUES (?,?,'subscription','active','seed','t','t')",
+            (oid, name),
+        )
+    _insert_instance(conn, iid="gym_old:2026-08-05", obligation_id="gym_old", due_date="2026-08-05", amount=50.0)
+    _insert_instance(conn, iid="gym_new:2026-08-12", obligation_id="gym_new", due_date="2026-08-12", amount=80.0)
+    conn.commit()
+
+    findings = [f for f in run_verification(conn, as_of_date="2026-06-20", persist=False)["findings"]
+                if f["check_id"] == "cross_obligation_overlap"]
+    assert len(findings) == 1
+
+
 # --- acknowledge / baseline --------------------------------------------------
 
 

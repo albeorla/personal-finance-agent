@@ -158,9 +158,10 @@ def test_sync_incremental_falls_back_to_lookback_when_empty(tmp_path, monkeypatc
     captured = {}
     monkeypatch.setattr(sfin, "fetch_simplefin_accounts",
                         lambda url, *, start_date=None, end_date=None, timeout=60: captured.update(start_date=start_date) or ([], []))
-    # lookback_days above the SimpleFIN-recommended cap is clamped to 45.
+    # Leave a full-day safety margin so a request later today stays under the
+    # SimpleFIN 45-day elapsed-time recommendation.
     sync_simplefin(conn, access_url="https://u:p@host/simplefin", incremental=True, lookback_days=90)
-    assert captured["start_date"] == (dt.date.today() - dt.timedelta(days=45)).isoformat()
+    assert captured["start_date"] == (dt.date.today() - dt.timedelta(days=44)).isoformat()
 
 
 def test_sync_explicit_start_date_is_not_clamped(tmp_path, monkeypatch):
