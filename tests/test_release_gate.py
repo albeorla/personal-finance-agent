@@ -16,6 +16,48 @@ APPLE_CSV = """Transaction Date,Clearing Date,Description,Merchant,Category,Type
 07/01/2026,07/02/2026,APPLE.COM/BILL,Apple Services,Subscriptions,Purchase,9.99
 """
 
+LOCAL_WRITERS = [
+    (
+        "set_goal_override",
+        "set_goal_override_for_db",
+        {"goal_id": "goal-test", "override_amount": 1},
+    ),
+    (
+        "set_debt_terms",
+        "set_debt_terms_for_db",
+        {"id": "debt-test", "name": "Test debt", "apr": 1},
+    ),
+    (
+        "capture_followup",
+        "capture_followup_for_db",
+        {"text": "Test", "surface_when": "2026-07-12"},
+    ),
+    (
+        "resolve_followup",
+        "resolve_followup_for_db",
+        {"followup_id": "followup-test"},
+    ),
+    (
+        "update_followup",
+        "update_followup_for_db",
+        {"followup_id": "followup-test", "priority": "high"},
+    ),
+    (
+        "apply_income_source",
+        "apply_income_source_config",
+        {"source": {}},
+    ),
+    (
+        "import_calendar_facts",
+        "import_calendar_facts_for_db",
+        {"facts": []},
+    ),
+]
+
+LOCAL_WRITER_MODULE_REPRESENTATIVES = [
+    LOCAL_WRITERS[index] for index in (0, 1, 2, 5, 6)
+]
+
 
 def _prepare_database(db, release_state):
     conn = sqlite3.connect(db)
@@ -628,13 +670,155 @@ def test_card_import_non_ok_result_is_unchanged_and_staged_write_is_discarded(
     ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    LOCAL_WRITERS,
+    ids=[writer[0] for writer in LOCAL_WRITERS],
+)
+def test_local_writer_rejects_stale_release_before_helper_invocation(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.StaleReleaseError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.StaleReleaseError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    LOCAL_WRITERS,
+    ids=[writer[0] for writer in LOCAL_WRITERS],
+)
+def test_local_writer_commits_with_row_factory_and_preserves_release(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE writer_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+
+    def helper_spy(conn, *args, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        conn.execute("INSERT INTO writer_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    assert getattr(server, entrypoint)(**arguments, db_path=str(db)) == expected
+
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT entrypoint FROM writer_probe").fetchall() == [
+            (entrypoint,)
+        ]
+        assert conn.execute(
+            "SELECT version FROM finance_release WHERE id = 1"
+        ).fetchone() == (build_info.VERSION,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    LOCAL_WRITER_MODULE_REPRESENTATIVES,
+    ids=[writer[0] for writer in LOCAL_WRITER_MODULE_REPRESENTATIVES],
+)
+@pytest.mark.parametrize(
+    "schema_version", [LATEST_SCHEMA_VERSION - 1, LATEST_SCHEMA_VERSION + 1]
+)
+def test_local_writer_rejects_incompatible_schema_before_helper_invocation(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    schema_version,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.IncompatibleSchemaError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.IncompatibleSchemaError,
+        [],
+        before,
+    )
+
+
+def test_calendar_fact_batch_rolls_back_when_later_fact_is_malformed(tmp_path):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+
+    with pytest.raises(ValueError, match="requires date"):
+        server.import_calendar_facts(
+            [
+                {
+                    "fact_type": "business_closure",
+                    "date": "2026-07-12",
+                    "source": "test",
+                },
+                {"fact_type": "business_closure"},
+            ],
+            db_path=str(db),
+        )
+
+    assert sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM calendar_facts"
+    ).fetchone()[0] == 0
+
+
 def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
+    migrated_writers = {
+        "set_manual_balance",
+        "import_card_statement",
+        *(writer[0] for writer in LOCAL_WRITERS),
+    }
     tree = ast.parse(Path(server.__file__).read_text())
     functions = {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in {"set_manual_balance", "import_card_statement"}
+        and node.name in migrated_writers
     }
     direct_calls = {}
     for name, function in functions.items():
@@ -653,8 +837,8 @@ def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
             )
         ]
 
-    assert set(functions) == {"set_manual_balance", "import_card_statement"}
-    assert direct_calls == {"set_manual_balance": [], "import_card_statement": []}
+    assert set(functions) == migrated_writers
+    assert direct_calls == {name: [] for name in migrated_writers}
 
 
 @pytest.mark.parametrize("release_state", ["missing_table", "missing_row", "mismatched"])

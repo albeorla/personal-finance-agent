@@ -245,21 +245,14 @@ def set_goal_override(
     goal with its recomputed progress.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_goal_override_for_db(
             conn,
             goal_id=goal_id,
             override_amount=override_amount,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -287,12 +280,8 @@ def set_debt_terms(
     from the avalanche target order even when their APR is high.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_debt_terms_for_db(
             conn,
             id=id,
@@ -307,10 +296,7 @@ def set_debt_terms(
             autopay=autopay,
             note=note,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -353,12 +339,8 @@ def capture_followup(
     follow-up instead of creating a duplicate. This writes to the DB only.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = capture_followup_for_db(
             conn,
             text=text,
@@ -367,10 +349,7 @@ def capture_followup(
             linked_obligation_id=linked_obligation_id,
             source=source,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -398,17 +377,10 @@ def list_due_followups(as_of_date: str | None = None, db_path: str | None = None
 def resolve_followup(followup_id: str, db_path: str | None = None) -> dict:
     """Mark a follow-up resolved so it stops surfacing. Idempotent."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = resolve_followup_for_db(conn, followup_id=followup_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -426,12 +398,8 @@ def update_followup(
     create a new row because the capture id is derived from content.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = update_followup_for_db(
             conn,
             followup_id,
@@ -440,10 +408,7 @@ def update_followup(
             priority=priority,
             linked_obligation_id=linked_obligation_id,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -688,17 +653,10 @@ def list_income_sources(db_path: str | None = None) -> dict:
 def apply_income_source(source: dict, db_path: str | None = None) -> dict:
     """Create or update an income source and schedule version after user confirmation."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_income_source_config(conn, source)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -710,17 +668,10 @@ def import_calendar_facts(facts: list[dict], db_path: str | None = None) -> dict
     calendar_id, related entity, title, confidence, notes, and payload.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = import_calendar_facts_for_db(conn, facts)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
