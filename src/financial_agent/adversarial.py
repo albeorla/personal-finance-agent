@@ -37,6 +37,7 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
+from .release_gate import guarded_write
 from .schema import ensure_app_schema, has_app_schema
 from .verification import SEVERITY_ERROR, SEVERITY_WARN
 
@@ -733,13 +734,8 @@ def main(argv: list[str] | None = None) -> int:
     from .status import default_db_path
 
     db_path = args.db or str(default_db_path())
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(db_path) as conn:
         result = run_adversarial_review(conn, as_of_date=args.as_of, model=args.model)
-        conn.commit()
-    finally:
-        conn.close()
 
     print(_format_cli_summary(result))
     return 0

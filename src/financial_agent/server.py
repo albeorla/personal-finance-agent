@@ -1462,17 +1462,10 @@ def execute_action_outbox(
     place on rerun rather than duplicated.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = execute_action_outbox_for_db(conn, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1483,6 +1476,7 @@ def create_todoist_task(
     description: str | None = None,
     priority: int | None = None,
     project_id: str | None = None,
+    db_path: str | None = None,
 ) -> dict:
     """Create a free-form Todoist task (e.g. a one-off reminder) in the Finance project.
 
@@ -1506,6 +1500,8 @@ def create_todoist_task(
     Returns on success: {"status": "created", "sent": true, "task_id", "url", "content"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return create_todoist_task_impl(
         content,
         due_string=due_string,
@@ -1525,6 +1521,7 @@ def update_todoist_task(
     description: str | None = None,
     priority: int | None = None,
     project_id: str | None = None,
+    db_path: str | None = None,
 ) -> dict:
     """Update an existing Todoist task in place, editing only the provided fields.
 
@@ -1549,6 +1546,8 @@ def update_todoist_task(
     Returns on success: {"status": "updated", "sent": true, "task_id", "url"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return update_todoist_task_impl(
         task_id,
         content=content,
@@ -1561,7 +1560,7 @@ def update_todoist_task(
 
 
 @mcp.tool()
-def complete_todoist_task(task_id: str) -> dict:
+def complete_todoist_task(task_id: str, db_path: str | None = None) -> dict:
     """Complete (close) an existing Todoist task by id.
 
     Live Todoist write-back is gated OFF by default. The task is closed ONLY when
@@ -1575,11 +1574,13 @@ def complete_todoist_task(task_id: str) -> dict:
     Returns on success: {"status": "completed", "sent": true, "task_id"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return complete_todoist_task_impl(task_id)
 
 
 @mcp.tool()
-def reopen_todoist_task(task_id: str) -> dict:
+def reopen_todoist_task(task_id: str, db_path: str | None = None) -> dict:
     """Reopen (un-complete) an existing Todoist task by id.
 
     Live Todoist write-back is gated OFF by default. The task is reopened ONLY when
@@ -1593,11 +1594,13 @@ def reopen_todoist_task(task_id: str) -> dict:
     Returns on success: {"status": "reopened", "sent": true, "task_id"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return reopen_todoist_task_impl(task_id)
 
 
 @mcp.tool()
-def delete_todoist_task(task_id: str) -> dict:
+def delete_todoist_task(task_id: str, db_path: str | None = None) -> dict:
     """Delete an existing Todoist task by id.
 
     Live Todoist write-back is gated OFF by default. The task is deleted ONLY when
@@ -1612,6 +1615,8 @@ def delete_todoist_task(task_id: str) -> dict:
     Returns on success: {"status": "deleted", "sent": true, "task_id"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return delete_todoist_task_impl(task_id)
 
 
@@ -1646,12 +1651,8 @@ def surface_due_items_to_todoist(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         # Headline enrichment needs synced balances; on an app-only DB (obligations
         # seeded, no sync yet) there is no balance/health read, so surface the bare
         # due items instead of crashing on the digest build.
@@ -1667,10 +1668,7 @@ def surface_due_items_to_todoist(
             # it on a same-day re-run.
             items = [build_sync_failed_item_for_db(as_of_date), *items]
         result = surface_to_todoist_for_db(conn, items, as_of_date, retire_keys=retire_keys)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1688,17 +1686,10 @@ def reconcile_todoist_emission(
     creating a duplicate. Writes only to the local ledger; no external call.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_emission_for_db(conn, surface_key, todoist_task_id, content_hash)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1723,17 +1714,10 @@ def reconcile_todoist_completions(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_todoist_completions_for_db(conn, as_of_date=as_of_date)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1765,17 +1749,10 @@ def reconcile_todoist_project(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_todoist_project_for_db(conn, as_of_date=as_of_date, apply=apply)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1883,19 +1860,12 @@ def run_background_sync(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = run_background_sync_for_db(
             conn, as_of_date=as_of_date, options=options, run_type=run_type, trigger_type=trigger_type
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2104,19 +2074,12 @@ def run_adversarial_review(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = run_adversarial_review_for_db(
             conn, as_of_date=as_of_date, persist=persist, model=model
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2305,19 +2268,12 @@ def sync_simplefin(
     problems) and 'notes' (expected balance-only connections like Apple Card).
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = sync_simplefin_for_db(
             conn, start_date=start_date, end_date=end_date, lookback_days=lookback_days, incremental=incremental
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()

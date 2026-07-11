@@ -46,7 +46,8 @@ def require_current_release_connection(conn: sqlite3.Connection) -> None:
 
     if row is None or row[0] != VERSION:
         raise StaleReleaseError(
-            f"Release record does not match running version {VERSION}"
+            f"Release record does not match running version {VERSION}. "
+            "Reload the finance server and retry."
         )
     _semantic_version(row[0])
 

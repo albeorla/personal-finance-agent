@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import financial_agent.adversarial as adversarial
 import financial_agent.backfill as backfill
 import financial_agent.migration as migration
 import financial_agent.onboarding as onboarding
@@ -340,6 +341,160 @@ MIXED_SAFE_READ_BRANCHES = [
             "balance": 2500,
             "dry_run": True,
         },
+    ),
+]
+
+REMAINING_DB_MUTATION_WRITERS = [
+    (
+        "execute_action_outbox",
+        "execute_action_outbox_for_db",
+        {"options": {"write_enabled": False}},
+        (),
+        {"options": {"write_enabled": False}},
+    ),
+    (
+        "surface_due_items_to_todoist",
+        "surface_to_todoist_for_db",
+        {"as_of_date": "2026-07-11", "sync_failed": False},
+        ([{"surface_key": "test-item"}], "2026-07-11"),
+        {"retire_keys": ["retire-test"]},
+    ),
+    (
+        "reconcile_todoist_emission",
+        "reconcile_emission_for_db",
+        {
+            "surface_key": "test-key",
+            "todoist_task_id": "task-test",
+            "content_hash": "hash-test",
+        },
+        ("test-key", "task-test", "hash-test"),
+        {},
+    ),
+    (
+        "reconcile_todoist_completions",
+        "reconcile_todoist_completions_for_db",
+        {"as_of_date": "2026-07-11"},
+        (),
+        {"as_of_date": "2026-07-11"},
+    ),
+    (
+        "reconcile_todoist_project",
+        "reconcile_todoist_project_for_db",
+        {"as_of_date": "2026-07-11", "apply": True},
+        (),
+        {"as_of_date": "2026-07-11", "apply": True},
+    ),
+    (
+        "run_background_sync",
+        "run_background_sync_for_db",
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"surface": {"write_enabled": False}},
+            "run_type": "acceptance",
+            "trigger_type": "manual",
+        },
+        (),
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"surface": {"write_enabled": False}},
+            "run_type": "acceptance",
+            "trigger_type": "manual",
+        },
+    ),
+    (
+        "run_adversarial_review",
+        "run_adversarial_review_for_db",
+        {"as_of_date": "2026-07-11", "persist": True, "model": "test-model"},
+        (),
+        {"as_of_date": "2026-07-11", "persist": True, "model": "test-model"},
+    ),
+    (
+        "sync_simplefin",
+        "sync_simplefin_for_db",
+        {
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-11",
+            "lookback_days": 10,
+            "incremental": True,
+        },
+        (),
+        {
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-11",
+            "lookback_days": 10,
+            "incremental": True,
+        },
+    ),
+]
+
+REMAINING_DB_MUTATION_SCHEMA_REPRESENTATIVES = [
+    (*REMAINING_DB_MUTATION_WRITERS[0], LATEST_SCHEMA_VERSION - 1),
+    (*REMAINING_DB_MUTATION_WRITERS[-1], LATEST_SCHEMA_VERSION + 1),
+]
+
+REMOTE_TODOIST_MUTATION_WRITERS = [
+    (
+        "create_todoist_task",
+        "create_todoist_task_impl",
+        {
+            "content": "Test task",
+            "due_string": "today",
+            "due_date": "2026-07-11",
+            "description": "Test description",
+            "priority": 4,
+            "project_id": "project-test",
+        },
+        ("Test task",),
+        {
+            "due_string": "today",
+            "due_date": "2026-07-11",
+            "description": "Test description",
+            "priority": 4,
+            "project_id": "project-test",
+        },
+    ),
+    (
+        "update_todoist_task",
+        "update_todoist_task_impl",
+        {
+            "task_id": "task-test",
+            "content": "Updated task",
+            "due_string": "tomorrow",
+            "due_date": "2026-07-12",
+            "description": "Updated description",
+            "priority": 3,
+            "project_id": "project-test",
+        },
+        ("task-test",),
+        {
+            "content": "Updated task",
+            "due_string": "tomorrow",
+            "due_date": "2026-07-12",
+            "description": "Updated description",
+            "priority": 3,
+            "project_id": "project-test",
+        },
+    ),
+    (
+        "complete_todoist_task",
+        "complete_todoist_task_impl",
+        {"task_id": "task-test"},
+        ("task-test",),
+        {},
+    ),
+    (
+        "reopen_todoist_task",
+        "reopen_todoist_task_impl",
+        {"task_id": "task-test"},
+        ("task-test",),
+        {},
+    ),
+    (
+        "delete_todoist_task",
+        "delete_todoist_task_impl",
+        {"task_id": "task-test"},
+        ("task-test",),
+        {},
     ),
 ]
 
@@ -2114,6 +2269,224 @@ def test_obligation_migration_wrapper_does_not_manage_sqlite_transactions_direct
     assert direct_calls == {"apply_obligation_migration": []}
 
 
+def _stub_surface_due_item_inputs(monkeypatch):
+    monkeypatch.setattr(server, "_has_synced_sources", lambda conn: False)
+    monkeypatch.setattr(
+        server,
+        "build_surface_items_for_db",
+        lambda conn, **kwargs: [{"surface_key": "test-item"}],
+    )
+    monkeypatch.setattr(
+        server,
+        "build_surface_retire_keys_for_db",
+        lambda conn, **kwargs: ["retire-test"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_args", "expected_kwargs"),
+    REMAINING_DB_MUTATION_WRITERS,
+    ids=[writer[0] for writer in REMAINING_DB_MUTATION_WRITERS],
+)
+def test_remaining_db_mutation_rejects_stale_release_before_helper_invocation(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_args,
+    expected_kwargs,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE remaining_writer_probe (entrypoint TEXT)")
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+    _stub_surface_due_item_inputs(monkeypatch)
+
+    def helper_spy(conn, *args, **kwargs):
+        helper_calls.append((args, kwargs))
+        conn.execute("INSERT INTO remaining_writer_probe VALUES (?)", (entrypoint,))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.StaleReleaseError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_args", "expected_kwargs"),
+    REMAINING_DB_MUTATION_WRITERS,
+    ids=[writer[0] for writer in REMAINING_DB_MUTATION_WRITERS],
+)
+def test_remaining_db_mutation_forwards_exact_helper_call_and_commits_row_connection(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_args,
+    expected_kwargs,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE remaining_writer_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+    helper_calls = []
+    _stub_surface_due_item_inputs(monkeypatch)
+
+    def helper_spy(conn, *args, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append((args, kwargs))
+        conn.execute("INSERT INTO remaining_writer_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    assert helper_calls == [(expected_args, expected_kwargs)]
+    assert sqlite3.connect(db).execute(
+        "SELECT entrypoint FROM remaining_writer_probe"
+    ).fetchall() == [(entrypoint,)]
+
+
+@pytest.mark.parametrize(
+    (
+        "entrypoint",
+        "helper_name",
+        "arguments",
+        "expected_args",
+        "expected_kwargs",
+        "schema_version",
+    ),
+    REMAINING_DB_MUTATION_SCHEMA_REPRESENTATIVES,
+    ids=[writer[0] for writer in REMAINING_DB_MUTATION_SCHEMA_REPRESENTATIVES],
+)
+def test_remaining_db_mutation_rejects_incompatible_schema_before_helper_invocation(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_args,
+    expected_kwargs,
+    schema_version,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+    _stub_surface_due_item_inputs(monkeypatch)
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.IncompatibleSchemaError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_args", "expected_kwargs"),
+    REMOTE_TODOIST_MUTATION_WRITERS,
+    ids=[writer[0] for writer in REMOTE_TODOIST_MUTATION_WRITERS],
+)
+def test_remote_todoist_mutation_rejects_stale_release_before_imported_impl(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_args,
+    expected_kwargs,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.StaleReleaseError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_args", "expected_kwargs"),
+    REMOTE_TODOIST_MUTATION_WRITERS,
+    ids=[writer[0] for writer in REMOTE_TODOIST_MUTATION_WRITERS],
+)
+def test_remote_todoist_mutation_forwards_existing_arguments_and_result_identity(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_args,
+    expected_kwargs,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    expected = {"entrypoint": entrypoint}
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    assert helper_calls == [(expected_args, expected_kwargs)]
+
+
+def test_stale_release_error_tells_writer_to_reload(tmp_path):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(release_gate.StaleReleaseError) as exc_info:
+        release_gate.require_current_release(str(db))
+
+    assert "reload" in str(exc_info.value).lower()
+
+
 def _direct_sqlite_transaction_calls(function_names, transaction_methods, module=server):
     tree = ast.parse(Path(module.__file__).read_text())
     functions = {
@@ -2140,6 +2513,83 @@ def _direct_sqlite_transaction_calls(function_names, transaction_methods, module
         ]
 
     return functions, direct_calls
+
+
+def test_adversarial_main_uses_guarded_release_checked_transaction(
+    tmp_path, monkeypatch, capsys
+):
+    stale_db = tmp_path / "stale.sqlite"
+    _prepare_database(stale_db, "current")
+    conn = sqlite3.connect(stale_db)
+    conn.execute("CREATE TABLE adversarial_probe (as_of_date TEXT, model TEXT)")
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    stale_before = _full_database_snapshot(stale_db)
+    calls = []
+
+    def review_spy(conn, *, as_of_date, model):
+        calls.append((as_of_date, model))
+        conn.execute(
+            "INSERT INTO adversarial_probe VALUES (?, ?)", (as_of_date, model)
+        )
+        return {
+            "available": True,
+            "reviewed_count": 2,
+            "findings_total": 0,
+            "by_severity": {},
+        }
+
+    monkeypatch.setattr(adversarial, "adversarial_review_enabled", lambda: True)
+    monkeypatch.setattr(adversarial, "run_adversarial_review", review_spy)
+
+    with pytest.raises(release_gate.StaleReleaseError):
+        adversarial.main(
+            [
+                "--as-of",
+                "2026-07-11",
+                "--db",
+                str(stale_db),
+                "--model",
+                "test-model",
+            ]
+        )
+
+    assert calls == []
+    assert _full_database_snapshot(stale_db) == stale_before
+
+    current_db = tmp_path / "current.sqlite"
+    _prepare_database(current_db, "current")
+    conn = sqlite3.connect(current_db)
+    conn.execute("CREATE TABLE adversarial_probe (as_of_date TEXT, model TEXT)")
+    conn.commit()
+    conn.close()
+
+    result = adversarial.main(
+        [
+            "--as-of",
+            "2026-07-12",
+            "--db",
+            str(current_db),
+            "--model",
+            "current-model",
+        ]
+    )
+
+    assert result == 0
+    assert calls == [("2026-07-12", "current-model")]
+    assert sqlite3.connect(current_db).execute(
+        "SELECT as_of_date, model FROM adversarial_probe"
+    ).fetchall() == [("2026-07-12", "current-model")]
+    assert capsys.readouterr().out == (
+        "adversarial review complete: reviewed 2 item(s), no advisory flags.\n"
+    )
+
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        {"main"}, {"commit", "rollback"}, adversarial
+    )
+    assert set(functions) == {"main"}
+    assert direct_calls == {"main": []}
 
 
 def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
@@ -2234,6 +2684,16 @@ def test_mixed_endpoints_do_not_manage_sqlite_transactions_directly():
     }
     functions, direct_calls = _direct_sqlite_transaction_calls(
         entrypoints, {"commit"}
+    )
+
+    assert set(functions) == entrypoints
+    assert direct_calls == {name: [] for name in entrypoints}
+
+
+def test_remaining_db_mutations_do_not_manage_sqlite_transactions_directly():
+    entrypoints = {writer[0] for writer in REMAINING_DB_MUTATION_WRITERS}
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        entrypoints, {"commit", "rollback"}
     )
 
     assert set(functions) == entrypoints
