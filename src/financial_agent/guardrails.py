@@ -23,7 +23,6 @@ from typing import Any
 
 from .cashflow import CASH_FLOOR, build_cash_flow_projections
 from .debts import list_debts
-from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
 
@@ -135,11 +134,36 @@ def list_guardrail_findings(
 
 
 def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
+    from .status import WORKING_BALANCE_STALE_DAYS, _latest_balances
+
     if accounts is None:
-        accounts = _latest_accounts(conn)
+        accounts = _latest_balances(conn, as_of=as_of)
     if not accounts:
         return []
-    projections, _ = build_cash_flow_projections(conn, accounts=accounts, windows=list(windows), start_date=as_of)
+    projections, _ = build_cash_flow_projections(
+        conn,
+        accounts=accounts,
+        windows=list(windows),
+        start_date=as_of,
+        working_balance_stale_days=WORKING_BALANCE_STALE_DAYS,
+    )
+    if projections and projections[0]["working_account"]["balance_date_stale"]:
+        working_account = projections[0]["working_account"]
+        return [_finding(
+            "cash_floor", "guardrail:cash_floor:unverified", "medium",
+            "Cash-floor verdict is unverified because the working balance is stale; "
+            "enter the current portal balance. If no manual correction is pinned, "
+            "a fresh export that updates the working balance can also verify it.",
+            {
+                "verdict": "unverified",
+                "balance_date": working_account.get("balance_date"),
+                "balance_age_days": working_account.get("balance_age_days"),
+                "would_be_breach_windows": [
+                    p["window_days"] for p in projections
+                    if p.get("lowest_balance") is not None and p["lowest_balance"] < CASH_FLOOR
+                ],
+            },
+        )]
     findings: list[dict[str, Any]] = []
     for p in projections:
         lowest = p.get("lowest_balance")
@@ -292,22 +316,6 @@ def _persist(conn, findings, as_of) -> None:
                 "INSERT INTO guardrail_evaluations (id, rule_type, evaluation_date, passed, finding_json, created_at) VALUES (?, ?, ?, 1, NULL, ?)",
                 (f"geval_{uuid.uuid4().hex[:12]}", rule_type, as_of.isoformat(), now),
             )
-
-
-def _latest_accounts(conn) -> list[dict[str, Any]]:
-    if not _has_table(conn, "balance_snapshots"):
-        return []
-    rows = conn.execute(
-        f"""
-        SELECT a.id AS account_id, a.name AS account_name, a.kind, bs.available, bs.recorded_at
-        FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id
-        WHERE bs.id = (SELECT inner_bs.id FROM balance_snapshots inner_bs
-                       WHERE inner_bs.account_id = bs.account_id
-                       {BALANCE_PRECEDENCE_ORDER_BY.format(alias="inner_bs")} LIMIT 1)
-        """
-    ).fetchall()
-    return [{"account_id": r["account_id"], "account_name": r["account_name"], "kind": r["kind"],
-             "available": round(float(r["available"]), 2), "recorded_at": r["recorded_at"]} for r in rows]
 
 
 def _has_table(conn, name) -> bool:

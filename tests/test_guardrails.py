@@ -64,7 +64,7 @@ def test_manual_balance_wins_over_newer_feed_in_guardrails(tmp_path):
     )
     conn.commit()
 
-    res = evaluate_guardrails(conn, as_of_date="2026-06-22", drift_findings=[])
+    res = evaluate_guardrails(conn, as_of_date="2026-06-21", drift_findings=[])
     assert [f for f in res["findings"] if f["rule_type"] == "cash_floor"] == []
 
 
