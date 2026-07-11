@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import financial_agent.backfill as backfill
+import financial_agent.onboarding as onboarding
 import financial_agent.scheduled as scheduled
 from financial_agent import build_info, release_gate, server
 from financial_agent.config import ensure_source_tables
@@ -216,6 +218,19 @@ IMP1_WRITERS = [
 
 IMP1_SCHEMA_REPRESENTATIVES = [
     IMP1_WRITERS[index] for index in (0, 1, 2, 4)
+]
+
+RECURRING_WRITERS = [
+    (
+        "backfill_recurring_instances",
+        "backfill_recurring_instances_for_db",
+        {"as_of_date": "2026-07-11", "lookback_days": 45},
+    ),
+    (
+        "auto_model_high_confidence_recurring",
+        "auto_model_high_confidence_recurring_for_db",
+        {"as_of_date": "2026-07-11"},
+    ),
 ]
 
 MIXED_WRITE_BRANCHES = [
@@ -1567,6 +1582,107 @@ def test_imp1_write_finance_memory_validates_before_release_gate(tmp_path, monke
 
 
 @pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    RECURRING_WRITERS,
+    ids=[writer[0] for writer in RECURRING_WRITERS],
+)
+def test_recurring_writer_rejects_stale_release_before_helper_and_preserves_database(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE recurring_writer_probe (entrypoint TEXT)")
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO recurring_writer_probe VALUES (?)", (entrypoint,))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.StaleReleaseError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    RECURRING_WRITERS,
+    ids=[writer[0] for writer in RECURRING_WRITERS],
+)
+@pytest.mark.parametrize(
+    "schema_version", [LATEST_SCHEMA_VERSION - 1, LATEST_SCHEMA_VERSION + 1]
+)
+def test_recurring_writer_rejects_incompatible_schema_before_helper(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments, schema_version
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE recurring_writer_probe (entrypoint TEXT)")
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO recurring_writer_probe VALUES (?)", (entrypoint,))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.IncompatibleSchemaError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    RECURRING_WRITERS,
+    ids=[writer[0] for writer in RECURRING_WRITERS],
+)
+def test_recurring_writer_forwards_arguments_and_commits_exact_helper_result(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE recurring_writer_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO recurring_writer_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    assert helper_calls == [arguments]
+    assert sqlite3.connect(db).execute(
+        "SELECT entrypoint FROM recurring_writer_probe"
+    ).fetchall() == [(entrypoint,)]
+
+
+@pytest.mark.parametrize(
     ("entrypoint", "helper_name", "arguments", "expected_helper_arguments"),
     MIXED_WRITE_BRANCHES,
     ids=[branch[0] for branch in MIXED_WRITE_BRANCHES],
@@ -1736,8 +1852,8 @@ def test_mixed_safe_read_is_read_only_and_reports_release_warning(
     ).fetchone()[0] == 0
 
 
-def _direct_sqlite_transaction_calls(function_names, transaction_methods):
-    tree = ast.parse(Path(server.__file__).read_text())
+def _direct_sqlite_transaction_calls(function_names, transaction_methods, module=server):
+    tree = ast.parse(Path(module.__file__).read_text())
     functions = {
         node.name: node
         for node in tree.body
@@ -1818,6 +1934,31 @@ def test_imp1_writers_do_not_manage_sqlite_transactions_directly():
 
     assert set(functions) == writers
     assert direct_calls == {name: [] for name in writers}
+
+
+def test_recurring_writers_and_helpers_do_not_manage_sqlite_transactions_directly():
+    wrapper_names = {writer[0] for writer in RECURRING_WRITERS}
+    wrapper_functions, wrapper_calls = _direct_sqlite_transaction_calls(
+        wrapper_names, {"commit", "rollback"}
+    )
+    backfill_functions, backfill_calls = _direct_sqlite_transaction_calls(
+        {"backfill_recurring_instances"}, {"commit", "rollback"}, backfill
+    )
+    onboarding_functions, onboarding_calls = _direct_sqlite_transaction_calls(
+        {"auto_model_high_confidence_recurring"},
+        {"commit", "rollback"},
+        onboarding,
+    )
+
+    assert set(wrapper_functions) == wrapper_names
+    assert set(backfill_functions) == {"backfill_recurring_instances"}
+    assert set(onboarding_functions) == {"auto_model_high_confidence_recurring"}
+    direct_calls = {
+        **{f"server.{name}": calls for name, calls in wrapper_calls.items()},
+        **{f"backfill.{name}": calls for name, calls in backfill_calls.items()},
+        **{f"onboarding.{name}": calls for name, calls in onboarding_calls.items()},
+    }
+    assert direct_calls == {name: [] for name in direct_calls}
 
 
 def test_mixed_endpoints_do_not_manage_sqlite_transactions_directly():

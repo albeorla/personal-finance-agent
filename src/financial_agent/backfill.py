@@ -116,7 +116,6 @@ def backfill_recurring_instances(
             created += len(new_instances)
             obligations_touched += 1
 
-    conn.commit()
     result: dict[str, Any] = {"instances_created": created, "obligations_touched": obligations_touched}
     if reconcile:
         result["reconcile"] = reconcile_obligation_instances(conn, as_of_date=as_of_date)
@@ -137,7 +136,6 @@ def backfill_recurring_instances(
         result["cleared_kept"] = conn.execute(
             "SELECT COUNT(*) FROM obligation_instances WHERE source = 'backfill' AND status != 'canceled'"
         ).fetchone()[0]
-        conn.commit()
     return result
 
 

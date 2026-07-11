@@ -2,6 +2,8 @@
 
 import sqlite3
 
+import pytest
+
 from financial_agent.onboarding import auto_model_high_confidence_recurring, scan_charge_onboarding_candidates
 from financial_agent.schema import ensure_app_schema
 
@@ -54,3 +56,47 @@ def test_auto_model_excludes_internal_transfers(tmp_path):
     # a transfer is never auto-modeled as a bill
     assert not any("transfer" in a["merchant"].lower() for a in res["applied"])
     assert any("transfer" in s["reason"].lower() for s in res["skipped"]) or res["applied_count"] == 0
+
+
+def test_auto_model_changes_roll_back_with_caller_transaction(tmp_path):
+    db = tmp_path / "m.sqlite"
+    conn = _db(
+        db,
+        transactions=_monthly(
+            "Volvo Car Fin Auto Finan Web", -580.84, [1, 2, 3, 4, 5, 6]
+        ),
+    )
+    scan_charge_onboarding_candidates(conn)
+    candidate = conn.execute(
+        "SELECT id, status FROM charge_onboarding_candidates "
+        "WHERE confidence = 'high' AND cash_flow_treatment = 'direct_checking'"
+    ).fetchone()
+    assert candidate is not None
+    before = {
+        "candidate_status": candidate["status"],
+        "obligations": conn.execute("SELECT COUNT(*) FROM obligations").fetchone()[0],
+        "instances": conn.execute(
+            "SELECT COUNT(*) FROM obligation_instances"
+        ).fetchone()[0],
+    }
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with conn:
+            result = auto_model_high_confidence_recurring(
+                conn, as_of_date="2026-06-21"
+            )
+            assert result["applied_count"] >= 1
+            raise RuntimeError("caller failed")
+
+    after = {
+        "candidate_status": conn.execute(
+            "SELECT status FROM charge_onboarding_candidates WHERE id = ?",
+            (candidate["id"],),
+        ).fetchone()[0],
+        "obligations": conn.execute("SELECT COUNT(*) FROM obligations").fetchone()[0],
+        "instances": conn.execute(
+            "SELECT COUNT(*) FROM obligation_instances"
+        ).fetchone()[0],
+    }
+    assert after == before

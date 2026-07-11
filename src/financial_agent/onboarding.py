@@ -1520,5 +1520,4 @@ def auto_model_high_confidence_recurring(
         except Exception as exc:  # noqa: BLE001 - skip un-appliable candidates, never abort the batch
             skipped.append({"candidate_id": r["id"], "reason": f"{type(exc).__name__}: {exc}"[:140]})
 
-    conn.commit()
     return {"applied_count": len(applied), "applied": applied, "skipped": skipped}

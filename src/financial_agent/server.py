@@ -2538,17 +2538,10 @@ def backfill_recurring_instances(as_of_date: str | None = None, lookback_days: i
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = backfill_recurring_instances_for_db(conn, as_of_date=as_of_date, lookback_days=lookback_days)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2559,17 +2552,10 @@ def auto_model_high_confidence_recurring(as_of_date: str | None = None, db_path:
     direct-checking with >=3 occurrences; everything else stays in the review queue.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = auto_model_high_confidence_recurring_for_db(conn, as_of_date=as_of_date)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 def main() -> None:
