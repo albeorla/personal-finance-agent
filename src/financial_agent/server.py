@@ -612,26 +612,33 @@ def import_checking_activity(
     """
 
     import datetime as _dt
-    import sqlite3
 
     resolved_db_path = db_path or str(default_db_path())
     resolved_as_of = as_of_date or _dt.date.today().isoformat()
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = import_checking_activity_for_db(
+                conn,
+                text=text,
+                account_query=account_query,
+                as_of_date=resolved_as_of,
+                balance=balance,
+                dry_run=True,
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = import_checking_activity_for_db(
             conn,
             text=text,
             account_query=account_query,
             as_of_date=resolved_as_of,
             balance=balance,
-            dry_run=dry_run,
+            dry_run=False,
         )
-        if not dry_run and result.get("status") == "ok":
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+        if result.get("status") != "ok":
+            conn.rollback()
+    return result
 
 
 @mcp.tool()
@@ -827,28 +834,20 @@ def suppress_contradicted_estimates(
     zero, routes it to dormant. Both paths are reversible and emit a low-severity
     drift finding.
 
-    mode='report' (default) emits findings but mutates nothing -- the observe
-    posture for the first live run. mode='enforce' applies the resolution. Tunable
-    thresholds (contradiction_ratio, flat_balance_ratio, modeled_floor,
-    contradiction_cycles, contradiction_lookback_days, near_zero_monthly) go in
-    options.
+    mode='report' (default) leaves obligations and instances unchanged but records
+    findings. mode='enforce' applies the resolution. Tunable thresholds
+    (contradiction_ratio, flat_balance_ratio, modeled_floor, contradiction_cycles,
+    contradiction_lookback_days, near_zero_monthly) go in options.
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     opts = {**(options or {}), "mode": mode}
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = suppress_contradicted_estimates_for_db(
             conn, as_of_date=as_of_date, options=opts
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1274,19 +1273,12 @@ def get_statement_status(
     whether spend is ahead of or behind the modeled pace.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = get_statement_status_for_db(
             conn, obligation_id=obligation_id, as_of_date=as_of_date
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1421,18 +1413,17 @@ def detect_drift(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if not persist:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = detect_drift_for_db(
+                conn, as_of_date=as_of_date, options=options, persist=False
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = detect_drift_for_db(conn, as_of_date=as_of_date, options=options, persist=persist)
-        if persist:
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2009,17 +2000,17 @@ def run_verification(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if not persist:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = run_verification_for_db(
+                conn, as_of_date=as_of_date, persist=False
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = run_verification_for_db(conn, as_of_date=as_of_date, persist=persist)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2254,18 +2245,10 @@ def evaluate_guardrails(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = evaluate_guardrails_for_db(conn, as_of_date=as_of_date, persist=persist)
-        if persist:
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()

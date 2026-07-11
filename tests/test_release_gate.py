@@ -16,6 +16,11 @@ APPLE_CSV = """Transaction Date,Clearing Date,Description,Merchant,Category,Type
 07/01/2026,07/02/2026,APPLE.COM/BILL,Apple Services,Subscriptions,Purchase,9.99
 """
 
+CHECKING_CSV = """Date,Description,Amount
+07/01/2026,PAYROLL DEPOSIT,2500.00
+07/02/2026,GROCERY STORE,-42.10
+"""
+
 LOCAL_WRITERS = [
     (
         "set_goal_override",
@@ -211,6 +216,113 @@ IMP1_WRITERS = [
 
 IMP1_SCHEMA_REPRESENTATIVES = [
     IMP1_WRITERS[index] for index in (0, 1, 2, 4)
+]
+
+MIXED_WRITE_BRANCHES = [
+    (
+        "suppress_contradicted_estimates",
+        "suppress_contradicted_estimates_for_db",
+        {
+            "as_of_date": "2026-07-11",
+            "mode": "report",
+            "options": {"modeled_floor": 100},
+        },
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"modeled_floor": 100, "mode": "report"},
+        },
+    ),
+    (
+        "evaluate_guardrails",
+        "evaluate_guardrails_for_db",
+        {"as_of_date": "2026-07-11", "persist": False},
+        {"as_of_date": "2026-07-11", "persist": False},
+    ),
+    (
+        "get_statement_status",
+        "get_statement_status_for_db",
+        {"obligation_id": "statement-test", "as_of_date": "2026-07-11"},
+        {"obligation_id": "statement-test", "as_of_date": "2026-07-11"},
+    ),
+    (
+        "detect_drift",
+        "detect_drift_for_db",
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"grace_days": 3},
+            "persist": True,
+        },
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"grace_days": 3},
+            "persist": True,
+        },
+    ),
+    (
+        "run_verification",
+        "run_verification_for_db",
+        {"as_of_date": "2026-07-11", "persist": True},
+        {"as_of_date": "2026-07-11", "persist": True},
+    ),
+    (
+        "import_checking_activity",
+        "import_checking_activity_for_db",
+        {
+            "text": CHECKING_CSV,
+            "account_query": "Apple Card",
+            "as_of_date": "2026-07-11",
+            "balance": 2500,
+            "dry_run": False,
+        },
+        {
+            "text": CHECKING_CSV,
+            "account_query": "Apple Card",
+            "as_of_date": "2026-07-11",
+            "balance": 2500,
+            "dry_run": False,
+        },
+    ),
+]
+
+MIXED_SAFE_READ_BRANCHES = [
+    (
+        "detect_drift",
+        "detect_drift_for_db",
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"grace_days": 3},
+            "persist": False,
+        },
+        {
+            "as_of_date": "2026-07-11",
+            "options": {"grace_days": 3},
+            "persist": False,
+        },
+    ),
+    (
+        "run_verification",
+        "run_verification_for_db",
+        {"as_of_date": "2026-07-11", "persist": False},
+        {"as_of_date": "2026-07-11", "persist": False},
+    ),
+    (
+        "import_checking_activity",
+        "import_checking_activity_for_db",
+        {
+            "text": CHECKING_CSV,
+            "account_query": "Apple Card",
+            "as_of_date": "2026-07-11",
+            "balance": 2500,
+            "dry_run": True,
+        },
+        {
+            "text": CHECKING_CSV,
+            "account_query": "Apple Card",
+            "as_of_date": "2026-07-11",
+            "balance": 2500,
+            "dry_run": True,
+        },
+    ),
 ]
 
 
@@ -1454,6 +1566,176 @@ def test_imp1_write_finance_memory_validates_before_release_gate(tmp_path, monke
     assert not db.exists()
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_helper_arguments"),
+    MIXED_WRITE_BRANCHES,
+    ids=[branch[0] for branch in MIXED_WRITE_BRANCHES],
+)
+@pytest.mark.parametrize(
+    ("gate_state", "expected_error"),
+    [
+        ("stale", release_gate.StaleReleaseError),
+        ("older_schema", release_gate.IncompatibleSchemaError),
+        ("newer_schema", release_gate.IncompatibleSchemaError),
+    ],
+)
+def test_mixed_write_branch_rejects_release_before_helper_and_preserves_database(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_helper_arguments,
+    gate_state,
+    expected_error,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE mixed_endpoint_probe (entrypoint TEXT)")
+    if gate_state == "stale":
+        conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    else:
+        schema_version = (
+            LATEST_SCHEMA_VERSION - 1
+            if gate_state == "older_schema"
+            else LATEST_SCHEMA_VERSION + 1
+        )
+        conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO mixed_endpoint_probe VALUES (?)", (entrypoint,))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(expected_error):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_helper_arguments"),
+    MIXED_WRITE_BRANCHES,
+    ids=[branch[0] for branch in MIXED_WRITE_BRANCHES],
+)
+def test_mixed_write_branch_forwards_arguments_and_commits_exact_helper_result(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_helper_arguments,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE mixed_endpoint_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"status": "ok", "entrypoint": entrypoint}
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO mixed_endpoint_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    assert helper_calls == [expected_helper_arguments]
+    assert sqlite3.connect(db).execute(
+        "SELECT entrypoint FROM mixed_endpoint_probe"
+    ).fetchall() == [(entrypoint,)]
+
+
+def test_checking_import_non_ok_result_discards_staged_writes(tmp_path, monkeypatch):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE mixed_endpoint_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"status": "ambiguous", "candidates": ["Checking"]}
+
+    def helper_spy(conn, **kwargs):
+        conn.execute("INSERT INTO mixed_endpoint_probe VALUES ('checking')")
+        return expected
+
+    monkeypatch.setattr(server, "import_checking_activity_for_db", helper_spy)
+
+    result = server.import_checking_activity(
+        CHECKING_CSV,
+        as_of_date="2026-07-11",
+        dry_run=False,
+        db_path=str(db),
+    )
+
+    assert result is expected
+    assert sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM mixed_endpoint_probe"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_helper_arguments"),
+    MIXED_SAFE_READ_BRANCHES,
+    ids=[branch[0] for branch in MIXED_SAFE_READ_BRANCHES],
+)
+@pytest.mark.parametrize("release_state", ["current", "stale"])
+def test_mixed_safe_read_is_read_only_and_reports_release_warning(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_helper_arguments,
+    release_state,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE mixed_endpoint_probe (entrypoint TEXT)")
+    if release_state == "stale":
+        conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    with release_gate.guarded_read(str(db)) as (_, status):
+        expected_warning = status.warning
+    before = _full_database_snapshot(db)
+    expected = {"entrypoint": entrypoint}
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append(kwargs)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO mixed_endpoint_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result == {**expected, "release_warning": expected_warning}
+    assert helper_calls == [expected_helper_arguments]
+    assert _full_database_snapshot(db) == before
+    assert sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM mixed_endpoint_probe"
+    ).fetchone()[0] == 0
+
+
 def _direct_sqlite_transaction_calls(function_names, transaction_methods):
     tree = ast.parse(Path(server.__file__).read_text())
     functions = {
@@ -1536,6 +1818,23 @@ def test_imp1_writers_do_not_manage_sqlite_transactions_directly():
 
     assert set(functions) == writers
     assert direct_calls == {name: [] for name in writers}
+
+
+def test_mixed_endpoints_do_not_manage_sqlite_transactions_directly():
+    entrypoints = {
+        "suppress_contradicted_estimates",
+        "evaluate_guardrails",
+        "get_statement_status",
+        "detect_drift",
+        "run_verification",
+        "import_checking_activity",
+    }
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        entrypoints, {"commit"}
+    )
+
+    assert set(functions) == entrypoints
+    assert direct_calls == {name: [] for name in entrypoints}
 
 
 @pytest.mark.parametrize("release_state", ["missing_table", "missing_row", "mismatched"])
