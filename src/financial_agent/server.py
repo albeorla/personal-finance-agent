@@ -68,7 +68,10 @@ from .memory import (
 )
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
 from .card_import import import_card_statement_for_db, import_checking_activity_for_db
-from .migration import apply_obligation_migration as apply_obligation_migration_for_db
+from .migration import (
+    apply_obligation_migration as apply_obligation_migration_for_db,
+    parse_obligation_migration_source,
+)
 from .sync_simplefin import sync_simplefin as sync_simplefin_for_db
 from .validate import run_live_validation as run_live_validation_for_db
 from .reconciliation import (
@@ -2217,19 +2220,22 @@ def apply_obligation_migration(
     read-only.
     """
 
-    import sqlite3
-
+    rows = parse_obligation_migration_source(source, path, options)
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = apply_obligation_migration_for_db(
+                conn, source=source, path=path, dry_run=True, options=options,
+                prepared_rows=rows,
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = apply_obligation_migration_for_db(
-            conn, source=source, path=path, dry_run=dry_run, options=options
+            conn, source=source, path=path, dry_run=False, options=options,
+            prepared_rows=rows,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()

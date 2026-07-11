@@ -1,12 +1,15 @@
 """Release gate coverage for supported database writers."""
 
 import ast
+import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 import financial_agent.backfill as backfill
+import financial_agent.migration as migration
 import financial_agent.onboarding as onboarding
 import financial_agent.scheduled as scheduled
 from financial_agent import build_info, release_gate, server
@@ -399,6 +402,11 @@ def _full_database_snapshot(db):
         return conn.execute("PRAGMA user_version").fetchone()[0], tuple(conn.iterdump())
     finally:
         conn.close()
+
+
+def _migration_yaml(path, items):
+    path.write_text(json.dumps({"working_account_id": "4321", "items": items}))
+    return str(path)
 
 
 def _prepare_writer_database(db):
@@ -1850,6 +1858,260 @@ def test_mixed_safe_read_is_read_only_and_reports_release_warning(
     assert sqlite3.connect(db).execute(
         "SELECT COUNT(*) FROM mixed_endpoint_probe"
     ).fetchone()[0] == 0
+
+
+def test_obligation_migration_dry_run_allows_stale_release_without_any_writes(
+    tmp_path,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    with release_gate.guarded_read(str(db)) as (_, status):
+        expected_warning = status.warning
+    before = _full_database_snapshot(db)
+    path = _migration_yaml(
+        tmp_path / "obligations.yaml",
+        [
+            {
+                "date": "2026-07-31",
+                "label": "Volvo wear and tear",
+                "amount": -712.0,
+                "source": "verbal",
+            }
+        ],
+    )
+
+    result = server.apply_obligation_migration(
+        path, dry_run=True, db_path=str(db)
+    )
+
+    assert result == {
+        "source": "obligations_yaml",
+        "dry_run": True,
+        "parsed": 1,
+        "obligations_to_create": 1,
+        "created_obligations": 0,
+        "created_instances": 0,
+        "skipped_already_modeled": 0,
+        "needs_review": 0,
+        "plan": [
+            {
+                "date": "2026-07-31",
+                "label": "Volvo wear and tear",
+                "amount": 712.0,
+                "direction": "outflow",
+                "decision": "new",
+                "existing_obligation_id": None,
+            }
+        ],
+        "migration_log_id": None,
+        "release_warning": expected_warning,
+    }
+    assert _full_database_snapshot(db) == before
+    assert sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM obligation_migration_log"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "schema_version", [LATEST_SCHEMA_VERSION - 1, LATEST_SCHEMA_VERSION + 1]
+)
+def test_obligation_migration_dry_run_rejects_incompatible_schema_without_changes(
+    tmp_path, schema_version
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    path = _migration_yaml(tmp_path / "obligations.yaml", [])
+
+    with pytest.raises(release_gate.IncompatibleSchemaError):
+        server.apply_obligation_migration(path, dry_run=True, db_path=str(db))
+
+    assert _full_database_snapshot(db) == before
+
+
+def test_obligation_migration_live_run_uses_guarded_write_and_commits_all_artifacts(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    path = _migration_yaml(
+        tmp_path / "obligations.yaml",
+        [
+            {
+                "date": "2026-07-31",
+                "label": "Volvo wear and tear",
+                "amount": -712.0,
+                "source": "verbal",
+            }
+        ],
+    )
+    guarded_write_calls = []
+    real_guarded_write = server.guarded_write
+
+    @contextmanager
+    def guarded_write_spy(db_path):
+        guarded_write_calls.append(db_path)
+        with real_guarded_write(db_path) as conn:
+            assert conn.in_transaction is True
+            yield conn
+
+    monkeypatch.setattr(server, "guarded_write", guarded_write_spy)
+
+    result = server.apply_obligation_migration(
+        path, dry_run=False, db_path=str(db)
+    )
+
+    assert set(result) == {
+        "source",
+        "dry_run",
+        "parsed",
+        "obligations_to_create",
+        "created_obligations",
+        "created_instances",
+        "skipped_already_modeled",
+        "needs_review",
+        "plan",
+        "migration_log_id",
+    }
+    assert (
+        result["created_obligations"],
+        result["created_instances"],
+        bool(result["migration_log_id"]),
+    ) == (1, 1, True)
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM obligations").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM obligation_instances"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM obligation_migration_log"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert guarded_write_calls == [str(db)]
+
+
+def test_obligation_migration_live_run_parses_before_rechecking_release(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    path = _migration_yaml(
+        tmp_path / "obligations.yaml",
+        [
+            {
+                "date": "2026-07-31",
+                "label": "Volvo wear and tear",
+                "amount": -712.0,
+                "source": "verbal",
+            }
+        ],
+    )
+    before = _full_database_snapshot(db)
+    events = []
+    real_parser = migration.parse_obligations_yaml
+    real_guarded_write = server.guarded_write
+
+    def parser_spy(source_path):
+        rows = real_parser(source_path)
+        events.append("parsed")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE finance_release SET version = '9999.0.0' WHERE id = 1")
+        conn.commit()
+        conn.close()
+        return rows
+
+    @contextmanager
+    def guarded_write_spy(db_path):
+        events.append("guarded_write")
+        with real_guarded_write(db_path) as conn:
+            yield conn
+
+    monkeypatch.setattr(migration, "parse_obligations_yaml", parser_spy)
+    monkeypatch.setattr(server, "guarded_write", guarded_write_spy)
+
+    with pytest.raises(release_gate.StaleReleaseError):
+        server.apply_obligation_migration(path, dry_run=False, db_path=str(db))
+
+    assert events == ["parsed", "guarded_write"]
+    after = _full_database_snapshot(db)
+    assert after != before
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT version FROM finance_release WHERE id = 1"
+        ).fetchone()[0] == "9999.0.0"
+        assert conn.execute("SELECT COUNT(*) FROM obligations").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM obligation_instances"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM obligation_migration_log"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_obligation_migration_live_run_rolls_back_first_group_when_second_fails(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    path = _migration_yaml(
+        tmp_path / "obligations.yaml",
+        [
+            {
+                "date": "2026-07-31",
+                "label": "Volvo wear and tear",
+                "amount": -712.0,
+                "source": "verbal",
+            },
+            {
+                "date": "2026-08-01",
+                "label": "School deposit",
+                "amount": -500.0,
+                "source": "invoice",
+            },
+        ],
+    )
+    before = _full_database_snapshot(db)
+    real_apply = migration.apply_obligation_instances
+    apply_calls = 0
+
+    def fail_after_first_group(conn, *, obligation, instances):
+        nonlocal apply_calls
+        apply_calls += 1
+        if apply_calls == 2:
+            raise RuntimeError("second group failed")
+        return real_apply(conn, obligation=obligation, instances=instances)
+
+    monkeypatch.setattr(
+        migration, "apply_obligation_instances", fail_after_first_group
+    )
+
+    with pytest.raises(RuntimeError, match="second group failed"):
+        server.apply_obligation_migration(path, dry_run=False, db_path=str(db))
+
+    assert apply_calls == 2
+    assert _full_database_snapshot(db) == before
+
+
+def test_obligation_migration_wrapper_does_not_manage_sqlite_transactions_directly():
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        {"apply_obligation_migration"}, {"commit", "rollback"}
+    )
+
+    assert set(functions) == {"apply_obligation_migration"}
+    assert direct_calls == {"apply_obligation_migration": []}
 
 
 def _direct_sqlite_transaction_calls(function_names, transaction_methods, module=server):
