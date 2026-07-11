@@ -102,6 +102,7 @@ from .todoist_outbox import (
     surface_to_todoist as surface_to_todoist_for_db,
     update_todoist_task as update_todoist_task_impl,
 )
+from .release_gate import guarded_read, guarded_write, require_current_release
 from .status import default_db_path
 from .status import get_finance_status as build_finance_status
 from .debts import (
@@ -194,12 +195,9 @@ def set_goal(
     goal with no deadline is treated as open-ended.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    require_current_release(resolved_db_path)
+    with guarded_write(resolved_db_path) as conn:
         result = set_goal_for_db(
             conn,
             name=name,
@@ -208,10 +206,7 @@ def set_goal(
             source_account=source_account,
             note=note,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -556,12 +551,8 @@ def set_manual_balance(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_manual_balance_for_db(
             conn,
             account_query=account_query,
@@ -569,11 +560,9 @@ def set_manual_balance(
             as_of_date=as_of_date,
             note=note,
         )
-        if result.get("status") == "ok":
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+        if result.get("status") != "ok":
+            conn.rollback()
+    return result
 
 
 @mcp.tool()
@@ -603,13 +592,23 @@ def import_card_statement(
     """
 
     import datetime as _dt
-    import sqlite3
 
     resolved_db_path = db_path or str(default_db_path())
     resolved_as_of = as_of_date or _dt.date.today().isoformat()
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = import_card_statement_for_db(
+                conn,
+                text=text,
+                account_query=account_query,
+                as_of_date=resolved_as_of,
+                statement_close_date=statement_close_date,
+                statement_total=statement_total,
+                dry_run=True,
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = import_card_statement_for_db(
             conn,
             text=text,
@@ -617,13 +616,11 @@ def import_card_statement(
             as_of_date=resolved_as_of,
             statement_close_date=statement_close_date,
             statement_total=statement_total,
-            dry_run=dry_run,
+            dry_run=False,
         )
-        if not dry_run and result.get("status") == "ok":
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+        if result.get("status") != "ok":
+            conn.rollback()
+    return result
 
 
 @mcp.tool()

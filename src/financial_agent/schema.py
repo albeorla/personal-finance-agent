@@ -11,6 +11,32 @@ from pathlib import Path
 LATEST_SCHEMA_VERSION = 4
 
 
+def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a static SQL script without committing the caller's transaction."""
+
+    statement = ""
+    for line in script.splitlines():
+        statement += f"{line}\n"
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+
+    trailing = statement.lstrip()
+    while trailing:
+        if trailing.startswith("--"):
+            _, separator, trailing = trailing.partition("\n")
+            if not separator:
+                return
+        elif trailing.startswith("/*"):
+            end = trailing.find("*/", 2)
+            if end == -1:
+                return
+            trailing = trailing[end + 2 :]
+        else:
+            raise sqlite3.OperationalError("incomplete trailing SQL statement")
+        trailing = trailing.lstrip()
+
+
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
     """Baseline migration: the full create-if-missing + ALTER schema body.
 
@@ -19,7 +45,8 @@ def _migrate_to_v1(conn: sqlite3.Connection) -> None:
     user_version 0 converge cleanly without data loss.
     """
 
-    conn.executescript(
+    _execute_script(
+        conn,
         """
         -- obligations.status values: 'active' (projects), 'inactive', and
         -- 'dormant_suppressed' (auto-deactivated by
@@ -540,7 +567,8 @@ def _migrate_to_v2(conn: sqlite3.Connection) -> None:
     verifier instead of passing silently. Idempotent (CREATE ... IF NOT EXISTS).
     """
 
-    conn.executescript(
+    _execute_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS verification_findings (
             id TEXT PRIMARY KEY,

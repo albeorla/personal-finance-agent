@@ -6,6 +6,7 @@ import sqlite3
 import sys
 
 import financial_agent.scheduled as scheduled
+from financial_agent.release_gate import promote_release
 from financial_agent.scheduled import LOCK_FILENAME, run_scheduled_daily_sync
 from financial_agent.schema import ensure_app_schema
 
@@ -21,6 +22,7 @@ def _db(path):
     ensure_app_schema(conn)
     conn.commit()
     conn.close()
+    promote_release(str(path))
     return str(path)
 
 
