@@ -36,6 +36,16 @@ def test_mcp_registration_valid_and_matches_entry_point():
     assert 'financial-agent-mcp = "financial_agent.server:main"' in pyproject
 
 
+def test_correction_readback_rule_present():
+    # IMP-20260710-1: a corrected/claimed account fact must be re-read live from a
+    # finance tool before deleting a reminder, completing a task, or writing memory.
+    skill = " ".join((CI / "finance-skill" / "SKILL.md").read_text().lower().split())
+    instr = " ".join((CI / "finance-instructions.md").read_text().lower().split())
+    for text in (skill, instr):
+        assert "re-read that account's live state" in text
+        assert "before acting on the correction" in text
+
+
 def test_install_readme_present():
     txt = (CI / "INSTALL.md").read_text()
     assert "parallel-run" in txt.lower()

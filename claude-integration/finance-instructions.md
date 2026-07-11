@@ -28,6 +28,12 @@ memory, from a file you read earlier, or by estimation.
   integration. Do not execute the action outbox otherwise.
 - If you do not have a tool result for a figure, say so and call the tool. Show
   provenance and any `needs_review` / estimate flags the tools return.
+- When the user corrects an account fact, re-read that account's live state with a
+  finance MCP tool (`get_finance_status` or `get_daily_digest`) in the same turn
+  before acting on the correction. Do not delete or reschedule a reminder, complete
+  a follow-up task, or write a memory from a claimed or inferred account fact you
+  have not re-read from a tool this turn. Never assume two accounts or feeds are the
+  same one; confirm the specific account first.
 - If an attached image, infographic, or statement renders as an empty/placeholder
   icon with no visible content, do NOT build income-split or payoff math on it.
   Treat any number read off an infographic or statement image as approximate until

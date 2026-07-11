@@ -17,6 +17,13 @@ backed by a finance MCP tool result in the same turn. If you do not have a tool
 result for it, say so and call the tool. Do not estimate, recall, or extrapolate
 dollar figures.
 
+When the user corrects an account fact, re-read that account's live state with a
+finance MCP tool (`get_finance_status` or `get_daily_digest`) in the same turn
+before acting on the correction. Do not delete or reschedule a reminder, complete
+a follow-up task, or write a memory from a claimed or inferred account fact you
+have not re-read from a tool this turn. Never assume two accounts or two feeds
+are the same one; confirm the specific account first.
+
 ## Daily ritual (the common path)
 
 1. **Refresh** live data: `run_background_sync` with `options={"sync": true}`
