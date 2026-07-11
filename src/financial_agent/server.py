@@ -983,22 +983,15 @@ def generate_income_instances(
     calendar source for one-off local closures.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = generate_income_instances_for_db(
             conn,
             start_date=start_date,
             through_date=through_date,
             extra_closure_dates=extra_closure_dates,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2082,19 +2075,12 @@ def acknowledge_verification_findings(
     in bulk.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = acknowledge_verification_findings_for_db(
             conn, finding_ids=finding_ids, check_id=check_id
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2159,17 +2145,10 @@ def write_finance_memory(
     if not text:
         raise ValueError("write_finance_memory requires 'text' (or its alias 'content')")
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = write_memory_for_db(conn, text=text, metadata=metadata, kind=kind, source=source)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2224,17 +2203,10 @@ def list_finance_memories(
 def delete_finance_memory(memory_id: str, db_path: str | None = None) -> dict:
     """Delete a finance memory by id (e.g. when a correction is no longer true)."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = delete_memory_for_db(conn, memory_id=memory_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2319,17 +2291,10 @@ def list_guardrail_findings(
 def apply_guardrail_rules(db_path: str | None = None) -> dict:
     """Idempotently seed the default guardrail rules into the database."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_guardrail_rules_for_db(conn)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()

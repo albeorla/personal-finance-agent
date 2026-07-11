@@ -172,6 +172,47 @@ RECONCILIATION_CONFIRMATION_SCHEMA_REPRESENTATIVES = [
     (*RECONCILIATION_CONFIRMATION_WRITERS[1], LATEST_SCHEMA_VERSION + 1),
 ]
 
+IMP1_WRITERS = [
+    (
+        "generate_income_instances",
+        "generate_income_instances_for_db",
+        {
+            "start_date": "2026-07-01",
+            "through_date": "2026-07-31",
+            "extra_closure_dates": ["2026-07-03"],
+        },
+    ),
+    (
+        "acknowledge_verification_findings",
+        "acknowledge_verification_findings_for_db",
+        {"finding_ids": ["finding-test"], "check_id": "projection_identity"},
+    ),
+    (
+        "write_finance_memory",
+        "write_memory_for_db",
+        {
+            "text": "Test memory",
+            "metadata": {"source": "release-gate"},
+            "kind": "fact",
+            "source": "test",
+        },
+    ),
+    (
+        "delete_finance_memory",
+        "delete_memory_for_db",
+        {"memory_id": "memory-test"},
+    ),
+    (
+        "apply_guardrail_rules",
+        "apply_guardrail_rules_for_db",
+        {},
+    ),
+]
+
+IMP1_SCHEMA_REPRESENTATIVES = [
+    IMP1_WRITERS[index] for index in (0, 1, 2, 4)
+]
+
 
 def _prepare_database(db, release_state):
     conn = sqlite3.connect(db)
@@ -1281,6 +1322,138 @@ def test_calendar_fact_batch_rolls_back_when_later_fact_is_malformed(tmp_path):
     ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    IMP1_WRITERS,
+    ids=[writer[0] for writer in IMP1_WRITERS],
+)
+def test_imp1_writer_rejects_stale_release_before_helper_and_preserves_database(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE imp1_writer_probe (entrypoint TEXT)")
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO imp1_writer_probe VALUES (?)", (entrypoint,))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.StaleReleaseError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.StaleReleaseError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    IMP1_SCHEMA_REPRESENTATIVES,
+    ids=[writer[0] for writer in IMP1_SCHEMA_REPRESENTATIVES],
+)
+@pytest.mark.parametrize(
+    "schema_version", [LATEST_SCHEMA_VERSION - 1, LATEST_SCHEMA_VERSION + 1]
+)
+def test_imp1_writer_rejects_incompatible_schema_before_helper(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    schema_version,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        helper_calls.append(kwargs)
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.IncompatibleSchemaError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.IncompatibleSchemaError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    IMP1_WRITERS,
+    ids=[writer[0] for writer in IMP1_WRITERS],
+)
+def test_imp1_writer_forwards_arguments_and_commits_exact_helper_result(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE imp1_writer_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+    helper_calls = []
+
+    def helper_spy(conn, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append(kwargs)
+        conn.execute("INSERT INTO imp1_writer_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    assert helper_calls == [arguments]
+    assert sqlite3.connect(db).execute(
+        "SELECT entrypoint FROM imp1_writer_probe"
+    ).fetchall() == [(entrypoint,)]
+
+
+def test_imp1_write_finance_memory_validates_before_release_gate(tmp_path, monkeypatch):
+    db = tmp_path / "missing.sqlite"
+    gate_calls = []
+
+    def stale_gate(*args, **kwargs):
+        gate_calls.append((args, kwargs))
+        raise release_gate.StaleReleaseError("release gate consulted")
+
+    monkeypatch.setattr(server, "require_current_release", stale_gate)
+    monkeypatch.setattr(server, "guarded_write", stale_gate)
+
+    with pytest.raises(ValueError, match="requires 'text'"):
+        server.write_finance_memory(db_path=str(db))
+
+    assert gate_calls == []
+    assert not db.exists()
+
+
 def _direct_sqlite_transaction_calls(function_names, transaction_methods):
     tree = ast.parse(Path(server.__file__).read_text())
     functions = {
@@ -1347,6 +1520,16 @@ def test_onboarding_statement_reconciliation_writers_do_not_manage_sqlite_transa
 
 def test_reconciliation_confirmation_writers_do_not_manage_sqlite_transactions_directly():
     writers = {writer[0] for writer in RECONCILIATION_CONFIRMATION_WRITERS}
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        writers, {"commit", "rollback"}
+    )
+
+    assert set(functions) == writers
+    assert direct_calls == {name: [] for name in writers}
+
+
+def test_imp1_writers_do_not_manage_sqlite_transactions_directly():
+    writers = {writer[0] for writer in IMP1_WRITERS}
     functions, direct_calls = _direct_sqlite_transaction_calls(
         writers, {"commit", "rollback"}
     )
