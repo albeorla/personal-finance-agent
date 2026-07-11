@@ -11,6 +11,7 @@ round-trip in ``test_digest_retire_then_resurface``.
 
 import sqlite3
 
+from financial_agent.release_gate import promote_release
 from financial_agent.schema import ensure_app_schema
 from financial_agent.server import (
     record_charge_onboarding_decision,
@@ -32,6 +33,12 @@ def _db(path):
     conn.row_factory = sqlite3.Row
     ensure_app_schema(conn)
     return conn
+
+
+def _promote_server_db(path, conn):
+    conn.commit()
+    conn.close()
+    promote_release(str(path))
 
 
 def _seed_emission(conn, surface_key, task_id, *, status="open", content_hash="h", retire_at=None):
@@ -139,7 +146,7 @@ def test_reject_decision_marks_retire(tmp_path):
     _seed_candidate(conn, "cand:acme", "Acme", existing_obligation_id="OB1")
     _seed_emission(conn, "obligation-due:OB1:2026-06-01", "A1")
     _seed_emission(conn, "obligation-due:OB1:2026-07-01", "A2")
-    conn.close()
+    _promote_server_db(db, conn)
 
     record_charge_onboarding_decision("cand:acme", {"action": "reject"}, db_path=str(db))
 
@@ -232,7 +239,7 @@ def test_reset_clears_retire(tmp_path):
     conn = _db(db)
     _seed_candidate(conn, "cand:acme", "Acme", status="deferred", existing_obligation_id="OB1")
     _seed_emission(conn, "obligation-due:OB1:2026-06-01", "A1", retire_at=_NOW)
-    conn.close()
+    _promote_server_db(db, conn)
 
     record_charge_onboarding_decision("cand:acme", {"action": "reset"}, db_path=str(db))
 
@@ -248,6 +255,7 @@ def test_batch_decisions_apply_independently(tmp_path):
     conn = _db(db)
     _seed_candidate(conn, "c1", "Acme")
     _seed_candidate(conn, "c2", "Beta")
+    _promote_server_db(db, conn)
 
     res = record_charge_onboarding_decisions(
         [

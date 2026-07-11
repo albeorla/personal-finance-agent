@@ -1015,17 +1015,10 @@ def scan_charge_onboarding_candidates(
     min_evidence, include_inflows, and link_existing_obligations.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = scan_charge_onboarding_candidates_for_db(conn, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1118,17 +1111,10 @@ def record_charge_onboarding_decision(
     rejected here. Restructuring (merge/split/edit) is also rejected.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = _record_onboarding_decision(conn, candidate_id, decision)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1146,14 +1132,10 @@ def record_charge_onboarding_decisions(
     {total, applied, failed, results:[{candidate_id, ok, status|error}]}.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
     results: list[dict] = []
     applied = failed = 0
-    try:
+    with guarded_write(resolved_db_path) as conn:
         for item in decisions or []:
             cid = (item or {}).get("candidate_id")
             dec = (item or {}).get("decision")
@@ -1168,10 +1150,7 @@ def record_charge_onboarding_decisions(
             except Exception as exc:  # noqa: BLE001 - record per item, never abort the batch
                 failed += 1
                 results.append({"candidate_id": cid, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
-        conn.commit()
-        return {"total": len(decisions or []), "applied": applied, "failed": failed, "results": results}
-    finally:
-        conn.close()
+    return {"total": len(decisions or []), "applied": applied, "failed": failed, "results": results}
 
 
 @mcp.tool()
@@ -1236,12 +1215,8 @@ def apply_charge_onboarding_candidate(
     rejecting and re-modeling.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_charge_onboarding_candidate_for_db(
             conn,
             candidate_id,
@@ -1253,10 +1228,7 @@ def apply_charge_onboarding_candidate(
             amount_override=amount_override,
             cadence_override=cadence_override,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1272,17 +1244,10 @@ def aggregate_statement_inputs(
     last known statement close as unrolled.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = aggregate_statement_inputs_for_db(conn, target_obligation_id=target_obligation_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1346,19 +1311,12 @@ def recompute_statement_estimates(
     to inputs-only). Idempotent.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = recompute_statement_estimates_for_db(
             conn, target_obligation_id=target_obligation_id, baseline=baseline
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1380,12 +1338,8 @@ def set_statement_actual(
     estimator. Errors list the known cycles when nothing matches.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_statement_actual_for_db(
             conn,
             obligation_id=obligation_id,
@@ -1395,10 +1349,7 @@ def set_statement_actual(
             source=source,
             note=note,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1418,17 +1369,10 @@ def reconcile_obligation_instances(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_obligation_instances_for_db(conn, as_of_date=as_of_date, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()

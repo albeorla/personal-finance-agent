@@ -97,6 +97,61 @@ OBLIGATION_WRITER_SCHEMA_REPRESENTATIVES = [
     (*OBLIGATION_WRITERS[3], LATEST_SCHEMA_VERSION + 1),
 ]
 
+ONBOARDING_STATEMENT_RECONCILIATION_WRITERS = [
+    (
+        "scan_charge_onboarding_candidates",
+        "scan_charge_onboarding_candidates_for_db",
+        {"options": {}},
+    ),
+    (
+        "record_charge_onboarding_decision",
+        "_record_onboarding_decision",
+        {"candidate_id": "candidate-test", "decision": "defer"},
+    ),
+    (
+        "record_charge_onboarding_decisions",
+        "_record_onboarding_decision",
+        {
+            "decisions": [
+                {"candidate_id": "candidate-test", "decision": "defer"}
+            ]
+        },
+    ),
+    (
+        "apply_charge_onboarding_candidate",
+        "apply_charge_onboarding_candidate_for_db",
+        {"candidate_id": "candidate-test"},
+    ),
+    (
+        "aggregate_statement_inputs",
+        "aggregate_statement_inputs_for_db",
+        {"target_obligation_id": "statement-test"},
+    ),
+    (
+        "recompute_statement_estimates",
+        "recompute_statement_estimates_for_db",
+        {"target_obligation_id": "statement-test"},
+    ),
+    (
+        "set_statement_actual",
+        "set_statement_actual_for_db",
+        {
+            "obligation_id": "statement-test",
+            "amount": 1,
+            "due_date": "2026-07-12",
+        },
+    ),
+    (
+        "reconcile_obligation_instances",
+        "reconcile_obligation_instances_for_db",
+        {"as_of_date": "2026-07-11"},
+    ),
+]
+
+ONBOARDING_STATEMENT_RECONCILIATION_SCHEMA_REPRESENTATIVES = [
+    ONBOARDING_STATEMENT_RECONCILIATION_WRITERS[index] for index in (0, 4, 7)
+]
+
 
 def _prepare_database(db, release_state):
     conn = sqlite3.connect(db)
@@ -919,6 +974,129 @@ def test_obligation_writer_commits_helper_result_with_row_factory(
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    ONBOARDING_STATEMENT_RECONCILIATION_WRITERS,
+    ids=[writer[0] for writer in ONBOARDING_STATEMENT_RECONCILIATION_WRITERS],
+)
+def test_onboarding_statement_reconciliation_writer_rejects_stale_release_before_helper(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.StaleReleaseError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.StaleReleaseError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    ONBOARDING_STATEMENT_RECONCILIATION_SCHEMA_REPRESENTATIVES,
+    ids=[
+        writer[0]
+        for writer in ONBOARDING_STATEMENT_RECONCILIATION_SCHEMA_REPRESENTATIVES
+    ],
+)
+@pytest.mark.parametrize(
+    "schema_version", [LATEST_SCHEMA_VERSION - 1, LATEST_SCHEMA_VERSION + 1]
+)
+def test_onboarding_statement_reconciliation_writer_rejects_incompatible_schema_before_helper(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    schema_version,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.IncompatibleSchemaError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.IncompatibleSchemaError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    ONBOARDING_STATEMENT_RECONCILIATION_WRITERS,
+    ids=[writer[0] for writer in ONBOARDING_STATEMENT_RECONCILIATION_WRITERS],
+)
+def test_onboarding_statement_reconciliation_writer_commits_exact_helper_result_with_row_factory(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE finance_writer_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+    if entrypoint == "record_charge_onboarding_decisions":
+        expected["status"] = expected
+
+    def helper_spy(conn, *args, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        conn.execute("INSERT INTO finance_writer_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+    helper_result = (
+        result["results"][0]["status"]
+        if entrypoint == "record_charge_onboarding_decisions"
+        else result
+    )
+
+    assert helper_result is expected
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT entrypoint FROM finance_writer_probe"
+        ).fetchall() == [(entrypoint,)]
+    finally:
+        conn.close()
+
+
 def test_calendar_fact_batch_rolls_back_when_later_fact_is_malformed(tmp_path):
     db = tmp_path / "finance.sqlite"
     _prepare_database(db, "current")
@@ -991,6 +1169,18 @@ def test_obligation_writers_do_not_manage_sqlite_transactions_directly():
 
     assert set(functions) == obligation_writers
     assert direct_calls == {name: [] for name in obligation_writers}
+
+
+def test_onboarding_statement_reconciliation_writers_do_not_manage_sqlite_transactions_directly():
+    writers = {
+        writer[0] for writer in ONBOARDING_STATEMENT_RECONCILIATION_WRITERS
+    }
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        writers, {"commit", "rollback"}
+    )
+
+    assert set(functions) == writers
+    assert direct_calls == {name: [] for name in writers}
 
 
 @pytest.mark.parametrize("release_state", ["missing_table", "missing_row", "mismatched"])
