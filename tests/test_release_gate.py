@@ -152,6 +152,26 @@ ONBOARDING_STATEMENT_RECONCILIATION_SCHEMA_REPRESENTATIVES = [
     ONBOARDING_STATEMENT_RECONCILIATION_WRITERS[index] for index in (0, 4, 7)
 ]
 
+RECONCILIATION_CONFIRMATION_WRITERS = [
+    (
+        "confirm_reconciliation_match",
+        "confirm_reconciliation_match_for_db",
+        {"instance_id": "instance-test", "transaction_id": "transaction-test"},
+        ("instance-test", "transaction-test"),
+    ),
+    (
+        "unconfirm_reconciliation_match",
+        "unconfirm_reconciliation_match_for_db",
+        {"instance_id": "instance-test"},
+        ("instance-test",),
+    ),
+]
+
+RECONCILIATION_CONFIRMATION_SCHEMA_REPRESENTATIVES = [
+    (*RECONCILIATION_CONFIRMATION_WRITERS[0], LATEST_SCHEMA_VERSION - 1),
+    (*RECONCILIATION_CONFIRMATION_WRITERS[1], LATEST_SCHEMA_VERSION + 1),
+]
+
 
 def _prepare_database(db, release_state):
     conn = sqlite3.connect(db)
@@ -1097,6 +1117,148 @@ def test_onboarding_statement_reconciliation_writer_commits_exact_helper_result_
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_helper_arguments"),
+    RECONCILIATION_CONFIRMATION_WRITERS,
+    ids=[writer[0] for writer in RECONCILIATION_CONFIRMATION_WRITERS],
+)
+def test_reconciliation_confirmation_writer_rejects_stale_release_before_helper(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_helper_arguments,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE reconciliation_confirmation_probe (entrypoint TEXT)")
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, *args):
+        helper_calls.append(args)
+        conn.execute(
+            "INSERT INTO reconciliation_confirmation_probe VALUES (?)",
+            (entrypoint,),
+        )
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.StaleReleaseError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.StaleReleaseError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "entrypoint",
+        "helper_name",
+        "arguments",
+        "expected_helper_arguments",
+        "schema_version",
+    ),
+    RECONCILIATION_CONFIRMATION_SCHEMA_REPRESENTATIVES,
+    ids=[
+        writer[0]
+        for writer in RECONCILIATION_CONFIRMATION_SCHEMA_REPRESENTATIVES
+    ],
+)
+def test_reconciliation_confirmation_writer_rejects_incompatible_schema_before_helper(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_helper_arguments,
+    schema_version,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE reconciliation_confirmation_probe (entrypoint TEXT)")
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(conn, *args):
+        helper_calls.append(args)
+        conn.execute(
+            "INSERT INTO reconciliation_confirmation_probe VALUES (?)",
+            (entrypoint,),
+        )
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+    error = None
+    try:
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+    except release_gate.IncompatibleSchemaError as exc:
+        error = exc
+
+    assert (type(error), helper_calls, _full_database_snapshot(db)) == (
+        release_gate.IncompatibleSchemaError,
+        [],
+        before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "expected_helper_arguments"),
+    RECONCILIATION_CONFIRMATION_WRITERS,
+    ids=[writer[0] for writer in RECONCILIATION_CONFIRMATION_WRITERS],
+)
+def test_reconciliation_confirmation_writer_commits_exact_helper_result_with_row_factory(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+    helper_name,
+    arguments,
+    expected_helper_arguments,
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE reconciliation_confirmation_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+    helper_calls = []
+
+    def helper_spy(conn, *args):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append(args)
+        conn.execute(
+            "INSERT INTO reconciliation_confirmation_probe VALUES (?)",
+            (entrypoint,),
+        )
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    assert helper_calls == [expected_helper_arguments]
+    assert sqlite3.connect(db).execute(
+        "SELECT entrypoint FROM reconciliation_confirmation_probe"
+    ).fetchall() == [(entrypoint,)]
+
+
 def test_calendar_fact_batch_rolls_back_when_later_fact_is_malformed(tmp_path):
     db = tmp_path / "finance.sqlite"
     _prepare_database(db, "current")
@@ -1175,6 +1337,16 @@ def test_onboarding_statement_reconciliation_writers_do_not_manage_sqlite_transa
     writers = {
         writer[0] for writer in ONBOARDING_STATEMENT_RECONCILIATION_WRITERS
     }
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        writers, {"commit", "rollback"}
+    )
+
+    assert set(functions) == writers
+    assert direct_calls == {name: [] for name in writers}
+
+
+def test_reconciliation_confirmation_writers_do_not_manage_sqlite_transactions_directly():
+    writers = {writer[0] for writer in RECONCILIATION_CONFIRMATION_WRITERS}
     functions, direct_calls = _direct_sqlite_transaction_calls(
         writers, {"commit", "rollback"}
     )

@@ -2447,17 +2447,10 @@ def confirm_reconciliation_match(
     transaction to the instance; it is recorded as a normal confirmed match.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = confirm_reconciliation_match_for_db(conn, instance_id, transaction_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2466,17 +2459,10 @@ def unconfirm_reconciliation_match(instance_id: str, db_path: str | None = None)
     clear the matched-transaction evidence.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = unconfirm_reconciliation_match_for_db(conn, instance_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
