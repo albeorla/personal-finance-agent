@@ -58,6 +58,45 @@ LOCAL_WRITER_MODULE_REPRESENTATIVES = [
     LOCAL_WRITERS[index] for index in (0, 1, 2, 5, 6)
 ]
 
+OBLIGATION_WRITERS = [
+    (
+        "apply_obligation_instances",
+        "apply_obligation_instances_for_db",
+        {
+            "obligation": {
+                "id": "obligation-test",
+                "name": "Test obligation",
+                "kind": "bill",
+                "source": "test",
+                "autopay": False,
+            },
+            "instances": [],
+        },
+    ),
+    (
+        "delete_obligation_instance",
+        "delete_obligation_instance_for_db",
+        {"instance_id": "instance-test"},
+    ),
+    (
+        "set_obligation_end",
+        "set_obligation_end_for_db",
+        {"obligation_id": "obligation-test", "active_until": "2026-12-31"},
+    ),
+    (
+        "deactivate_obligation",
+        "deactivate_obligation_for_db",
+        {"obligation_id": "obligation-test"},
+    ),
+]
+
+OBLIGATION_WRITER_SCHEMA_REPRESENTATIVES = [
+    (*OBLIGATION_WRITERS[0], LATEST_SCHEMA_VERSION - 1),
+    (*OBLIGATION_WRITERS[1], LATEST_SCHEMA_VERSION - 1),
+    (*OBLIGATION_WRITERS[2], LATEST_SCHEMA_VERSION + 1),
+    (*OBLIGATION_WRITERS[3], LATEST_SCHEMA_VERSION + 1),
+]
+
 
 def _prepare_database(db, release_state):
     conn = sqlite3.connect(db)
@@ -785,6 +824,101 @@ def test_local_writer_rejects_incompatible_schema_before_helper_invocation(
     )
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    OBLIGATION_WRITERS,
+    ids=[writer[0] for writer in OBLIGATION_WRITERS],
+)
+def test_obligation_writer_rejects_stale_release_before_helper_invocation(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.StaleReleaseError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments", "schema_version"),
+    OBLIGATION_WRITER_SCHEMA_REPRESENTATIVES,
+    ids=[writer[0] for writer in OBLIGATION_WRITER_SCHEMA_REPRESENTATIVES],
+)
+def test_obligation_writer_rejects_incompatible_schema_before_helper_invocation(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments, schema_version
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {schema_version}")
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+    helper_calls = []
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    with pytest.raises(release_gate.IncompatibleSchemaError):
+        getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert helper_calls == []
+    assert _full_database_snapshot(db) == before
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "helper_name", "arguments"),
+    OBLIGATION_WRITERS,
+    ids=[writer[0] for writer in OBLIGATION_WRITERS],
+)
+def test_obligation_writer_commits_helper_result_with_row_factory(
+    tmp_path, monkeypatch, entrypoint, helper_name, arguments
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE obligation_writer_probe (entrypoint TEXT)")
+    conn.commit()
+    conn.close()
+    expected = {"entrypoint": entrypoint}
+
+    def helper_spy(conn, *args, **kwargs):
+        assert conn.row_factory is sqlite3.Row
+        conn.execute("INSERT INTO obligation_writer_probe VALUES (?)", (entrypoint,))
+        return expected
+
+    monkeypatch.setattr(server, helper_name, helper_spy)
+
+    result = getattr(server, entrypoint)(**arguments, db_path=str(db))
+
+    assert result is expected
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT entrypoint FROM obligation_writer_probe"
+        ).fetchall() == [(entrypoint,)]
+    finally:
+        conn.close()
+
+
 def test_calendar_fact_batch_rolls_back_when_later_fact_is_malformed(tmp_path):
     db = tmp_path / "finance.sqlite"
     _prepare_database(db, "current")
@@ -807,18 +941,13 @@ def test_calendar_fact_batch_rolls_back_when_later_fact_is_malformed(tmp_path):
     ).fetchone()[0] == 0
 
 
-def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
-    migrated_writers = {
-        "set_manual_balance",
-        "import_card_statement",
-        *(writer[0] for writer in LOCAL_WRITERS),
-    }
+def _direct_sqlite_transaction_calls(function_names, transaction_methods):
     tree = ast.parse(Path(server.__file__).read_text())
     functions = {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in migrated_writers
+        and node.name in function_names
     }
     direct_calls = {}
     for name, function in functions.items():
@@ -828,7 +957,7 @@ def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
             and (
-                call.func.attr == "commit"
+                call.func.attr in transaction_methods
                 or (
                     call.func.attr == "connect"
                     and isinstance(call.func.value, ast.Name)
@@ -837,8 +966,31 @@ def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
             )
         ]
 
+    return functions, direct_calls
+
+
+def test_migrated_writer_functions_do_not_manage_sqlite_transactions_directly():
+    migrated_writers = {
+        "set_manual_balance",
+        "import_card_statement",
+        *(writer[0] for writer in LOCAL_WRITERS),
+    }
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        migrated_writers, {"commit"}
+    )
+
     assert set(functions) == migrated_writers
     assert direct_calls == {name: [] for name in migrated_writers}
+
+
+def test_obligation_writers_do_not_manage_sqlite_transactions_directly():
+    obligation_writers = {writer[0] for writer in OBLIGATION_WRITERS}
+    functions, direct_calls = _direct_sqlite_transaction_calls(
+        obligation_writers, {"commit", "rollback"}
+    )
+
+    assert set(functions) == obligation_writers
+    assert direct_calls == {name: [] for name in obligation_writers}
 
 
 @pytest.mark.parametrize("release_state", ["missing_table", "missing_row", "mismatched"])

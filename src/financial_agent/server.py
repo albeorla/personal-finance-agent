@@ -732,8 +732,6 @@ def apply_obligation_instances(
     new inserts from re-applied upserts (never a silent no-op).
     """
 
-    import sqlite3
-
     # Require an explicit autopay decision when a bill is created conversationally.
     # The backing function defaults autopay=True (quiet) for the auto-detectors, but
     # a hand-added bill with no decision would then silently never surface as a
@@ -746,18 +744,13 @@ def apply_obligation_instances(
         )
 
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_obligation_instances_for_db(
             conn,
             obligation=obligation,
             instances=instances,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -772,17 +765,10 @@ def delete_obligation_instance(
     its history. Re-apply the instance with an explicit id to revive it.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = delete_obligation_instance_for_db(conn, instance_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -800,17 +786,10 @@ def set_obligation_end(
     instances are deleted, they are just excluded past the end date.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_obligation_end_for_db(conn, obligation_id, active_until)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -824,17 +803,10 @@ def deactivate_obligation(
     upcoming bills this pulls from the runway before relying on it.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = deactivate_obligation_for_db(conn, obligation_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
