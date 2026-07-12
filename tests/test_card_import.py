@@ -9,6 +9,8 @@ statement total. The latest run drives the digest ``apple_card_stale`` signal.
 """
 
 import datetime as dt
+import hashlib
+import json
 import sqlite3
 
 from financial_agent import card_import as ci
@@ -24,9 +26,17 @@ from financial_agent.card_import import (
     synthetic_txn_id,
 )
 from financial_agent.config import ensure_source_tables
+from financial_agent.cashflow import build_cash_flow_projections
 from financial_agent.digest import _apple_card_stale
 from financial_agent.obligations import apply_obligation_instances
+from financial_agent.reconciliation import (
+    confirm_reconciliation_match,
+    list_matched_obligation_instances,
+    reconcile_obligation_instances,
+)
 from financial_agent.schema import ensure_app_schema
+from financial_agent.status import _latest_balances
+from financial_agent.verification import run_verification
 
 # An Apple Card CSV export: purchases are positive; Payment / Daily Cash rows are
 # inflows that must not count as cycle spend. Two Whole Foods rows on the same day
@@ -275,6 +285,220 @@ CHECKING_CSV = """Date,Description,Amount
 06/06/2026,CORNER STORE,-42.10
 06/07/2026,CORNER STORE,-42.10
 """
+
+
+def test_confirmed_chase_import_flows_through_reconciliation_and_projection(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed_accounts(conn)
+    due_date = "2099-07-11"
+    instance_id = f"synthetic_orchard_rent:{due_date}"
+    chase_csv = (
+        "Details,Posting Date,Description,Amount,Type,Balance,Check or Slip #\n"
+        "DEBIT,07/11/2099,SYNTHETIC ORCHARD RENT,-25.00,ACH_DEBIT,4975.00,\n"
+    )
+    conn.execute(
+        "INSERT INTO balance_snapshots "
+        "(account_id, balance, available, recorded_at, source, balance_date) "
+        "VALUES ('ACT-chk', 5000.0, 5000.0, '2099-07-11T00:00:00+00:00', "
+        "'simplefin', ?)",
+        (due_date,),
+    )
+    apply_obligation_instances(
+        conn,
+        obligation={
+            "id": "synthetic_orchard_rent",
+            "name": "Synthetic Orchard Rent",
+            "kind": "housing",
+            "status": "active",
+            "source": "seed",
+        },
+        instances=[
+            {
+                "id": instance_id,
+                "due_date": due_date,
+                "amount": -25.0,
+                "source": "seed",
+                "cash_flow_treatment": "direct_checking",
+            }
+        ],
+    )
+
+    preview = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date=due_date,
+    )
+    applied = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date=due_date,
+        dry_run=False,
+        confirmed_source_hash=preview["source_hash"],
+    )
+    assert applied["status"] == "ok" and applied["new"] == 1
+    imported = conn.execute(
+        "SELECT id, source, payee, amount FROM transactions "
+        "WHERE account_id = 'ACT-chk' AND source = 'checking_paste'"
+    ).fetchone()
+    assert imported is not None
+    assert imported["payee"] == "SYNTHETIC ORCHARD RENT"
+    assert imported["amount"] == -25.0
+
+    reconciliation = reconcile_obligation_instances(conn, as_of_date=due_date)
+    assert reconciliation["matched_auto"] == 1
+    matches = list_matched_obligation_instances(conn)
+    assert len(matches) == 1
+    assert matches[0]["obligation_instance_id"] == instance_id
+    assert matches[0]["transaction_id"] == imported["id"]
+
+    confirmed = confirm_reconciliation_match(conn, instance_id)
+    assert confirmed["matched_transaction_id"] == imported["id"]
+    projections, _ = build_cash_flow_projections(
+        conn,
+        accounts=_latest_balances(conn, as_of=dt.date.fromisoformat(due_date)),
+        windows=[30],
+        start_date=dt.date.fromisoformat(due_date),
+        working_account_id="ACT-chk",
+    )
+    assert instance_id not in {event["instance_id"] for event in projections[0]["events"]}
+
+    verification = run_verification(conn, as_of_date=due_date, persist=False)
+    assert not [
+        finding
+        for finding in verification["findings"]
+        if finding["check_id"] == "projection_identity"
+    ]
+
+
+def test_native_chase_activity_requires_matching_preview_and_is_idempotent(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _seed_accounts(conn)
+    descriptions = (
+        "FAKE ALPHA CREDIT",
+        "FAKE BETA DEBIT",
+        "FAKE INVALID DATE",
+    )
+    chase_csv = (
+        "Details,Posting Date,Description,Amount,Type,Balance,Check or Slip #\n"
+        f"CREDIT,07/10/2099,{descriptions[0]},125.00,ACH_CREDIT,900.00,\n"
+        f"DEBIT,07/11/2099,{descriptions[1]},-25.00,DEBIT_CARD,875.00,\n"
+        f"DEBIT,not-a-date,{descriptions[2]},-5.00,DEBIT_CARD,870.00,\n"
+    )
+    source_hash = hashlib.sha256(chase_csv.encode("utf-8")).hexdigest()
+
+    preview = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2099-07-12",
+    )
+    assert preview.get("format") == "chase_activity"
+    assert preview["status"] == "preview" and preview["dry_run"] is True
+    assert {
+        key: preview[key]
+        for key in (
+            "total_rows",
+            "parsed_rows",
+            "new",
+            "duplicate",
+            "skipped_rows",
+            "row_error_count",
+        )
+    } == {
+        "total_rows": 3,
+        "parsed_rows": 2,
+        "new": 2,
+        "duplicate": 0,
+        "skipped_rows": 1,
+        "row_error_count": 1,
+    }
+    assert preview["row_errors"] == [{"row_number": 4, "error_code": "invalid_date"}]
+    assert preview["source_hash"] == source_hash
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM checking_import_runs").fetchone()[0] == 0
+
+    serialized_preview = json.dumps(preview, sort_keys=True)
+    assert "4321" not in serialized_preview
+    assert chase_csv not in serialized_preview
+    assert all(description not in serialized_preview for description in descriptions)
+
+    unconfirmed = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2099-07-12",
+        dry_run=False,
+    )
+    assert unconfirmed["status"] not in {"ok", "preview"}
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM checking_import_runs").fetchone()[0] == 0
+
+    wrong_hash = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2099-07-12",
+        dry_run=False,
+        confirmed_source_hash="0" * 64,
+    )
+    assert wrong_hash["status"] not in {"ok", "preview"}
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM checking_import_runs").fetchone()[0] == 0
+
+    applied = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2099-07-12",
+        dry_run=False,
+        confirmed_source_hash=preview["source_hash"],
+    )
+    assert applied["status"] == "ok"
+    assert applied["new"] == 2 and applied["duplicate"] == 0
+    transaction_rows = conn.execute(
+        "SELECT source FROM transactions WHERE account_id = 'ACT-chk'"
+    ).fetchall()
+    assert len(transaction_rows) == 2
+    assert all(row["source"] == "checking_paste" for row in transaction_rows)
+    receipts = conn.execute("SELECT * FROM checking_import_runs").fetchall()
+    assert len(receipts) == 1
+    receipt = dict(receipts[0])
+    assert {
+        key: receipt[key]
+        for key in (
+            "source_hash",
+            "total_rows",
+            "parsed_rows",
+            "new_count",
+            "duplicate_count",
+            "skipped_rows",
+            "row_error_count",
+        )
+    } == {
+        "source_hash": source_hash,
+        "total_rows": 3,
+        "parsed_rows": 2,
+        "new_count": 2,
+        "duplicate_count": 0,
+        "skipped_rows": 1,
+        "row_error_count": 1,
+    }
+
+    retry = import_checking_activity_for_db(
+        conn,
+        text=chase_csv,
+        account_query="PREMIER PLUS CKG",
+        as_of_date="2099-07-13",
+        dry_run=False,
+        confirmed_source_hash=preview["source_hash"],
+    )
+    assert retry["new"] == 0 and retry["duplicate"] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE account_id = 'ACT-chk'"
+    ).fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM checking_import_runs").fetchone()[0] == 1
 
 
 def test_checking_import_writes_txns_and_balance_and_is_idempotent(tmp_path):

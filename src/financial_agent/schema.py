@@ -8,7 +8,7 @@ from pathlib import Path
 # Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
 # a fresh DB ends at this version after ensure_app_schema runs. When adding a
 # migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
@@ -597,6 +597,26 @@ def _migrate_to_v4(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "obligations", "active_until", "TEXT")
 
 
+def _migrate_to_v5(conn: sqlite3.Connection) -> None:
+    """Record one confirmed checking import receipt per exact source file."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checking_import_runs (
+            source_hash TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            total_rows INTEGER NOT NULL,
+            parsed_rows INTEGER NOT NULL,
+            new_count INTEGER NOT NULL,
+            duplicate_count INTEGER NOT NULL,
+            skipped_rows INTEGER NOT NULL,
+            row_error_count INTEGER NOT NULL
+        )
+        """
+    )
+
+
 # Ordered migration registry: (target version, idempotent apply function).
 # Append-only; never reorder or renumber existing entries.
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
@@ -604,6 +624,7 @@ _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (2, _migrate_to_v2),
     (3, _migrate_to_v3),
     (4, _migrate_to_v4),
+    (5, _migrate_to_v5),
 ]
 
 

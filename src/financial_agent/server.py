@@ -633,6 +633,7 @@ def import_checking_activity(
     as_of_date: str | None = None,
     balance: float | None = None,
     dry_run: bool = True,
+    confirmed_source_hash: str | None = None,
     db_path: str | None = None,
 ) -> dict:
     """Import pasted checking-account activity (CSV) into the DB.
@@ -664,6 +665,7 @@ def import_checking_activity(
             as_of_date=resolved_as_of,
             balance=balance,
             dry_run=dry_run,
+            confirmed_source_hash=confirmed_source_hash,
         )
         if not dry_run and result.get("status") == "ok":
             conn.commit()

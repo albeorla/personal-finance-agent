@@ -44,6 +44,7 @@ PASTE_SOURCE = "apple_card_paste"
 # activity is pasted in as a CSV. Its transactions land under this source, kept
 # distinct from the card-paste lane and the SimpleFIN feed.
 CHECKING_SOURCE = "checking_paste"
+_CHASE_ACTIVITY_HEADER = "Details,Posting Date,Description,Amount,Type,Balance,Check or Slip #"
 
 # Card org -> the canonical statement-payment obligation its charges roll into.
 # Mirrors onboarding.ORG_TO_STATEMENT_TARGET for the Apple Card only (this module
@@ -463,6 +464,7 @@ def import_checking_activity_for_db(
     as_of_date: str,
     balance: float | None = None,
     dry_run: bool = True,
+    confirmed_source_hash: str | None = None,
 ) -> dict[str, Any]:
     """Parse pasted checking-account activity (CSV) and (unless dry-run) write it.
 
@@ -480,7 +482,41 @@ def import_checking_activity_for_db(
     now = _now()
     warnings: list[str] = []
 
-    parsed = parse_generic_csv(text)
+    is_chase_activity = bool(text.splitlines()) and text.splitlines()[0] == _CHASE_ACTIVITY_HEADER
+    source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest() if is_chase_activity else None
+    if is_chase_activity:
+        reader = csv.DictReader(io.StringIO(text))
+        txns = []
+        row_errors = []
+        total_rows = 0
+        for row_number, row in enumerate(reader, start=2):
+            total_rows += 1
+            iso = _to_iso_date((row.get("Posting Date") or "").strip())
+            amount = _parse_money((row.get("Amount") or "").strip())
+            if iso is None or amount is None:
+                row_errors.append(
+                    {
+                        "row_number": row_number,
+                        "error_code": "invalid_date" if iso is None else "invalid_amount",
+                    }
+                )
+                continue
+            description = (row.get("Description") or "").strip()
+            txns.append(
+                {
+                    "transacted_date": iso,
+                    "merchant": description,
+                    "description": description,
+                    "amount": round(amount, 2),
+                    "inflow": amount > 0,
+                    "type": None,
+                }
+            )
+        parsed = {"txns": txns, "skipped": len(row_errors)}
+    else:
+        parsed = parse_generic_csv(text)
+        row_errors = []
+        total_rows = len(parsed["txns"]) + parsed["skipped"]
     if not parsed["txns"]:
         return {
             "status": "unparsed",
@@ -537,13 +573,56 @@ def import_checking_activity_for_db(
         "warnings": warnings,
     }
 
+    if is_chase_activity:
+        result.update(
+            {
+                "format": "chase_activity",
+                "account": {"status": "matched"},
+                "total_rows": total_rows,
+                "parsed_rows": len(txns),
+                "row_error_count": len(row_errors),
+                "row_errors": row_errors,
+                "source_hash": source_hash,
+            }
+        )
+
+        if not dry_run and confirmed_source_hash != source_hash:
+            result["status"] = "confirmation_required"
+            result["preview"] = "Import refused: confirm the matching preview source hash."
+            return result
+
     if dry_run:
-        result["preview"] = _render_checking_preview(result)
+        result["preview"] = (
+            "Chase activity preview. Confirm this source hash to apply."
+            if is_chase_activity
+            else _render_checking_preview(result)
+        )
         return result
 
     # --- commit path (caller owns the transaction) ---
     for txn in new_rows:
         _insert_paste_transaction(conn, account_id, txn, now, source=CHECKING_SOURCE)
+
+    if is_chase_activity:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO checking_import_runs (
+                source_hash, account_id, imported_at, total_rows, parsed_rows,
+                new_count, duplicate_count, skipped_rows, row_error_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_hash,
+                account_id,
+                now,
+                total_rows,
+                len(txns),
+                len(new_rows),
+                duplicate,
+                parsed["skipped"],
+                len(row_errors),
+            ),
+        )
 
     if balance is not None:
         result["balance_snapshot"] = set_manual_balance(
@@ -554,7 +633,7 @@ def import_checking_activity_for_db(
             note="Checking balance snapshot from activity paste.",
         )
 
-    result["preview"] = _render_checking_preview(result)
+    result["preview"] = "Chase activity imported." if is_chase_activity else _render_checking_preview(result)
     return result
 
 
