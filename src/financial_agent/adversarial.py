@@ -51,7 +51,7 @@ _ENV_MODEL = "FINANCE_AGENT_ADVERSARIAL_MODEL"
 _ENV_TIMEOUT = "FINANCE_AGENT_ADVERSARIAL_TIMEOUT"
 _TRUTHY = {"1", "true", "yes", "on"}
 _DEFAULT_MODEL = "fable"
-_DEFAULT_TIMEOUT_S = 120
+_DEFAULT_TIMEOUT_S = 300
 
 # An estimated outflow has to be at least this large to count as "materially
 # driving the projection" - the same floor build_daily_digest uses for its

@@ -174,7 +174,7 @@ The deterministic verification phase proves the model ties out internally — pu
 
 **Subscription auth, no API key.** The real reviewer spawns the Claude Code CLI (`claude -p`) as a read-only subprocess using your Claude subscription via OAuth. The child environment has `ANTHROPIC_API_KEY` removed so it can never silently fall back to a metered API key. The subprocess gets no tools and is isolated from this MCP server (so it cannot recurse); every row it judges is embedded inline in the prompt as untrusted text.
 
-**Enable it.** The phase is off by default and inert offline and in tests. It runs only when both are true: the environment flag `FINANCE_AGENT_ADVERSARIAL` is truthy (`1`/`true`/`yes`/`on`) AND the `claude` binary resolves on `PATH`. Optional tuning: `FINANCE_AGENT_ADVERSARIAL_MODEL` (default `sonnet`) and `FINANCE_AGENT_ADVERSARIAL_TIMEOUT` (seconds, default 120).
+**Enable it.** The phase is off by default and inert offline and in tests. It runs only when both are true: the environment flag `FINANCE_AGENT_ADVERSARIAL` is truthy (`1`/`true`/`yes`/`on`) AND the `claude` binary resolves on `PATH`. Optional tuning: `FINANCE_AGENT_ADVERSARIAL_MODEL` (default `fable`) and `FINANCE_AGENT_ADVERSARIAL_TIMEOUT` (seconds, default 300).
 
 ### Three enforcement layers
 

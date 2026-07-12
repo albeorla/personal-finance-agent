@@ -357,6 +357,26 @@ def test_runner_child_env_has_gate_flag_stripped(monkeypatch):
     assert captured["env"].get("FINANCE_AGENT_ADVERSARIAL_CHILD") == "1"
 
 
+def test_real_runner_allows_slow_fable_review_by_default(monkeypatch):
+    monkeypatch.setattr(adversarial.shutil, "which", lambda _name: "/usr/bin/claude")
+    monkeypatch.delenv("FINANCE_AGENT_ADVERSARIAL_TIMEOUT", raising=False)
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"result": {"findings": [], "reviewed_count": 0}}'
+        stderr = ""
+
+    def _run(*args, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return _Proc()
+
+    monkeypatch.setattr(adversarial.subprocess, "run", _run)
+    _claude_runner(targets={"recurring_candidates": [{"x": 1}]}, model="fable")
+
+    assert captured["timeout"] == 300
+
+
 # --- normalization details --------------------------------------------------
 
 
