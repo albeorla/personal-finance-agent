@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -107,7 +109,7 @@ def require_current_release(db_path: str) -> None:
         raise StaleReleaseError("Release record could not be read") from exc
 
 
-def promote_release(db_path: str) -> None:
+def promote_release(db_path: str) -> dict[str, object]:
     """Create or advance the authoritative release record to this version."""
 
     path = Path(db_path).absolute()
@@ -117,6 +119,7 @@ def promote_release(db_path: str) -> None:
     conn = sqlite3.connect(f"{path.as_uri()}?mode=rw", uri=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        old_version = None
         current_schema = get_schema_version(conn)
         if current_schema > LATEST_SCHEMA_VERSION:
             raise IncompatibleSchemaError(
@@ -129,6 +132,7 @@ def promote_release(db_path: str) -> None:
             row = conn.execute(
                 "SELECT version FROM finance_release WHERE id = 1"
             ).fetchone()
+            old_version = None if row is None else row[0]
             if row is not None and _semantic_version(row[0]) > _semantic_version(VERSION):
                 raise StaleReleaseError(
                     f"Release {row[0]} is newer than running version {VERSION}",
@@ -167,7 +171,16 @@ def promote_release(db_path: str) -> None:
                     "UPDATE finance_release SET version = ? WHERE id = 1",
                     (VERSION,),
                 )
+        write_applied = old_version != VERSION
+        result = {
+            "status": "promoted" if write_applied else "current",
+            "write_applied": write_applied,
+            "old_version": old_version,
+            "new_version": VERSION,
+            "reload_required": write_applied,
+        }
         conn.commit()
+        return result
     except Exception:
         conn.rollback()
         raise
@@ -244,3 +257,24 @@ def guarded_read(db_path: str):
         yield conn, status
     finally:
         conn.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("status", "promote"))
+    parser.add_argument("--db", required=True)
+    args = parser.parse_args(argv)
+
+    if args.command == "promote":
+        result = promote_release(args.db)
+    else:
+        with guarded_read(args.db) as (_, status):
+            result = {
+                "status": status.status,
+                "write_applied": False,
+                "old_version": status.db_version,
+                "new_version": status.runtime_version,
+                "reload_required": False,
+            }
+    print(json.dumps(result))
+    return 0

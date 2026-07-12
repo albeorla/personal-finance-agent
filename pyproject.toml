@@ -1,6 +1,6 @@
 [project]
 name = "financial-agent"
-version = "0.3.28"
+version = "0.3.29"
 description = "Local finance MCP server for grounded cash-flow and Todoist workflows."
 requires-python = ">=3.11"
 dependencies = [
@@ -16,6 +16,7 @@ dev = [
 financial-agent-mcp = "financial_agent.server:main"
 financial-agent-ui = "financial_agent.ui:main"
 financial-agent-daily = "financial_agent.scheduled:main"
+financial-agent-release = "financial_agent.release_gate:main"
 
 [build-system]
 requires = ["hatchling"]

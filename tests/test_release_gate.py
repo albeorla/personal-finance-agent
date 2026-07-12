@@ -3097,3 +3097,45 @@ def test_in_transaction_release_recheck_returns_new_stored_version_without_write
     assert helper_calls == []
     assert _database_snapshot(db)["goals"] == goals_before
     assert _release_version(db) == stored_version
+
+
+def test_release_cli_status_promote_and_idempotent_repromote(tmp_path, capsys):
+    db = tmp_path / "finance.db"
+    _prepare_database(db, "missing_row")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO finance_release (id, version) VALUES (1, ?)",
+            ("0.0.0",),
+        )
+
+    def output():
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1
+        return json.loads(lines[0])
+
+    assert release_gate.main(["status", "--db", str(db)]) == 0
+    assert output() == {
+        "status": "stale",
+        "write_applied": False,
+        "old_version": "0.0.0",
+        "new_version": build_info.VERSION,
+        "reload_required": False,
+    }
+
+    assert release_gate.main(["promote", "--db", str(db)]) == 0
+    assert output() == {
+        "status": "promoted",
+        "write_applied": True,
+        "old_version": "0.0.0",
+        "new_version": build_info.VERSION,
+        "reload_required": True,
+    }
+
+    assert release_gate.main(["promote", "--db", str(db)]) == 0
+    assert output() == {
+        "status": "current",
+        "write_applied": False,
+        "old_version": build_info.VERSION,
+        "new_version": build_info.VERSION,
+        "reload_required": False,
+    }
