@@ -106,6 +106,21 @@ def parse_cashflow_md(path: str, *, base_year: int = 2026) -> list[dict[str, Any
     return rows
 
 
+def parse_obligation_migration_source(
+    source: str,
+    path: str,
+    options: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse a supported legacy obligation source into normalized rows."""
+
+    opts = options or {}
+    if source == "obligations_yaml":
+        return parse_obligations_yaml(path)
+    if source == "cashflow_md":
+        return parse_cashflow_md(path, base_year=int(opts.get("base_year", 2026)))
+    raise ValueError(f"unsupported migration source: {source!r}")
+
+
 def apply_obligation_migration(
     conn: sqlite3.Connection,
     *,
@@ -113,17 +128,17 @@ def apply_obligation_migration(
     path: str,
     dry_run: bool = True,
     options: dict[str, Any] | None = None,
+    prepared_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Migrate obligations from a legacy source, deduped, with a needs_review fallback."""
 
-    ensure_app_schema(conn)
-    opts = options or {}
-    if source == "obligations_yaml":
-        rows = parse_obligations_yaml(path)
-    elif source == "cashflow_md":
-        rows = parse_cashflow_md(path, base_year=int(opts.get("base_year", 2026)))
-    else:
-        raise ValueError(f"unsupported migration source: {source!r}")
+    rows = (
+        parse_obligation_migration_source(source, path, options)
+        if prepared_rows is None
+        else prepared_rows
+    )
+    if not dry_run:
+        ensure_app_schema(conn)
 
     # Classify every row up front against the current DB state (deterministic).
     plan: list[dict[str, Any]] = []
@@ -172,18 +187,20 @@ def apply_obligation_migration(
 
     skipped = sum(1 for r in plan if r["decision"] == "already_modeled")
     needs_review = sum(1 for r in plan if r["decision"] == "needs_review")
-    log_id = f"migration_{uuid.uuid4().hex[:12]}"
-    conn.execute(
-        """
-        INSERT INTO obligation_migration_log (
-            id, run_timestamp, source_type, source_path, dry_run, parsed,
-            created_obligations, created_instances, skipped_already_modeled,
-            needs_review, errors_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-        """,
-        (log_id, _now(), source, path, 1 if dry_run else 0, len(rows),
-         created_obligations, created_instances, skipped, needs_review),
-    )
+    log_id = None
+    if not dry_run:
+        log_id = f"migration_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO obligation_migration_log (
+                id, run_timestamp, source_type, source_path, dry_run, parsed,
+                created_obligations, created_instances, skipped_already_modeled,
+                needs_review, errors_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (log_id, _now(), source, path, 0, len(rows), created_obligations,
+             created_instances, skipped, needs_review),
+        )
 
     return {
         "source": source,

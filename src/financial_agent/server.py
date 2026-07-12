@@ -68,7 +68,10 @@ from .memory import (
 )
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
 from .card_import import import_card_statement_for_db, import_checking_activity_for_db
-from .migration import apply_obligation_migration as apply_obligation_migration_for_db
+from .migration import (
+    apply_obligation_migration as apply_obligation_migration_for_db,
+    parse_obligation_migration_source,
+)
 from .sync_simplefin import sync_simplefin as sync_simplefin_for_db
 from .validate import run_live_validation as run_live_validation_for_db
 from .reconciliation import (
@@ -107,6 +110,7 @@ from .todoist_outbox import (
     surface_to_todoist as surface_to_todoist_for_db,
     update_todoist_task as update_todoist_task_impl,
 )
+from .release_gate import guarded_read, guarded_write, require_current_release
 from .status import default_db_path
 from .status import get_finance_status as build_finance_status
 from .debts import (
@@ -199,12 +203,9 @@ def set_goal(
     goal with no deadline is treated as open-ended.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    require_current_release(resolved_db_path)
+    with guarded_write(resolved_db_path) as conn:
         result = set_goal_for_db(
             conn,
             name=name,
@@ -213,10 +214,7 @@ def set_goal(
             source_account=source_account,
             note=note,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -255,21 +253,14 @@ def set_goal_override(
     goal with its recomputed progress.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_goal_override_for_db(
             conn,
             goal_id=goal_id,
             override_amount=override_amount,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -297,12 +288,8 @@ def set_debt_terms(
     from the avalanche target order even when their APR is high.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_debt_terms_for_db(
             conn,
             id=id,
@@ -317,10 +304,7 @@ def set_debt_terms(
             autopay=autopay,
             note=note,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -363,12 +347,8 @@ def capture_followup(
     follow-up instead of creating a duplicate. This writes to the DB only.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = capture_followup_for_db(
             conn,
             text=text,
@@ -377,10 +357,7 @@ def capture_followup(
             linked_obligation_id=linked_obligation_id,
             source=source,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -408,17 +385,10 @@ def list_due_followups(as_of_date: str | None = None, db_path: str | None = None
 def resolve_followup(followup_id: str, db_path: str | None = None) -> dict:
     """Mark a follow-up resolved so it stops surfacing. Idempotent."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = resolve_followup_for_db(conn, followup_id=followup_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -436,12 +406,8 @@ def update_followup(
     create a new row because the capture id is derived from content.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = update_followup_for_db(
             conn,
             followup_id,
@@ -450,10 +416,7 @@ def update_followup(
             priority=priority,
             linked_obligation_id=linked_obligation_id,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -561,12 +524,8 @@ def set_manual_balance(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_manual_balance_for_db(
             conn,
             account_query=account_query,
@@ -574,11 +533,9 @@ def set_manual_balance(
             as_of_date=as_of_date,
             note=note,
         )
-        if result.get("status") == "ok":
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+        if result.get("status") != "ok":
+            conn.rollback()
+    return result
 
 
 @mcp.tool()
@@ -608,13 +565,23 @@ def import_card_statement(
     """
 
     import datetime as _dt
-    import sqlite3
 
     resolved_db_path = db_path or str(default_db_path())
     resolved_as_of = as_of_date or _dt.date.today().isoformat()
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = import_card_statement_for_db(
+                conn,
+                text=text,
+                account_query=account_query,
+                as_of_date=resolved_as_of,
+                statement_close_date=statement_close_date,
+                statement_total=statement_total,
+                dry_run=True,
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = import_card_statement_for_db(
             conn,
             text=text,
@@ -622,13 +589,11 @@ def import_card_statement(
             as_of_date=resolved_as_of,
             statement_close_date=statement_close_date,
             statement_total=statement_total,
-            dry_run=dry_run,
+            dry_run=False,
         )
-        if not dry_run and result.get("status") == "ok":
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+        if result.get("status") != "ok":
+            conn.rollback()
+    return result
 
 
 @mcp.tool()
@@ -656,27 +621,34 @@ def import_checking_activity(
     """
 
     import datetime as _dt
-    import sqlite3
 
     resolved_db_path = db_path or str(default_db_path())
     resolved_as_of = as_of_date or _dt.date.today().isoformat()
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = import_checking_activity_for_db(
+                conn,
+                text=text,
+                account_query=account_query,
+                as_of_date=resolved_as_of,
+                balance=balance,
+                dry_run=True,
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = import_checking_activity_for_db(
             conn,
             text=text,
             account_query=account_query,
             as_of_date=resolved_as_of,
             balance=balance,
-            dry_run=dry_run,
+            dry_run=False,
             confirmed_source_hash=confirmed_source_hash,
         )
-        if not dry_run and result.get("status") == "ok":
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+        if result.get("status") != "ok":
+            conn.rollback()
+    return result
 
 
 @mcp.tool()
@@ -698,17 +670,10 @@ def list_income_sources(db_path: str | None = None) -> dict:
 def apply_income_source(source: dict, db_path: str | None = None) -> dict:
     """Create or update an income source and schedule version after user confirmation."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_income_source_config(conn, source)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -720,17 +685,10 @@ def import_calendar_facts(facts: list[dict], db_path: str | None = None) -> dict
     calendar_id, related entity, title, confidence, notes, and payload.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = import_calendar_facts_for_db(conn, facts)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -791,8 +749,6 @@ def apply_obligation_instances(
     new inserts from re-applied upserts (never a silent no-op).
     """
 
-    import sqlite3
-
     # Require an explicit autopay decision when a bill is created conversationally.
     # The backing function defaults autopay=True (quiet) for the auto-detectors, but
     # a hand-added bill with no decision would then silently never surface as a
@@ -805,18 +761,13 @@ def apply_obligation_instances(
         )
 
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_obligation_instances_for_db(
             conn,
             obligation=obligation,
             instances=instances,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -831,17 +782,10 @@ def delete_obligation_instance(
     its history. Re-apply the instance with an explicit id to revive it.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = delete_obligation_instance_for_db(conn, instance_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -859,17 +803,10 @@ def set_obligation_end(
     instances are deleted, they are just excluded past the end date.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_obligation_end_for_db(conn, obligation_id, active_until)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -883,17 +820,10 @@ def deactivate_obligation(
     upcoming bills this pulls from the runway before relying on it.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = deactivate_obligation_for_db(conn, obligation_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -914,28 +844,20 @@ def suppress_contradicted_estimates(
     zero, routes it to dormant. Both paths are reversible and emit a low-severity
     drift finding.
 
-    mode='report' (default) emits findings but mutates nothing -- the observe
-    posture for the first live run. mode='enforce' applies the resolution. Tunable
-    thresholds (contradiction_ratio, flat_balance_ratio, modeled_floor,
-    contradiction_cycles, contradiction_lookback_days, near_zero_monthly) go in
-    options.
+    mode='report' (default) leaves obligations and instances unchanged but records
+    findings. mode='enforce' applies the resolution. Tunable thresholds
+    (contradiction_ratio, flat_balance_ratio, modeled_floor, contradiction_cycles,
+    contradiction_lookback_days, near_zero_monthly) go in options.
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     opts = {**(options or {}), "mode": mode}
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = suppress_contradicted_estimates_for_db(
             conn, as_of_date=as_of_date, options=opts
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1070,22 +992,15 @@ def generate_income_instances(
     calendar source for one-off local closures.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = generate_income_instances_for_db(
             conn,
             start_date=start_date,
             through_date=through_date,
             extra_closure_dates=extra_closure_dates,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1102,17 +1017,10 @@ def scan_charge_onboarding_candidates(
     min_evidence, include_inflows, and link_existing_obligations.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = scan_charge_onboarding_candidates_for_db(conn, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1205,17 +1113,10 @@ def record_charge_onboarding_decision(
     rejected here. Restructuring (merge/split/edit) is also rejected.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = _record_onboarding_decision(conn, candidate_id, decision)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1233,14 +1134,10 @@ def record_charge_onboarding_decisions(
     {total, applied, failed, results:[{candidate_id, ok, status|error}]}.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
     results: list[dict] = []
     applied = failed = 0
-    try:
+    with guarded_write(resolved_db_path) as conn:
         for item in decisions or []:
             cid = (item or {}).get("candidate_id")
             dec = (item or {}).get("decision")
@@ -1255,10 +1152,7 @@ def record_charge_onboarding_decisions(
             except Exception as exc:  # noqa: BLE001 - record per item, never abort the batch
                 failed += 1
                 results.append({"candidate_id": cid, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
-        conn.commit()
-        return {"total": len(decisions or []), "applied": applied, "failed": failed, "results": results}
-    finally:
-        conn.close()
+    return {"total": len(decisions or []), "applied": applied, "failed": failed, "results": results}
 
 
 @mcp.tool()
@@ -1323,12 +1217,8 @@ def apply_charge_onboarding_candidate(
     rejecting and re-modeling.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_charge_onboarding_candidate_for_db(
             conn,
             candidate_id,
@@ -1340,10 +1230,7 @@ def apply_charge_onboarding_candidate(
             amount_override=amount_override,
             cadence_override=cadence_override,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1359,17 +1246,10 @@ def aggregate_statement_inputs(
     last known statement close as unrolled.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = aggregate_statement_inputs_for_db(conn, target_obligation_id=target_obligation_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1403,19 +1283,12 @@ def get_statement_status(
     whether spend is ahead of or behind the modeled pace.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = get_statement_status_for_db(
             conn, obligation_id=obligation_id, as_of_date=as_of_date
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1433,19 +1306,12 @@ def recompute_statement_estimates(
     to inputs-only). Idempotent.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = recompute_statement_estimates_for_db(
             conn, target_obligation_id=target_obligation_id, baseline=baseline
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1467,12 +1333,8 @@ def set_statement_actual(
     estimator. Errors list the known cycles when nothing matches.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = set_statement_actual_for_db(
             conn,
             obligation_id=obligation_id,
@@ -1482,10 +1344,7 @@ def set_statement_actual(
             source=source,
             note=note,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1505,17 +1364,10 @@ def reconcile_obligation_instances(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_obligation_instances_for_db(conn, as_of_date=as_of_date, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1571,18 +1423,17 @@ def detect_drift(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if not persist:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = detect_drift_for_db(
+                conn, as_of_date=as_of_date, options=options, persist=False
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = detect_drift_for_db(conn, as_of_date=as_of_date, options=options, persist=persist)
-        if persist:
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1618,17 +1469,10 @@ def execute_action_outbox(
     place on rerun rather than duplicated.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = execute_action_outbox_for_db(conn, options=options)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1639,6 +1483,7 @@ def create_todoist_task(
     description: str | None = None,
     priority: int | None = None,
     project_id: str | None = None,
+    db_path: str | None = None,
 ) -> dict:
     """Create a free-form Todoist task (e.g. a one-off reminder) in the Finance project.
 
@@ -1662,6 +1507,8 @@ def create_todoist_task(
     Returns on success: {"status": "created", "sent": true, "task_id", "url", "content"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return create_todoist_task_impl(
         content,
         due_string=due_string,
@@ -1681,6 +1528,7 @@ def update_todoist_task(
     description: str | None = None,
     priority: int | None = None,
     project_id: str | None = None,
+    db_path: str | None = None,
 ) -> dict:
     """Update an existing Todoist task in place, editing only the provided fields.
 
@@ -1705,6 +1553,8 @@ def update_todoist_task(
     Returns on success: {"status": "updated", "sent": true, "task_id", "url"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return update_todoist_task_impl(
         task_id,
         content=content,
@@ -1717,7 +1567,7 @@ def update_todoist_task(
 
 
 @mcp.tool()
-def complete_todoist_task(task_id: str) -> dict:
+def complete_todoist_task(task_id: str, db_path: str | None = None) -> dict:
     """Complete (close) an existing Todoist task by id.
 
     Live Todoist write-back is gated OFF by default. The task is closed ONLY when
@@ -1731,11 +1581,13 @@ def complete_todoist_task(task_id: str) -> dict:
     Returns on success: {"status": "completed", "sent": true, "task_id"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return complete_todoist_task_impl(task_id)
 
 
 @mcp.tool()
-def reopen_todoist_task(task_id: str) -> dict:
+def reopen_todoist_task(task_id: str, db_path: str | None = None) -> dict:
     """Reopen (un-complete) an existing Todoist task by id.
 
     Live Todoist write-back is gated OFF by default. The task is reopened ONLY when
@@ -1749,11 +1601,13 @@ def reopen_todoist_task(task_id: str) -> dict:
     Returns on success: {"status": "reopened", "sent": true, "task_id"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return reopen_todoist_task_impl(task_id)
 
 
 @mcp.tool()
-def delete_todoist_task(task_id: str) -> dict:
+def delete_todoist_task(task_id: str, db_path: str | None = None) -> dict:
     """Delete an existing Todoist task by id.
 
     Live Todoist write-back is gated OFF by default. The task is deleted ONLY when
@@ -1768,6 +1622,8 @@ def delete_todoist_task(task_id: str) -> dict:
     Returns on success: {"status": "deleted", "sent": true, "task_id"}.
     """
 
+    resolved_db_path = db_path or str(default_db_path())
+    require_current_release(resolved_db_path)
     return delete_todoist_task_impl(task_id)
 
 
@@ -1802,12 +1658,8 @@ def surface_due_items_to_todoist(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         # Headline enrichment needs synced balances; on an app-only DB (obligations
         # seeded, no sync yet) there is no balance/health read, so surface the bare
         # due items instead of crashing on the digest build.
@@ -1823,10 +1675,7 @@ def surface_due_items_to_todoist(
             # it on a same-day re-run.
             items = [build_sync_failed_item_for_db(as_of_date), *items]
         result = surface_to_todoist_for_db(conn, items, as_of_date, retire_keys=retire_keys)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1844,17 +1693,10 @@ def reconcile_todoist_emission(
     creating a duplicate. Writes only to the local ledger; no external call.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_emission_for_db(conn, surface_key, todoist_task_id, content_hash)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1879,17 +1721,10 @@ def reconcile_todoist_completions(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_todoist_completions_for_db(conn, as_of_date=as_of_date)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -1921,17 +1756,10 @@ def reconcile_todoist_project(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reconcile_todoist_project_for_db(conn, as_of_date=as_of_date, apply=apply)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2039,19 +1867,12 @@ def run_background_sync(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = run_background_sync_for_db(
             conn, as_of_date=as_of_date, options=options, run_type=run_type, trigger_type=trigger_type
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2159,17 +1980,17 @@ def run_verification(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if not persist:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = run_verification_for_db(
+                conn, as_of_date=as_of_date, persist=False
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = run_verification_for_db(conn, as_of_date=as_of_date, persist=persist)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2225,19 +2046,12 @@ def acknowledge_verification_findings(
     in bulk.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = acknowledge_verification_findings_for_db(
             conn, finding_ids=finding_ids, check_id=check_id
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2267,19 +2081,12 @@ def run_adversarial_review(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = run_adversarial_review_for_db(
             conn, as_of_date=as_of_date, persist=persist, model=model
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2302,17 +2109,10 @@ def write_finance_memory(
     if not text:
         raise ValueError("write_finance_memory requires 'text' (or its alias 'content')")
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = write_memory_for_db(conn, text=text, metadata=metadata, kind=kind, source=source)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2367,17 +2167,10 @@ def list_finance_memories(
 def delete_finance_memory(memory_id: str, db_path: str | None = None) -> dict:
     """Delete a finance memory by id (e.g. when a correction is no longer true)."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = delete_memory_for_db(conn, memory_id=memory_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2397,19 +2190,22 @@ def apply_obligation_migration(
     read-only.
     """
 
-    import sqlite3
-
+    rows = parse_obligation_migration_source(source, path, options)
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = apply_obligation_migration_for_db(
+                conn, source=source, path=path, dry_run=True, options=options,
+                prepared_rows=rows,
+            )
+        return {**result, "release_warning": release_status.warning}
+
+    with guarded_write(resolved_db_path) as conn:
         result = apply_obligation_migration_for_db(
-            conn, source=source, path=path, dry_run=dry_run, options=options
+            conn, source=source, path=path, dry_run=False, options=options,
+            prepared_rows=rows,
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2425,18 +2221,10 @@ def evaluate_guardrails(
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = evaluate_guardrails_for_db(conn, as_of_date=as_of_date, persist=persist)
-        if persist:
-            conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2462,17 +2250,10 @@ def list_guardrail_findings(
 def apply_guardrail_rules(db_path: str | None = None) -> dict:
     """Idempotently seed the default guardrail rules into the database."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = apply_guardrail_rules_for_db(conn)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2494,19 +2275,12 @@ def sync_simplefin(
     problems) and 'notes' (expected balance-only connections like Apple Card).
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = sync_simplefin_for_db(
             conn, start_date=start_date, end_date=end_date, lookback_days=lookback_days, incremental=incremental
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2590,17 +2364,10 @@ def confirm_reconciliation_match(
     transaction to the instance; it is recorded as a normal confirmed match.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = confirm_reconciliation_match_for_db(conn, instance_id, transaction_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2609,17 +2376,10 @@ def unconfirm_reconciliation_match(instance_id: str, db_path: str | None = None)
     clear the matched-transaction evidence.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = unconfirm_reconciliation_match_for_db(conn, instance_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2809,17 +2569,10 @@ def backfill_recurring_instances(as_of_date: str | None = None, lookback_days: i
     """
     as_of_date = _resolve_as_of(as_of_date)
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = backfill_recurring_instances_for_db(conn, as_of_date=as_of_date, lookback_days=lookback_days)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2830,17 +2583,10 @@ def auto_model_high_confidence_recurring(as_of_date: str | None = None, db_path:
     direct-checking with >=3 occurrences; everything else stays in the review queue.
     """
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = auto_model_high_confidence_recurring_for_db(conn, as_of_date=as_of_date)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 def main() -> None:

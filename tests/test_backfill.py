@@ -2,6 +2,9 @@
 
 import sqlite3
 
+import pytest
+
+import financial_agent.backfill as backfill
 from financial_agent.backfill import backfill_recurring_instances, list_recently_cleared
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
@@ -109,3 +112,30 @@ def test_backfill_cancels_unmatched_history_to_avoid_false_missing(tmp_path):
     assert leftover == 0
     # the matched June rent is kept and shows cleared
     assert any(c["obligation_name"] == "Rent check" for c in list_recently_cleared(conn, as_of_date="2026-06-21"))
+
+
+def test_backfill_rolls_back_created_instances_when_reconciliation_raises(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "b.sqlite"
+    conn = _db(db)
+    _rent(conn)
+    conn.commit()
+
+    def fail_reconciliation(conn, *, as_of_date):
+        raise RuntimeError("reconciliation failed")
+
+    monkeypatch.setattr(
+        backfill, "reconcile_obligation_instances", fail_reconciliation
+    )
+
+    with pytest.raises(RuntimeError, match="reconciliation failed"):
+        with conn:
+            backfill_recurring_instances(
+                conn, as_of_date="2026-06-21", lookback_days=90
+            )
+
+    persisted = sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM obligation_instances WHERE source = 'backfill'"
+    ).fetchone()[0]
+    assert persisted == 0

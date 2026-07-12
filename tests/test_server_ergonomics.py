@@ -6,12 +6,19 @@ as_of_date defaults to today when omitted, and write_finance_memory accepts
 """
 
 import inspect
+import sqlite3
 
 import pytest
 
 pytest.importorskip("mcp", reason="MCP server deps not installed")
 
 from financial_agent import server
+from financial_agent.release_gate import promote_release
+
+
+def _promoted_db(path):
+    sqlite3.connect(path).close()
+    promote_release(str(path))
 
 
 def test_no_tool_requires_as_of_date():
@@ -38,6 +45,7 @@ def test_as_of_date_defaults_to_today(tmp_path):
 
 def test_write_finance_memory_accepts_content_alias(tmp_path):
     db = tmp_path / "fa.sqlite"
+    _promoted_db(db)
     result = server.write_finance_memory(
         content="Apple Card feed is balance-only",
         kind="fact",

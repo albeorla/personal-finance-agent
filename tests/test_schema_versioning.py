@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from financial_agent import schema
 from financial_agent.schema import (
     LATEST_SCHEMA_VERSION,
@@ -92,3 +94,31 @@ def test_existing_v0_db_converges_without_data_loss():
     assert get_schema_version(conn) == LATEST_SCHEMA_VERSION
     rows = conn.execute("SELECT id FROM obligations WHERE id = 'ob_keep'").fetchall()
     assert len(rows) == 1  # baseline migration is idempotent: no data lost
+
+
+def test_execute_script_rejects_incomplete_trailing_sql():
+    conn = _mem()
+
+    with pytest.raises(sqlite3.Error):
+        schema._execute_script(conn, "CREATE TABLE silently_dropped (id INTEGER)")
+
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'silently_dropped'"
+    ).fetchone() is None
+
+
+def test_schema_migrations_can_be_rolled_back(tmp_path):
+    db = tmp_path / "rollback.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("BEGIN")
+
+    ensure_app_schema(conn)
+    conn.rollback()
+    conn.close()
+
+    reopened = sqlite3.connect(db)
+    try:
+        assert get_schema_version(reopened) == 0
+        assert has_app_schema(reopened) is False
+    finally:
+        reopened.close()

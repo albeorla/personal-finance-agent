@@ -9,6 +9,7 @@ so no real network call is ever made.
 import sqlite3
 
 import financial_agent.todoist_outbox as tb
+from financial_agent.release_gate import promote_release
 from financial_agent.schema import ensure_app_schema
 from financial_agent.follow_ups import capture_followup, list_due_followups
 from financial_agent.todoist_outbox import (
@@ -453,6 +454,7 @@ def test_surface_tool_prepends_sync_failed_item_when_flag_set(tmp_path, monkeypa
     db = tmp_path / "f.db"
     conn = _db(db)  # empty app db: no due items to build, so the prepend is the only item
     conn.close()
+    promote_release(str(db))
 
     # Force the gate closed regardless of any ambient .env so the call is hermetic.
     # The tool resolves the gate via todoist_outbox.get_finance_config.

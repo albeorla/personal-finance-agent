@@ -133,9 +133,9 @@ def get_surface_queue(
 
     ``working_account_balance_stale`` is optional precomputed digest balance data.
     When it says the working account's own balance date is stale, the queue also
-    drops balance-derived guardrails for this read and adds one confirm-live-balance
-    item instead of recomputing staleness here. This covers feed-lagged checking
-    balances even when the full daily sync succeeded.
+    drops balance-derived guardrails and trough sensitivity for this read and adds
+    one confirm-live-balance item instead of recomputing staleness here. This covers
+    feed-lagged checking balances even when the full daily sync succeeded.
 
     ``trough_sensitivity`` is optional. The daily-digest builder supplies the
     already-computed trough downside band; this module does not import
@@ -153,7 +153,8 @@ def get_surface_queue(
     items += _goal_review_items(conn, as_of)
     items += _estimate_review_items(conn, as_of)
     items += _snapshot_refresh_items(conn, as_of)
-    items += _trough_breach_items(trough_sensitivity, as_of)
+    if not working_balance_stale:
+        items += _trough_breach_items(trough_sensitivity, as_of)
     items += _working_account_balance_stale_items(working_account_balance_stale)
     items += _guardrail_items(
         conn,

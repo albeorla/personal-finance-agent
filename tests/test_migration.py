@@ -42,10 +42,16 @@ def test_parse_obligations_yaml_normalizes(tmp_path):
 def test_dry_run_writes_nothing(tmp_path):
     conn = _db(tmp_path / "m.sqlite")
     p = _yaml(tmp_path / "o.yaml", [{"date": "2026-07-31", "label": "Volvo wear and tear", "amount": -712.0, "source": "verbal"}])
+    before = tuple(conn.iterdump())
+
     res = apply_obligation_migration(conn, source="obligations_yaml", path=p, dry_run=True)
+
     assert res["obligations_to_create"] == 1
     assert res["created_obligations"] == 0
+    assert res["migration_log_id"] is None
     assert conn.execute("SELECT COUNT(*) FROM obligations").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM obligation_migration_log").fetchone()[0] == 0
+    assert tuple(conn.iterdump()) == before
 
 
 def test_dedup_skips_already_modeled(tmp_path):

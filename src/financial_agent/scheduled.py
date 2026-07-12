@@ -17,11 +17,11 @@ import argparse
 import fcntl
 import json
 import os
-import sqlite3
 from datetime import date
 from typing import Any
 
 from .background import run_background_sync
+from .release_gate import guarded_write
 from .status import default_db_path
 
 
@@ -80,15 +80,10 @@ def run_scheduled_daily_sync(
                 "phases": _skipped_phases("dry run"),
             }
 
-        conn = sqlite3.connect(resolved_db)
-        conn.row_factory = sqlite3.Row
-        try:
+        with guarded_write(resolved_db) as conn:
             run = run_background_sync(
                 conn, as_of_date=as_of, run_type="daily_sync", trigger_type="scheduled", options=options
             )
-            conn.commit()
-        finally:
-            conn.close()
         phases = _phase_summary(run, sync=sync, surface=surface)
         phase_statuses = {phase["status"] for phase in phases.values()}
         semantic_status = "warn" if phase_statuses & {"warn", "failed"} else "ok"

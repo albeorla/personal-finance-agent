@@ -11,6 +11,7 @@ from financial_agent.obligations import (
     suppress_contradicted_estimates,
     suppress_dormant_avg_estimates,
 )
+from financial_agent.release_gate import promote_release
 from financial_agent.schema import ensure_app_schema
 
 
@@ -19,6 +20,13 @@ def _db(path):
     conn.row_factory = sqlite3.Row
     ensure_app_schema(conn)
     return conn
+
+
+def _promote_server_db(path):
+    conn = _db(path)
+    conn.commit()
+    conn.close()
+    promote_release(str(path))
 
 
 def _db_with_source(path):
@@ -192,7 +200,9 @@ def test_server_apply_requires_autopay_classification(tmp_path):
     # creating a bill without classifying autopay is rejected (so it can't silently go quiet)
     with pytest.raises(ValueError, match="autopay"):
         server.apply_obligation_instances(no_autopay, inst, db_path=str(db))
+    assert not db.exists()
     # with an explicit classification it applies
+    _promote_server_db(db)
     res = server.apply_obligation_instances({**no_autopay, "autopay": False}, inst, db_path=str(db))
     assert res["obligation_id"] == "x"
 
@@ -204,6 +214,7 @@ def test_server_list_obligations_limit_offset_reports_more(tmp_path):
     from financial_agent import server
 
     db = tmp_path / "fa.sqlite"
+    _promote_server_db(db)
     for i in range(3):
         server.apply_obligation_instances(
             {"id": f"bill{i}", "name": f"Bill {i}", "kind": "bill", "autopay": False, "source": "seed"},
