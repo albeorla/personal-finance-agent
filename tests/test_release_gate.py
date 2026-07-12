@@ -3,11 +3,15 @@
 import ast
 import json
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
+import anyio
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 import financial_agent.adversarial as adversarial
 import financial_agent.backfill as backfill
@@ -2940,3 +2944,156 @@ def test_guarded_read_closes_connection_and_propagates_body_error(
 
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         guarded_conn.execute("SELECT 1")
+
+
+def test_stale_writer_returns_structured_reload_required_over_stdio(tmp_path):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    stored_version = "9.9.9"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE finance_release SET version = ? WHERE id = 1",
+        (stored_version,),
+    )
+    conn.commit()
+    conn.close()
+    before = _full_database_snapshot(db)
+
+    missing_db = tmp_path / "missing.sqlite"
+    malformed_db = tmp_path / "malformed.sqlite"
+    _prepare_database(malformed_db, "current")
+    conn = sqlite3.connect(malformed_db)
+    conn.execute(
+        "UPDATE finance_release SET version = 'not-semver' WHERE id = 1"
+    )
+    conn.commit()
+    conn.close()
+    malformed_before = _full_database_snapshot(malformed_db)
+
+    async def call_tools():
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "financial_agent.server"],
+            cwd=Path(__file__).parents[1],
+        )
+        async with stdio_client(parameters) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                stale_result = await session.call_tool(
+                    "set_goal",
+                    {
+                        "name": "Transport probe",
+                        "target_amount": 1,
+                        "db_path": str(db),
+                    },
+                )
+                missing_result = await session.call_tool(
+                    "set_goal",
+                    {
+                        "name": "Missing database probe",
+                        "target_amount": 1,
+                        "db_path": str(missing_db),
+                    },
+                )
+                malformed_result = await session.call_tool(
+                    "set_goal",
+                    {
+                        "name": "Malformed release probe",
+                        "target_amount": 1,
+                        "db_path": str(malformed_db),
+                    },
+                )
+                unrelated_result = await session.call_tool("unknown_tool", {})
+                return (
+                    stale_result,
+                    missing_result,
+                    malformed_result,
+                    unrelated_result,
+                )
+
+    result, missing_result, malformed_result, unrelated_result = anyio.run(call_tools)
+    expected = {
+        "status": "reload_required",
+        "reload_required": True,
+        "write_applied": False,
+        "runtime_version": build_info.VERSION,
+        "stored_version": stored_version,
+        "message": (
+            f"Release record does not match running version {build_info.VERSION}. "
+            "Reload the finance server and retry."
+        ),
+    }
+
+    assert result.isError is True
+    assert result.structuredContent == expected
+    assert len(result.content) == 1
+    assert result.content[0].type == "text"
+    assert json.loads(result.content[0].text) == expected
+    assert missing_result.isError is True
+    assert missing_result.structuredContent is None
+    assert "release record could not be read" in missing_result.content[0].text.lower()
+    assert malformed_result.isError is True
+    assert malformed_result.structuredContent is None
+    assert "invalid release record version" in malformed_result.content[0].text.lower()
+    assert unrelated_result.isError is True
+    assert unrelated_result.structuredContent is None
+    assert "unknown tool" in unrelated_result.content[0].text.lower()
+    assert not missing_db.exists()
+    assert _full_database_snapshot(malformed_db) == malformed_before
+    assert _full_database_snapshot(db) == before
+
+
+def test_in_transaction_release_recheck_returns_new_stored_version_without_write(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    goals_before = _database_snapshot(db)["goals"]
+    stored_version = "9999.0.0"
+    real_precheck = release_gate.require_current_release
+    helper_calls = []
+
+    def advance_after_precheck(db_path):
+        real_precheck(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE finance_release SET version = ? WHERE id = 1",
+            (stored_version,),
+        )
+        conn.commit()
+        conn.close()
+
+    def helper_spy(*args, **kwargs):
+        helper_calls.append((args, kwargs))
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(release_gate, "require_current_release", advance_after_precheck)
+    monkeypatch.setattr(server, "set_goal_for_db", helper_spy)
+
+    async def call_tool():
+        return await server.mcp.call_tool(
+            "set_goal",
+            {
+                "name": "In-lock probe",
+                "target_amount": 1,
+                "db_path": str(db),
+            },
+        )
+
+    result = anyio.run(call_tool)
+
+    assert result.isError is True
+    assert result.structuredContent == {
+        "status": "reload_required",
+        "reload_required": True,
+        "write_applied": False,
+        "runtime_version": build_info.VERSION,
+        "stored_version": stored_version,
+        "message": (
+            f"Release record does not match running version {build_info.VERSION}. "
+            "Reload the finance server and retry."
+        ),
+    }
+    assert helper_calls == []
+    assert _database_snapshot(db)["goals"] == goals_before
+    assert _release_version(db) == stored_version

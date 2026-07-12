@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 
 from .calendar_facts import (
     import_calendar_facts as import_calendar_facts_for_db,
@@ -110,7 +114,12 @@ from .todoist_outbox import (
     surface_to_todoist as surface_to_todoist_for_db,
     update_todoist_task as update_todoist_task_impl,
 )
-from .release_gate import guarded_read, guarded_write, require_current_release
+from .release_gate import (
+    StaleReleaseError,
+    guarded_read,
+    guarded_write,
+    require_current_release,
+)
 from .status import default_db_path
 from .status import get_finance_status as build_finance_status
 from .debts import (
@@ -136,7 +145,25 @@ from .surface_queue import (
 )
 
 
-mcp = FastMCP("financial-agent")
+class FinanceMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict):
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as error:
+            cause = error.__cause__
+            if not isinstance(cause, StaleReleaseError) or not cause.requires_reload:
+                raise
+            payload = cause.reload_required_payload()
+            return CallToolResult(
+                content=[
+                    TextContent(type="text", text=json.dumps(payload, sort_keys=True))
+                ],
+                structuredContent=payload,
+                isError=True,
+            )
+
+
+mcp = FinanceMCP("financial-agent")
 
 
 def _list_result(items, total: int | None = None, more: int | None = None) -> dict:

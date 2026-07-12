@@ -14,6 +14,30 @@ from .schema import LATEST_SCHEMA_VERSION, ensure_app_schema, get_schema_version
 class StaleReleaseError(RuntimeError):
     """Raised when a database cannot be verified for this release."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        stored_version: str | None = None,
+        requires_reload: bool = False,
+    ):
+        super().__init__(message)
+        self.runtime_version = VERSION
+        self.stored_version = stored_version
+        self.requires_reload = requires_reload
+
+    def reload_required_payload(self) -> dict[str, object]:
+        if not self.requires_reload:
+            raise ValueError("This release failure does not require a server reload")
+        return {
+            "status": "reload_required",
+            "reload_required": True,
+            "write_applied": False,
+            "runtime_version": self.runtime_version,
+            "stored_version": self.stored_version,
+            "message": str(self),
+        }
+
 
 class IncompatibleSchemaError(RuntimeError):
     """Raised when a database schema does not match this release."""
@@ -30,7 +54,9 @@ class ReleaseStatus:
 def _semantic_version(version: str) -> tuple[int, int, int]:
     parts = version.split(".") if isinstance(version, str) else []
     if len(parts) != 3 or any(not part.isdigit() for part in parts):
-        raise StaleReleaseError(f"Invalid release version: {version!r}")
+        raise StaleReleaseError(
+            f"Invalid release record version: {version!r}", stored_version=version
+        )
     return tuple(map(int, parts))
 
 
@@ -44,10 +70,15 @@ def require_current_release_connection(conn: sqlite3.Connection) -> None:
     except sqlite3.Error as exc:
         raise StaleReleaseError("Release record could not be read") from exc
 
-    if row is None or row[0] != VERSION:
+    if row is None:
+        raise StaleReleaseError("Release record is missing")
+    if row[0] != VERSION:
+        _semantic_version(row[0])
         raise StaleReleaseError(
             f"Release record does not match running version {VERSION}. "
-            "Reload the finance server and retry."
+            "Reload the finance server and retry.",
+            stored_version=row[0],
+            requires_reload=True,
         )
     _semantic_version(row[0])
 
@@ -100,7 +131,9 @@ def promote_release(db_path: str) -> None:
             ).fetchone()
             if row is not None and _semantic_version(row[0]) > _semantic_version(VERSION):
                 raise StaleReleaseError(
-                    f"Release {row[0]} is newer than running version {VERSION}"
+                    f"Release {row[0]} is newer than running version {VERSION}",
+                    stored_version=row[0],
+                    requires_reload=True,
                 )
         ensure_app_schema(conn)
         require_current_schema_connection(conn)
@@ -125,7 +158,9 @@ def promote_release(db_path: str) -> None:
             stored_version = _semantic_version(row[0])
             if stored_version > runtime_version:
                 raise StaleReleaseError(
-                    f"Release {row[0]} is newer than running version {VERSION}"
+                    f"Release {row[0]} is newer than running version {VERSION}",
+                    stored_version=row[0],
+                    requires_reload=True,
                 )
             if stored_version < runtime_version:
                 conn.execute(
