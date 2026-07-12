@@ -14,13 +14,13 @@ def _status_db(path, *, available=9000.0, obligations=()):
     conn.executescript(
         """
         CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT, org TEXT, kind TEXT, currency TEXT);
-        CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL, recorded_at TEXT, source TEXT);
+        CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL, recorded_at TEXT, source TEXT, balance_date TEXT);
         CREATE TABLE sync_runs (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT, accounts_seen INT, transactions_inserted INT, transactions_updated INT, error TEXT);
         CREATE TABLE transactions (id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT, amount REAL, payee TEXT, description TEXT, pending INTEGER, source TEXT);
         """
     )
     conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
-    conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('chk',?,?,'2026-06-20T00:00:00+00:00','simplefin')", (available, available))
+    conn.execute("INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source,balance_date) VALUES ('chk',?,?,'2026-06-20T00:00:00+00:00','simplefin','2026-06-20')", (available, available))
     conn.execute("INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) VALUES ('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00','i',1,0,0,NULL)")
     conn.row_factory = sqlite3.Row
     ensure_app_schema(conn)

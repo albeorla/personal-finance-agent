@@ -425,21 +425,21 @@ def test_working_account_uses_tighter_stale_threshold_than_other_accounts(tmp_pa
     conn.executescript(
         """
         CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT, org TEXT, kind TEXT, currency TEXT);
-        CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL, recorded_at TEXT, source TEXT);
+        CREATE TABLE balance_snapshots (id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL, recorded_at TEXT, source TEXT, balance_date TEXT);
         CREATE TABLE sync_runs (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT, accounts_seen INT, transactions_inserted INT, transactions_updated INT, error TEXT);
         """
     )
     conn.execute("INSERT INTO accounts VALUES ('chk','PREMIER PLUS CKG (4321)','Chase','checking','USD')")
     conn.execute("INSERT INTO accounts VALUES ('card','Rewards Card (9999)','Big Bank','','USD')")
     # Both balances are 2 days old as of 2026-06-20 - over the working account's
-    # 1-day bar, under every other account's 3-day bar.
+    # same-day bar, under every other account's 3-day bar.
     conn.execute(
-        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) "
-        "VALUES ('chk',1000,1000,'2026-06-18T00:00:00+00:00','simplefin')"
+        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source,balance_date) "
+        "VALUES ('chk',1000,1000,'2026-06-18T00:00:00+00:00','simplefin','2026-06-18')"
     )
     conn.execute(
-        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) "
-        "VALUES ('card',-200,-200,'2026-06-18T00:00:00+00:00','simplefin')"
+        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source,balance_date) "
+        "VALUES ('card',-200,-200,'2026-06-18T00:00:00+00:00','simplefin','2026-06-18')"
     )
     conn.execute(
         "INSERT INTO sync_runs (started_at,finished_at,mode,accounts_seen,transactions_inserted,transactions_updated,error) "
@@ -456,11 +456,82 @@ def test_working_account_uses_tighter_stale_threshold_than_other_accounts(tmp_pa
         now=datetime(2026, 6, 20, tzinfo=UTC),
     )
 
-    assert WORKING_BALANCE_STALE_DAYS == 1
+    assert WORKING_BALANCE_STALE_DAYS == 0
     card = next(a for a in result["balances"]["accounts"] if a["account_id"] == "card")
     assert card["balance_age_days"] == 2
     assert card["balance_date_stale"] is False  # under the general 3-day bar
 
     working = result["cash_flow_projections"][0]["working_account"]
     assert working["balance_age_days"] == 2
-    assert working["balance_date_stale"] is True  # over the working-account 1-day bar
+    assert working["balance_date_stale"] is True  # over the working-account same-day bar
+
+
+def test_legacy_recorded_at_keeps_generic_freshness_without_verifying_working_cash(
+    tmp_path,
+):
+    db_path = tmp_path / "transactions.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE accounts (
+            id TEXT PRIMARY KEY, name TEXT, org TEXT, kind TEXT, currency TEXT
+        );
+        CREATE TABLE balance_snapshots (
+            id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL,
+            recorded_at TEXT, source TEXT
+        );
+        CREATE TABLE sync_runs (
+            id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT,
+            accounts_seen INT, transactions_inserted INT,
+            transactions_updated INT, error TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO accounts VALUES "
+        "('chk','Checking 4321','Chase','checking','USD')"
+    )
+    conn.execute(
+        "INSERT INTO accounts VALUES "
+        "('card','Rewards Card 9999','Big Bank','credit','USD')"
+    )
+    conn.execute(
+        "INSERT INTO balance_snapshots "
+        "(account_id,balance,available,recorded_at,source) VALUES "
+        "('chk',9000,9000,'2026-06-20T08:00:00+00:00','simplefin')"
+    )
+    conn.execute(
+        "INSERT INTO balance_snapshots "
+        "(account_id,balance,available,recorded_at,source) VALUES "
+        "('card',-200,-200,'2026-06-15T08:00:00+00:00','simplefin')"
+    )
+    conn.execute(
+        "INSERT INTO sync_runs "
+        "(started_at,finished_at,mode,accounts_seen,transactions_inserted,"
+        "transactions_updated,error) VALUES "
+        "('2026-06-20T09:58:00+00:00','2026-06-20T10:00:00+00:00',"
+        "'incremental',2,0,0,NULL)"
+    )
+    ensure_app_schema(conn)
+    conn.commit()
+    conn.close()
+
+    result = get_finance_status(
+        db_path=str(db_path),
+        working_account_id="chk",
+        start_date="2026-06-20",
+        now=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    card = next(
+        account
+        for account in result["balances"]["accounts"]
+        if account["account_id"] == "card"
+    )
+    assert card["balance_age_days"] == 5
+    assert card["balance_date_stale"] is True
+
+    working = result["cash_flow_projections"][0]["working_account"]
+    assert working["balance_date"] == "2026-06-20"
+    assert working["source_balance_date"] is None
+    assert working["balance_date_stale"] is True

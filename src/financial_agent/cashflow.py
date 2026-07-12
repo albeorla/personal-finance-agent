@@ -50,12 +50,26 @@ def build_cash_flow_projections(
     # Override the generic per-account staleness flag (status.py's
     # BALANCE_DATE_STALE_DAYS) with the working account's own, tighter bar
     # (status.py's WORKING_BALANCE_STALE_DAYS, passed in as
-    # working_balance_stale_days) so a 1-day-old checking balance reads as
-    # stale here even though it would not for e.g. a monthly card feed.
+    # working_balance_stale_days). Missing and future dates are also unverified.
     age_days = working_account.get("balance_age_days")
+    source_age_days = (
+        working_account.get("source_balance_age_days")
+        if "source_balance_age_days" in working_account
+        else age_days
+    )
     working_account = {
         **working_account,
-        "balance_date_stale": bool(age_days is not None and age_days > working_balance_stale_days),
+        "source_balance_date": (
+            working_account.get("source_balance_date")
+            if "source_balance_date" in working_account
+            else working_account.get("balance_date")
+        ),
+        "source_balance_age_days": source_age_days,
+        "balance_date_stale": bool(
+            source_age_days is None
+            or source_age_days < 0
+            or source_age_days > working_balance_stale_days
+        ),
     }
 
     projections = []
@@ -317,8 +331,11 @@ def _build_window_projection(
             "account_name": working_account["account_name"],
             "available": working_account["available"],
             "recorded_at": working_account["recorded_at"],
+            "source": working_account.get("source"),
             "balance_date": working_account.get("balance_date"),
             "balance_age_days": working_account.get("balance_age_days"),
+            "source_balance_date": working_account.get("source_balance_date"),
+            "source_balance_age_days": working_account.get("source_balance_age_days"),
             "balance_date_stale": working_account.get("balance_date_stale", False),
         },
         "starting_balance": round(float(starting_balance), 2),

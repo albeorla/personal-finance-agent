@@ -78,7 +78,7 @@ def _db(path):
         );
         CREATE TABLE IF NOT EXISTS balance_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, balance REAL,
-            available REAL, recorded_at TEXT, source TEXT
+            available REAL, recorded_at TEXT, source TEXT, balance_date TEXT
         );
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY, account_id TEXT, posted TEXT, transacted_at TEXT,
@@ -94,13 +94,13 @@ def _db(path):
     return conn
 
 
-def _checking(conn, *, available=9000.0, recorded_at="2026-06-23T00:00:00+00:00"):
+def _checking(conn, *, available=9000.0, recorded_at="2026-06-24T00:00:00+00:00"):
     conn.execute(
         "INSERT INTO accounts (id,name,org,kind,currency) VALUES ('chk','Checking 4321','Chase','checking','USD')"
     )
     conn.execute(
-        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source) VALUES ('chk',?,?,?,'simplefin')",
-        (available, available, recorded_at),
+        "INSERT INTO balance_snapshots (account_id,balance,available,recorded_at,source,balance_date) VALUES ('chk',?,?,?,'simplefin',?)",
+        (available, available, recorded_at, recorded_at[:10]),
     )
 
 

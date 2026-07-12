@@ -151,13 +151,17 @@ def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
         working_account = projections[0]["working_account"]
         return [_finding(
             "cash_floor", "guardrail:cash_floor:unverified", "medium",
-            "Cash-floor verdict is unverified because the working balance is stale; "
+            "Cash floor verdict is unverified because the working balance is stale; "
             "enter the current portal balance. If no manual correction is pinned, "
             "a fresh export that updates the working balance can also verify it.",
             {
                 "verdict": "unverified",
-                "balance_date": working_account.get("balance_date"),
-                "balance_age_days": working_account.get("balance_age_days"),
+                "account_id": working_account.get("account_id"),
+                "account_name": working_account.get("account_name"),
+                "balance_date": working_account.get("source_balance_date"),
+                "balance_age_days": working_account.get("source_balance_age_days"),
+                "balance_recorded_at": working_account.get("recorded_at"),
+                "balance_source": working_account.get("source"),
                 "would_be_breach_windows": [
                     p["window_days"] for p in projections
                     if p.get("lowest_balance") is not None and p["lowest_balance"] < CASH_FLOOR

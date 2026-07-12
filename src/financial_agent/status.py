@@ -18,12 +18,11 @@ SCHEMA_VERSION = "finance_status.v1"
 DEFAULT_WINDOWS = [7, 14, 30]
 DEFAULT_FRESHNESS_HOURS = 24
 BALANCE_DATE_STALE_DAYS = 3
-# The working (checking) account gets a tighter staleness bar than other
-# accounts: a 1-day-old checking balance can already hide a payday or a big
-# debit, so cash-danger colors should not trust it. Balance-only feeds like
+# The working (checking) account requires same-day evidence because even a
+# 1-day-old balance can hide a payday or a large debit. Balance-only feeds like
 # the Apple Card ("Updated Monthly") stay on the general 3-day threshold above
 # so they are not spuriously flagged every day.
-WORKING_BALANCE_STALE_DAYS = 1
+WORKING_BALANCE_STALE_DAYS = 0
 
 
 def default_db_path() -> Path:
@@ -254,8 +253,12 @@ def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> 
     as_of_date = as_of or date.today()
     accounts = []
     for row in rows:
-        balance_date = _snapshot_date(row["balance_date"]) or _snapshot_date(row["recorded_at"])
+        source_balance_date = _snapshot_date(row["balance_date"])
+        balance_date = source_balance_date or _snapshot_date(row["recorded_at"])
         age_days = (as_of_date - balance_date).days if balance_date else None
+        source_age_days = (
+            (as_of_date - source_balance_date).days if source_balance_date else None
+        )
         accounts.append(
             {
                 "account_id": row["account_id"],
@@ -268,6 +271,10 @@ def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> 
                 "recorded_at": row["recorded_at"],
                 "balance_date": balance_date.isoformat() if balance_date else None,
                 "balance_age_days": age_days,
+                "source_balance_date": (
+                    source_balance_date.isoformat() if source_balance_date else None
+                ),
+                "source_balance_age_days": source_age_days,
                 "balance_date_stale": bool(age_days is not None and age_days > BALANCE_DATE_STALE_DAYS),
                 "source": row["source"],
             }

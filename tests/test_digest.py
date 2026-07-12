@@ -13,7 +13,7 @@ def _status_db(
     *,
     available,
     obligations=(),
-    balance_date=None,
+    balance_date="2026-06-20",
     recorded_at="2026-06-20T00:00:00+00:00",
     sync_started_at="2026-06-20T09:58:00+00:00",
     sync_finished_at="2026-06-20T10:00:00+00:00",
@@ -348,6 +348,7 @@ def test_status_color_capped_yellow_when_working_balance_stale_even_below_floor(
     db = _status_db(
         tmp_path / "d.sqlite",
         available=1000.0,  # below the $2,500 floor
+        balance_date="2026-06-18",
         recorded_at="2026-06-18T00:00:00+00:00",
         sync_started_at="2026-06-20T09:58:00+00:00",
         sync_finished_at="2026-06-20T10:00:00+00:00",
@@ -361,17 +362,17 @@ def test_status_color_capped_yellow_when_working_balance_stale_even_below_floor(
     assert "confirm the live balance" in digest["status_reason"]
 
 
-def test_status_color_not_capped_when_working_balance_is_one_day_old(tmp_path):
-    """A 1-day-old working balance is at the bar, not over it - stays fresh, so
-    a real floor breach still reads RED (regression guard on the >1 boundary)."""
+def test_status_color_capped_when_working_balance_is_one_day_old(tmp_path):
+    """A 1-day-old working balance cannot verify today's cash-floor verdict."""
     db = _status_db(
         tmp_path / "d.sqlite",
         available=1000.0,  # below the $2,500 floor
+        balance_date="2026-06-19",
         recorded_at="2026-06-19T00:00:00+00:00",
         sync_started_at="2026-06-20T09:58:00+00:00",
         sync_finished_at="2026-06-20T10:00:00+00:00",
     )
     digest = build_daily_digest(db, as_of_date="2026-06-20")
 
-    assert digest["balances"]["working_account_balance_date_stale"] is False
-    assert digest["status_color"] == "RED"
+    assert digest["balances"]["working_account_balance_date_stale"] is True
+    assert digest["status_color"] == "YELLOW"

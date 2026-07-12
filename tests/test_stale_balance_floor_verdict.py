@@ -14,7 +14,7 @@ from financial_agent.guardrails import (
     list_guardrail_findings,
 )
 from financial_agent.schema import ensure_app_schema
-from financial_agent.status import WORKING_BALANCE_STALE_DAYS, get_finance_status
+from financial_agent.status import get_finance_status
 from financial_agent.surface_queue import get_surface_queue
 
 
@@ -213,13 +213,13 @@ def test_server_surface_queue_suppresses_stale_cash_floor_warning(tmp_path):
     ("available", "expected_breach_windows"),
     [(9000.0, []), (1000.0, [7, 14, 30])],
 )
-def test_one_day_old_working_balance_keeps_verified_floor_behavior(
+def test_same_day_working_balance_keeps_verified_floor_behavior(
     tmp_path, available, expected_breach_windows
 ):
     conn = _finance_db(
         tmp_path / "finance.sqlite",
         available=available,
-        balance_date="2026-07-10",
+        balance_date=AS_OF,
     )
 
     findings = _cash_floor_findings(
@@ -231,6 +231,33 @@ def test_one_day_old_working_balance_keeps_verified_floor_behavior(
         )
     )
 
-    assert WORKING_BALANCE_STALE_DAYS == 1
     assert not any(f["evidence"].get("verdict") == "unverified" for f in findings)
     assert [f["evidence"]["window_days"] for f in findings] == expected_breach_windows
+
+
+@pytest.mark.parametrize(
+    "balance_date",
+    ["2026-07-10", None, "not-a-date", "2026-07-12"],
+    ids=["yesterday", "missing", "malformed", "future"],
+)
+def test_cash_floor_requires_same_day_source_backed_balance(tmp_path, balance_date):
+    conn = _finance_db(
+        tmp_path / "finance.sqlite",
+        available=9000.0,
+        balance_date=balance_date,
+    )
+
+    findings = _cash_floor_findings(
+        evaluate_guardrails(
+            conn,
+            as_of_date=AS_OF,
+            drift_findings=[],
+            now=NOW,
+        )
+    )
+
+    assert len(findings) == 1
+    evidence = findings[0]["evidence"]
+    assert evidence["verdict"] == "unverified"
+    assert evidence["balance_source"] == "simplefin"
+    assert evidence["balance_recorded_at"] == f"{AS_OF}T10:00:00+00:00"
