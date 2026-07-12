@@ -138,8 +138,6 @@ def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
 
     if accounts is None:
         accounts = _latest_balances(conn, as_of=as_of)
-    if not accounts:
-        return []
     projections, _ = build_cash_flow_projections(
         conn,
         accounts=accounts,
@@ -147,7 +145,25 @@ def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
         start_date=as_of,
         working_balance_stale_days=WORKING_BALANCE_STALE_DAYS,
     )
-    if projections and projections[0]["working_account"]["balance_date_stale"]:
+    if not projections:
+        return [_finding(
+            "cash_floor", "guardrail:cash_floor:unverified", "medium",
+            "Cash floor verdict is unverified because no working balance evidence "
+            "exists; enter the current portal balance or provide a fresh export "
+            "that updates the working balance.",
+            {
+                "verdict": "unverified",
+                "reason": "missing_working_balance",
+                "account_id": None,
+                "account_name": None,
+                "balance_date": None,
+                "balance_age_days": None,
+                "balance_recorded_at": None,
+                "balance_source": None,
+                "would_be_breach_windows": None,
+            },
+        )]
+    if projections[0]["working_account"]["balance_date_stale"]:
         working_account = projections[0]["working_account"]
         return [_finding(
             "cash_floor", "guardrail:cash_floor:unverified", "medium",

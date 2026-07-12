@@ -261,3 +261,68 @@ def test_cash_floor_requires_same_day_source_backed_balance(tmp_path, balance_da
     assert evidence["verdict"] == "unverified"
     assert evidence["balance_source"] == "simplefin"
     assert evidence["balance_recorded_at"] == f"{AS_OF}T10:00:00+00:00"
+
+
+def test_missing_working_balance_surfaces_unverified_everywhere(tmp_path):
+    db_path = tmp_path / "finance.sqlite"
+    conn = sqlite3.connect(db_path)
+    ensure_source_tables(conn)
+    ensure_app_schema(conn)
+    conn.commit()
+    conn.close()
+
+    status = get_finance_status(db_path=db_path, start_date=AS_OF, now=NOW)
+    digest = build_daily_digest(str(db_path), as_of_date=AS_OF, now=NOW)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    queue = get_surface_queue(conn, as_of_date=AS_OF)
+    conn.close()
+
+    assert digest["status_color"] == "YELLOW"
+    assert "all guardrails pass" not in render_digest_markdown(
+        digest, verbose=True
+    ).lower()
+    assert "no working cash account found for cash-flow projection" in status["warnings"]
+    assert status["balances"]["accounts"] == []
+    assert status["cash_flow_projections"] == []
+
+    status_floor = _cash_floor_findings({"findings": status["guardrail_findings"]})
+    assert len(status_floor) == 1
+    assert status_floor[0]["evidence"] == {
+        "verdict": "unverified",
+        "reason": "missing_working_balance",
+        "account_id": None,
+        "account_name": None,
+        "balance_date": None,
+        "balance_age_days": None,
+        "balance_recorded_at": None,
+        "balance_source": None,
+        "would_be_breach_windows": None,
+    }
+
+    floor_items = [
+        item
+        for item in queue["items"]
+        if item["type"] == "guardrail_warning"
+        and item["evidence"].get("rule_type") == "cash_floor"
+    ]
+    assert len(floor_items) == 1
+    assert not any(item["type"] == "confirm_live_balance" for item in queue["items"])
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    evaluate_guardrails(
+        conn,
+        as_of_date=AS_OF,
+        drift_findings=[],
+        now=NOW,
+        persist=True,
+    )
+    rows = list_guardrail_findings(
+        conn, evaluation_date=AS_OF, rule_type="cash_floor"
+    )
+    conn.close()
+
+    assert len(rows) == 1
+    assert rows[0]["passed"] is False
+    assert rows[0]["finding"]["evidence"]["reason"] == "missing_working_balance"

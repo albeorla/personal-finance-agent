@@ -197,7 +197,7 @@ wheels = [
 
 [[package]]
 name = "financial-agent"
-version = "0.3.24"
+version = "0.3.25"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
