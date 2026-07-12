@@ -8,7 +8,7 @@ from pathlib import Path
 # Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
 # a fresh DB ends at this version after ensure_app_schema runs. When adding a
 # migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 
 def _migrate_to_v1(conn: sqlite3.Connection) -> None:
@@ -617,6 +617,22 @@ def _migrate_to_v5(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v6(conn: sqlite3.Connection) -> None:
+    """Persist rejected generic-check suggestion pairs."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS check_suggestion_rejections (
+            suggestion_id TEXT PRIMARY KEY,
+            obligation_instance_id TEXT NOT NULL,
+            transaction_id TEXT NOT NULL,
+            rejected_at TEXT NOT NULL,
+            UNIQUE (obligation_instance_id, transaction_id)
+        )
+        """
+    )
+
+
 # Ordered migration registry: (target version, idempotent apply function).
 # Append-only; never reorder or renumber existing entries.
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
@@ -625,6 +641,7 @@ _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (3, _migrate_to_v3),
     (4, _migrate_to_v4),
     (5, _migrate_to_v5),
+    (6, _migrate_to_v6),
 ]
 
 

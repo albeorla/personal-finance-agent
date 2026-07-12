@@ -79,6 +79,11 @@ from .reconciliation import (
     reconcile_obligation_instances as reconcile_obligation_instances_for_db,
     unconfirm_reconciliation_match as unconfirm_reconciliation_match_for_db,
 )
+from .check_suggestions import (
+    confirm_check_suggestion as confirm_check_suggestion_for_db,
+    list_check_suggestions as list_check_suggestions_for_db,
+    reject_check_suggestion as reject_check_suggestion_for_db,
+)
 from .statements import (
     aggregate_statement_inputs as aggregate_statement_inputs_for_db,
     get_statement_status as get_statement_status_for_db,
@@ -2611,6 +2616,68 @@ def unconfirm_reconciliation_match(instance_id: str, db_path: str | None = None)
     conn.row_factory = sqlite3.Row
     try:
         result = unconfirm_reconciliation_match_for_db(conn, instance_id)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_check_suggestions(as_of_date: str | None = None, db_path: str | None = None) -> dict:
+    """List advisory matches between posted generic checks and expected bills."""
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return _list_result(list_check_suggestions_for_db(conn, as_of_date=as_of_date))
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def reject_check_suggestion(suggestion_id: str, db_path: str | None = None) -> dict:
+    """Durably reject one advisory bill/check pair without changing the bill."""
+
+    import sqlite3
+
+    resolved_db_path = db_path or str(default_db_path())
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        result = reject_check_suggestion_for_db(conn, suggestion_id)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def confirm_check_suggestion(
+    suggestion_id: str,
+    as_of_date: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """Confirm an eligible bill/check pair and return the refreshed projection."""
+
+    import sqlite3
+    from datetime import date
+
+    resolved_db_path = db_path or str(default_db_path())
+    as_of = date.fromisoformat(as_of_date) if as_of_date else date.today()
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        from .status import _latest_balances
+
+        result = confirm_check_suggestion_for_db(
+            conn,
+            suggestion_id,
+            as_of_date=as_of,
+            accounts=_latest_balances(conn, as_of=as_of),
+        )
         conn.commit()
         return result
     finally:
