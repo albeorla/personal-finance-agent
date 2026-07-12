@@ -2386,32 +2386,22 @@ def unconfirm_reconciliation_match(instance_id: str, db_path: str | None = None)
 def list_check_suggestions(as_of_date: str | None = None, db_path: str | None = None) -> dict:
     """List advisory matches between posted generic checks and expected bills."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        return _list_result(list_check_suggestions_for_db(conn, as_of_date=as_of_date))
-    finally:
-        conn.close()
+    with guarded_read(resolved_db_path) as (conn, release_status):
+        result = _list_result(
+            list_check_suggestions_for_db(conn, as_of_date=as_of_date)
+        )
+    return {**result, "release_warning": release_status.warning}
 
 
 @mcp.tool()
 def reject_check_suggestion(suggestion_id: str, db_path: str | None = None) -> dict:
     """Durably reject one advisory bill/check pair without changing the bill."""
 
-    import sqlite3
-
     resolved_db_path = db_path or str(default_db_path())
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         result = reject_check_suggestion_for_db(conn, suggestion_id)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()
@@ -2422,14 +2412,11 @@ def confirm_check_suggestion(
 ) -> dict:
     """Confirm an eligible bill/check pair and return the refreshed projection."""
 
-    import sqlite3
     from datetime import date
 
     resolved_db_path = db_path or str(default_db_path())
     as_of = date.fromisoformat(as_of_date) if as_of_date else date.today()
-    conn = sqlite3.connect(resolved_db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    with guarded_write(resolved_db_path) as conn:
         from .status import _latest_balances
 
         result = confirm_check_suggestion_for_db(
@@ -2438,10 +2425,7 @@ def confirm_check_suggestion(
             as_of_date=as_of,
             accounts=_latest_balances(conn, as_of=as_of),
         )
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    return result
 
 
 @mcp.tool()

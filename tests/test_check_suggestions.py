@@ -8,6 +8,7 @@ import pytest
 
 from financial_agent.obligations import apply_obligation_instances
 from financial_agent.reconciliation import confirm_reconciliation_match
+from financial_agent.release_gate import promote_release
 from financial_agent.schema import ensure_app_schema
 
 
@@ -272,8 +273,17 @@ def test_generic_check_suggestion_reject_confirm_and_projection_lifecycle(tmp_pa
     )
     assert pre_due["evidence"]["date"]["delta_days"] == -4
     conn.close()
+    promote_release(str(db_path))
 
     server = importlib.import_module("financial_agent.server")
+    listed = server.list_check_suggestions(
+        as_of_date="2026-08-06", db_path=str(db_path)
+    )
+    assert listed["release_warning"] is None
+    assert august["suggestion_id"] in {
+        item["suggestion_id"] for item in listed["items"]
+    }
+
     with pytest.raises(ValueError, match="no longer eligible"):
         server.confirm_check_suggestion(
             suggestion_id=future["suggestion_id"],

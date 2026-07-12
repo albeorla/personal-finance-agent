@@ -4,6 +4,7 @@ import ast
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -426,6 +427,23 @@ REMAINING_DB_MUTATION_WRITERS = [
             "lookback_days": 10,
             "incremental": True,
         },
+    ),
+    (
+        "reject_check_suggestion",
+        "reject_check_suggestion_for_db",
+        {"suggestion_id": "suggestion-test"},
+        ("suggestion-test",),
+        {},
+    ),
+    (
+        "confirm_check_suggestion",
+        "confirm_check_suggestion_for_db",
+        {
+            "suggestion_id": "suggestion-test",
+            "as_of_date": "2026-07-11",
+        },
+        ("suggestion-test",),
+        {"as_of_date": date(2026, 7, 11), "accounts": []},
     ),
 ]
 
@@ -2015,6 +2033,46 @@ def test_mixed_safe_read_is_read_only_and_reports_release_warning(
     assert sqlite3.connect(db).execute(
         "SELECT COUNT(*) FROM mixed_endpoint_probe"
     ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("release_state", ["current", "stale"])
+def test_check_suggestion_list_is_read_only_and_reports_release_warning(
+    tmp_path, monkeypatch, release_state
+):
+    db = tmp_path / "finance.sqlite"
+    _prepare_database(db, "current")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE check_suggestion_read_probe (value TEXT)")
+    if release_state == "stale":
+        conn.execute("UPDATE finance_release SET version = '0.0.0' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    with release_gate.guarded_read(str(db)) as (_, status):
+        expected_warning = status.warning
+    before = _full_database_snapshot(db)
+    expected = {"suggestion_id": "suggestion-test"}
+    helper_calls = []
+
+    def helper_spy(conn, *, as_of_date=None):
+        assert conn.row_factory is sqlite3.Row
+        helper_calls.append(as_of_date)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO check_suggestion_read_probe VALUES ('write')")
+        return [expected]
+
+    monkeypatch.setattr(server, "list_check_suggestions_for_db", helper_spy)
+
+    result = server.list_check_suggestions(
+        as_of_date="2026-07-11", db_path=str(db)
+    )
+
+    assert result == {
+        "items": [expected],
+        "count": 1,
+        "release_warning": expected_warning,
+    }
+    assert helper_calls == ["2026-07-11"]
+    assert _full_database_snapshot(db) == before
 
 
 def test_obligation_migration_dry_run_allows_stale_release_without_any_writes(
