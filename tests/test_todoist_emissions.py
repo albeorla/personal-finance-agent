@@ -559,6 +559,37 @@ def test_completed_task_marks_emission_resolved(tmp_path):
     assert row["status"] == "completed"
 
 
+def test_check_suggestion_checkbox_never_counts_as_financial_approval(tmp_path):
+    conn = _db(tmp_path / "f.db")
+    key = "check-suggestion:rent-check-1233"
+    _seed_open_emission(conn, key, "T1")
+
+    reconciled = _reconcile(
+        conn, lambda token, task_id: {"id": task_id, "checked": True}
+    )
+
+    assert reconciled["resolved"] == 0
+    assert reconciled["review_tasks_to_resurface"] == 1
+    assert conn.execute(
+        "SELECT status FROM todoist_emissions WHERE surface_key = ?", (key,)
+    ).fetchone()["status"] == "retired"
+
+    created = surface_to_todoist(
+        conn,
+        [{"surface_key": key, "content": "Review check match: Rent"}],
+        AS_OF,
+        write_enabled=True,
+        token="tok",
+        project_id="proj",
+        send_func=lambda token, path, body, **kw: {"id": "T2"},
+    )
+    assert created["created"] == 1
+    assert tuple(conn.execute(
+        "SELECT todoist_task_id, status FROM todoist_emissions WHERE surface_key = ?",
+        (key,),
+    ).fetchone()) == ("T2", "open")
+
+
 def test_is_completed_alias_also_resolves(tmp_path):
     conn = _db(tmp_path / "f.db")
     _seed_open_emission(conn, "snapshot-due:ACT-1", "T1")

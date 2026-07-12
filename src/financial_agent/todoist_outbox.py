@@ -790,9 +790,11 @@ def reconcile_todoist_completions(
     For every open ``todoist_emissions`` row, fetch the task's current state from
     Todoist (GET ``/tasks/<id>``). A 404 means the task was completed or deleted
     (it left the active-tasks endpoint); a 200 whose ``checked``/``is_completed``/
-    ``completed_at`` is set means the user checked it off. Either way the emission
-    is marked resolved so ``surface_to_todoist`` never recreates it, and any
-    follow-up linked by a ``followup:<id>`` surface_key is resolved too.
+    ``completed_at`` is set means the user checked it off. Most emissions are
+    marked resolved so ``surface_to_todoist`` never recreates them, and any
+    follow-up linked by a ``followup:<id>`` surface_key is resolved too. Financial
+    check suggestions are the exception: a Todoist checkbox is not approval, so
+    their emission is retired and recreated until an explicit confirm or reject.
 
     Gated by ``TODOIST_WRITE_ENABLED`` (and a configured token), exactly like the
     other Todoist calls: when the gate is closed this makes NO external call and
@@ -819,6 +821,7 @@ def reconcile_todoist_completions(
         "integration_enabled": live,
         "checked": 0,
         "resolved": 0,
+        "review_tasks_to_resurface": 0,
         "followups_resolved": 0,
         "still_open": 0,
         "failed": 0,
@@ -851,6 +854,16 @@ def reconcile_todoist_completions(
         else:
             summary["still_open"] += 1
             summary["items"].append({"surface_key": key, "action": "unchanged"})
+            continue
+
+        if key.startswith("check-suggestion:"):
+            mark_emission_status(conn, key, "retired")
+            summary["review_tasks_to_resurface"] += 1
+            summary["items"].append({
+                "surface_key": key,
+                "action": "retired_for_resurface",
+                "reason": "review checkbox does not approve a financial suggestion",
+            })
             continue
 
         mark_emission_status(conn, key, disposition)

@@ -317,3 +317,127 @@ def test_generic_check_suggestion_reject_confirm_and_projection_lifecycle(tmp_pa
             competition["suggestion_id"],
             as_of_date="2026-08-06",
         )
+
+
+def test_daily_surface_shows_check_match_evidence_and_retires_decided_pair(
+    tmp_path, monkeypatch
+):
+    """Pending generic-check matches reach Todoist and disappear after a decision."""
+    conn = _db(tmp_path / "checks.sqlite")
+    rent = _bill(conn, "rent", "Rent", "2026-07-01", -3000.0)
+    _bill(conn, "studio", "Studio rent", "2026-07-02", -2999.0)
+    conn.execute(
+        """
+        INSERT INTO transactions
+            (id,account_id,posted,amount,payee,description,pending,source)
+        VALUES ('check-july','ACT-chk','2026-07-05T09:00:00',-3000.0,
+                'CHECK 1233','CHECK 1233',0,'simplefin')
+        """
+    )
+    conn.commit()
+
+    check_suggestions = importlib.import_module("financial_agent.check_suggestions")
+    surface_queue = importlib.import_module("financial_agent.surface_queue")
+    suggestions = check_suggestions.list_check_suggestions(
+        conn, as_of_date="2026-07-12"
+    )
+    suggestion = next(
+        item
+        for item in suggestions
+        if item["bill"]["instance_id"] == rent
+    )
+    surface_key = f"check-suggestion:{suggestion['suggestion_id']}"
+    expected_keys = {
+        f"check-suggestion:{item['suggestion_id']}" for item in suggestions
+    }
+
+    before = "\n".join(conn.iterdump())
+    items = surface_queue.build_surface_items(conn, as_of_date="2026-07-12")
+    assert "\n".join(conn.iterdump()) == before
+    assert expected_keys <= {item["surface_key"] for item in items}
+
+    item = next(candidate for candidate in items if candidate["surface_key"] == surface_key)
+    assert item["content"] == "Review check match: Rent"
+    assert item["due_date"] == "2026-07-12"
+    assert "$3,000.00" in item["description"]
+    assert "due 2026-07-01" in item["description"]
+    assert "posted 2026-07-05" in item["description"]
+    assert "CHECK 1233" in item["description"]
+    assert "PREMIER PLUS CKG (4321)" in item["description"]
+    assert "Ambiguous: yes (2 eligible bills)" in item["description"]
+    assert suggestion["suggestion_id"] in item["description"]
+    assert "Tell the agent approve to mark this bill paid" in item["description"]
+    assert "Checking this Todoist task is not financial approval." in item["description"]
+
+    conn.executemany(
+        """
+        INSERT INTO todoist_emissions (
+            surface_key, todoist_task_id, status, content_hash, created_at, last_seen
+        ) VALUES (?, ?, 'open', 'hash', 'now', 'now')
+        """,
+        [
+            (key, f"todoist-check-match-{index}")
+            for index, key in enumerate(sorted(expected_keys), start=1)
+        ],
+    )
+    check_suggestions.reject_check_suggestion(conn, suggestion["suggestion_id"])
+    confirmed_suggestion = next(
+        item for item in suggestions if item["suggestion_id"] != suggestion["suggestion_id"]
+    )
+    check_suggestions.confirm_check_suggestion(
+        conn,
+        confirmed_suggestion["suggestion_id"],
+        as_of_date="2026-07-12",
+    )
+    monkeypatch.setattr(
+        surface_queue, "list_charge_onboarding_queue", lambda _conn: [{"id": "active"}]
+    )
+    retire_keys = surface_queue.build_surface_retire_keys(
+        conn, as_of_date="2026-07-12"
+    )
+    assert set(retire_keys) == expected_keys
+    assert "onboarding-digest" not in retire_keys
+
+    deleted: list[str] = []
+
+    def delete(_token, task_id):
+        deleted.append(task_id)
+        return True
+
+    todoist_outbox = importlib.import_module("financial_agent.todoist_outbox")
+    result = todoist_outbox.surface_to_todoist(
+        conn,
+        [],
+        "2026-07-12",
+        write_enabled=True,
+        token="token",
+        project_id="project",
+        retire_keys=retire_keys,
+        delete_func=delete,
+    )
+    assert result["retired"] == 2
+    assert set(deleted) == {"todoist-check-match-1", "todoist-check-match-2"}
+    assert {
+        row["status"]
+        for row in conn.execute(
+            "SELECT status FROM todoist_emissions WHERE surface_key LIKE 'check-suggestion:%'"
+        )
+    } == {"retired"}
+
+    unknown_key = "check-suggestion:unknown-read-state"
+    conn.execute(
+        """
+        INSERT INTO todoist_emissions (
+            surface_key, todoist_task_id, status, content_hash, created_at, last_seen
+        ) VALUES (?, 'todoist-unknown', 'open', 'hash', 'now', 'now')
+        """,
+        (unknown_key,),
+    )
+
+    def fail_listing(*_args, **_kwargs):
+        raise sqlite3.OperationalError("source unavailable")
+
+    monkeypatch.setattr(surface_queue, "list_check_suggestions", fail_listing)
+    assert unknown_key not in surface_queue.build_surface_retire_keys(
+        conn, as_of_date="2026-07-12"
+    )

@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
+from .check_suggestions import list_check_suggestions
 from .config import get_finance_config
 from .follow_ups import list_due_followups
 from .goals import list_goals
@@ -236,9 +237,10 @@ def build_surface_items(
       bills due within the lead window
     - ``estimate-review:<obligation_id>:<cycle>`` from obligations past review
     - ``snapshot-due:<account>`` from stale balance-only account snapshots
+    - ``check-suggestion:<id>`` from generic checks that may pay a known bill
 
     Read-only. Returns items in a deterministic order (follow-ups, goals,
-    manual-due, estimates, snapshots) for stable re-runs.
+    manual-due, estimates, snapshots, check suggestions) for stable re-runs.
     """
 
     ensure_app_schema(conn)
@@ -249,6 +251,7 @@ def build_surface_items(
     items += _manual_obligation_due_surface_items(conn, as_of)
     items += _estimate_review_surface_items(conn, as_of)
     items += _snapshot_due_surface_items(conn, as_of)
+    items += _check_suggestion_surface_items(conn, as_of)
     items += _onboarding_digest_surface_item(conn, as_of)
     items += _finance_status_surface_item(headline)
     return items
@@ -261,19 +264,70 @@ def build_surface_retire_keys(
 ) -> list[str]:
     """Read-only: surface_keys the write path should retire this run.
 
-    Currently just the singleton onboarding-digest when its queue is empty (a
-    stale digest task from a prior non-empty run must be removed). Mirrors the
-    old in-builder retire, but returns intent as DATA so the builder writes
-    nothing.
+    Returns the singleton onboarding digest when its queue is empty, plus open
+    generic-check suggestion tasks whose pair is no longer eligible after a
+    confirmation or rejection.
     """
 
     ensure_app_schema(conn)
-    _coerce_date(as_of_date)  # validate shape; the queue is not date-filtered
+    as_of = _coerce_date(as_of_date)
+    retire_keys: list[str] = []
     try:
         candidates = list_charge_onboarding_queue(conn)
     except sqlite3.OperationalError:
+        candidates = None
+    if candidates == []:
+        retire_keys.append(_ONBOARDING_DIGEST_KEY)
+
+    try:
+        active_check_keys = {
+            f"check-suggestion:{item['suggestion_id']}"
+            for item in list_check_suggestions(conn, as_of_date=as_of)
+        }
+    except sqlite3.OperationalError:
+        active_check_keys = None
+    if active_check_keys is not None:
+        rows = conn.execute(
+            "SELECT surface_key FROM todoist_emissions "
+            "WHERE status = 'open' AND surface_key LIKE 'check-suggestion:%'"
+        ).fetchall()
+        retire_keys += [row[0] for row in rows if row[0] not in active_check_keys]
+    return retire_keys
+
+
+def _check_suggestion_surface_items(
+    conn: sqlite3.Connection, as_of: date
+) -> list[dict[str, Any]]:
+    try:
+        suggestions = list_check_suggestions(conn, as_of_date=as_of)
+    except sqlite3.OperationalError:
         return []
-    return [] if candidates else [_ONBOARDING_DIGEST_KEY]
+
+    items: list[dict[str, Any]] = []
+    for suggestion in suggestions:
+        bill = suggestion["bill"]
+        transaction = suggestion["transaction"]
+        eligible = suggestion["evidence"]["competition"]["eligible_bill_count"]
+        ambiguous = "yes" if suggestion["ambiguous"] else "no"
+        suggestion_id = suggestion["suggestion_id"]
+        items.append(
+            {
+                "surface_key": f"check-suggestion:{suggestion_id}",
+                "content": f"Review check match: {bill['name']}",
+                "description": (
+                    f"Possible payment: ${_money(abs(bill['amount']))} due "
+                    f"{bill['due_date']}; CHECK {transaction['check_identifier']} "
+                    f"posted {transaction['date']} for "
+                    f"${_money(abs(transaction['amount']))} from "
+                    f"{transaction['account_name']}. Ambiguous: {ambiguous} "
+                    f"({eligible} eligible bills). Suggestion: {suggestion_id}. "
+                    "Tell the agent approve to mark this bill paid, or reject to keep it "
+                    "open. Checking this Todoist task is not financial approval."
+                ),
+                "due_date": as_of.isoformat(),
+            }
+        )
+    return items
 
 
 def _finance_status_surface_item(headline: str | None) -> list[dict[str, Any]]:
