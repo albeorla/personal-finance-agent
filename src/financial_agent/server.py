@@ -120,7 +120,7 @@ from .release_gate import (
     guarded_write,
     require_current_release,
 )
-from .status import default_db_path
+from .status import _finance_today, default_db_path
 from .status import get_finance_status as build_finance_status
 from .debts import (
     list_debts as list_debts_for_db,
@@ -195,9 +195,7 @@ def _resolve_as_of(as_of_date: str | None) -> str:
     schema fell out of context) never fail just for omitting today's date.
     """
 
-    import datetime as _dt
-
-    return as_of_date or _dt.date.today().isoformat()
+    return as_of_date or _finance_today().isoformat()
 
 
 def _has_synced_sources(conn) -> bool:
@@ -591,10 +589,8 @@ def import_card_statement(
     returns candidates; a wrong-card paste is blocked by the match floor.
     """
 
-    import datetime as _dt
-
     resolved_db_path = db_path or str(default_db_path())
-    resolved_as_of = as_of_date or _dt.date.today().isoformat()
+    resolved_as_of = _resolve_as_of(as_of_date)
     if dry_run:
         with guarded_read(resolved_db_path) as (conn, release_status):
             result = import_card_statement_for_db(
@@ -647,10 +643,8 @@ def import_checking_activity(
     returns candidates.
     """
 
-    import datetime as _dt
-
     resolved_db_path = db_path or str(default_db_path())
-    resolved_as_of = as_of_date or _dt.date.today().isoformat()
+    resolved_as_of = _resolve_as_of(as_of_date)
     if dry_run:
         with guarded_read(resolved_db_path) as (conn, release_status):
             result = import_checking_activity_for_db(

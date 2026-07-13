@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .cashflow import build_cash_flow_projections
 from .drift import detect_drift
@@ -18,11 +19,17 @@ SCHEMA_VERSION = "finance_status.v1"
 DEFAULT_WINDOWS = [7, 14, 30]
 DEFAULT_FRESHNESS_HOURS = 24
 BALANCE_DATE_STALE_DAYS = 3
+FINANCE_TIMEZONE = ZoneInfo("America/New_York")
 # The working (checking) account requires same-day evidence because even a
 # 1-day-old balance can hide a payday or a large debit. Balance-only feeds like
 # the Apple Card ("Updated Monthly") stay on the general 3-day threshold above
 # so they are not spuriously flagged every day.
 WORKING_BALANCE_STALE_DAYS = 0
+
+
+def _finance_today(now: datetime | None = None) -> date:
+    observed_at = now or datetime.now(UTC)
+    return observed_at.astimezone(FINANCE_TIMEZONE).date()
 
 
 def default_db_path() -> Path:
@@ -67,7 +74,7 @@ def get_finance_status(
     resolved_db_path = Path(db_path).expanduser() if db_path is not None else default_db_path()
     observed_at = now or datetime.now(UTC)
     requested_windows = windows or DEFAULT_WINDOWS
-    projection_start_date = _parse_date(start_date) if start_date else observed_at.date()
+    projection_start_date = _parse_date(start_date) if start_date else _finance_today(observed_at)
     trace_id = _new_id("trace")
     balances_result_id = _new_id("result")
 
@@ -250,7 +257,7 @@ def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> 
         ORDER BY a.name COLLATE NOCASE
         """
     ).fetchall()
-    as_of_date = as_of or date.today()
+    as_of_date = as_of or _finance_today()
     accounts = []
     for row in rows:
         source_balance_date = _snapshot_date(row["balance_date"])

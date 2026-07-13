@@ -13,6 +13,7 @@ from financial_agent.guardrails import (
     evaluate_guardrails,
     list_guardrail_findings,
 )
+from financial_agent.manual_balance import set_manual_balance
 from financial_agent.schema import ensure_app_schema
 from financial_agent.status import get_finance_status
 from financial_agent.surface_queue import get_surface_queue
@@ -233,6 +234,52 @@ def test_same_day_working_balance_keeps_verified_floor_behavior(
 
     assert not any(f["evidence"].get("verdict") == "unverified" for f in findings)
     assert [f["evidence"]["window_days"] for f in findings] == expected_breach_windows
+
+
+def test_manual_balance_is_fresh_until_next_new_york_day(tmp_path):
+    db_path = tmp_path / "finance.sqlite"
+    conn = _finance_db(db_path, available=8000.0, balance_date="2026-07-10")
+    set_manual_balance(conn, "Checking 4321", 9000.0, AS_OF)
+    conn.commit()
+    conn.close()
+
+    same_evening = get_finance_status(
+        db_path=db_path,
+        now=datetime(2026, 7, 12, 1, 0, tzinfo=UTC),
+    )
+    same_evening_working = same_evening["cash_flow_projections"][0]["working_account"]
+    same_evening_floor = _cash_floor_findings(
+        {"findings": same_evening["guardrail_findings"]}
+    )
+
+    assert {
+        "projection_start_date": same_evening["cash_flow_projections"][0]["start_date"],
+        "source_balance_date": same_evening_working["source_balance_date"],
+        "balance_date_stale": same_evening_working["balance_date_stale"],
+        "unverified": any(
+            finding["evidence"].get("verdict") == "unverified"
+            for finding in same_evening_floor
+        ),
+    } == {
+        "projection_start_date": AS_OF,
+        "source_balance_date": AS_OF,
+        "balance_date_stale": False,
+        "unverified": False,
+    }
+
+    next_local_day = get_finance_status(
+        db_path=db_path,
+        now=datetime(2026, 7, 12, 4, 0, tzinfo=UTC),
+    )
+    next_day_floor = _cash_floor_findings(
+        {"findings": next_local_day["guardrail_findings"]}
+    )
+
+    assert next_local_day["cash_flow_projections"][0]["start_date"] == "2026-07-12"
+    assert len(next_day_floor) == 1
+    assert next_day_floor[0]["evidence"]["verdict"] == "unverified"
+    assert next_day_floor[0]["evidence"]["balance_date"] == AS_OF
+    assert next_day_floor[0]["evidence"]["balance_age_days"] == 1
 
 
 @pytest.mark.parametrize(

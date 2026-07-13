@@ -69,15 +69,17 @@ _MATCH_FLOOR = 0.4
 _TIE_BAND = 0.1
 
 
-def _ensure_manual_note_column(conn: sqlite3.Connection) -> None:
-    """Add balance_snapshots.manual_note if missing (idempotent, non-breaking).
+def _ensure_manual_columns(conn: sqlite3.Connection) -> None:
+    """Add manual balance columns if missing (idempotent, non-breaking).
 
-    The source schema mirrors the SimpleFIN feed and has no note column, so we
-    add it here rather than in SOURCE_SCHEMA. ALTER TABLE ADD COLUMN is a no-op
-    on existing rows and safe to run repeatedly.
+    The source schema already includes balance_date, but older source tables may
+    predate it. manual_note is local-only. ALTER TABLE ADD COLUMN leaves existing
+    rows null and is safe to run repeatedly.
     """
 
     columns = {row[1] for row in conn.execute("PRAGMA table_info(balance_snapshots)").fetchall()}
+    if "balance_date" not in columns:
+        conn.execute("ALTER TABLE balance_snapshots ADD COLUMN balance_date TEXT")
     if "manual_note" not in columns:
         conn.execute("ALTER TABLE balance_snapshots ADD COLUMN manual_note TEXT")
 
@@ -305,7 +307,7 @@ def set_manual_balance(
             "message": "Multiple accounts matched; please refine account_query",
         }
 
-    _ensure_manual_note_column(conn)
+    _ensure_manual_columns(conn)
     recorded_at = _effective_recorded_at(conn, top["account_id"], as_of_date)
     # Drop any earlier manual correction for this account on the same as-of date
     # so a stale (possibly wrong-sign) manual row cannot linger and re-win
@@ -336,9 +338,10 @@ def set_manual_balance(
             sign_corrected = True
 
     conn.execute(
-        "INSERT INTO balance_snapshots (account_id, balance, available, recorded_at, source, manual_note) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (top["account_id"], corrected, corrected, recorded_at, _MANUAL_SOURCE, note),
+        "INSERT INTO balance_snapshots "
+        "(account_id, balance, available, recorded_at, source, manual_note, balance_date) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (top["account_id"], corrected, corrected, recorded_at, _MANUAL_SOURCE, note, as_of_date),
     )
 
     return {
