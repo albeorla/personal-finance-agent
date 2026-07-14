@@ -694,6 +694,9 @@ def reconcile_emission(
         ) VALUES (?, ?, 'open', ?, ?, ?)
         ON CONFLICT(surface_key) DO UPDATE SET
             todoist_task_id = excluded.todoist_task_id,
+            status = 'open',
+            content_hash = excluded.content_hash,
+            retire_requested_at = NULL,
             last_seen = excluded.last_seen
         """,
         (surface_key, todoist_task_id, content_hash, now, now),
@@ -790,11 +793,11 @@ def reconcile_todoist_completions(
     For every open ``todoist_emissions`` row, fetch the task's current state from
     Todoist (GET ``/tasks/<id>``). A 404 means the task was completed or deleted
     (it left the active-tasks endpoint); a 200 whose ``checked``/``is_completed``/
-    ``completed_at`` is set means the user checked it off. Most emissions are
-    marked resolved so ``surface_to_todoist`` never recreates them, and any
-    follow-up linked by a ``followup:<id>`` surface_key is resolved too. Financial
-    check suggestions are the exception: a Todoist checkbox is not approval, so
-    their emission is retired and recreated until an explicit confirm or reject.
+    ``completed_at`` is set means the user checked it off. Most emissions record
+    the evidence hash acknowledged by that checkbox: the same evidence stays
+    dismissed, while changed evidence can resurface. A ``followup:<id>`` resolves
+    its source record. Financial check suggestions are retired and recreated until
+    an explicit confirm or reject because a Todoist checkbox is not approval.
 
     Gated by ``TODOIST_WRITE_ENABLED`` (and a configured token), exactly like the
     other Todoist calls: when the gate is closed this makes NO external call and
@@ -894,6 +897,7 @@ def surface_to_todoist(
     project_id: str | None = None,
     env_path: str | None = None,
     send_func: Callable[..., dict[str, Any]] = _write_request,
+    list_func: Callable[..., dict[str, Any]] = _list_tasks_request,
     delete_func: Callable[..., bool] = _delete_request,
     retire_keys: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -909,8 +913,12 @@ def surface_to_todoist(
     - the in-place update returns HTTP 404 -> the task was deleted in Todoist;
       close the emission (deleted_by_user) and resolve a linked ``followup:<id>``
       follow-up so the push is never retried daily
-    - row exists + completed / deleted_by_user -> the user resolved it; mark the
-      source item resolved and do NOT recreate
+    - row exists + completed / deleted_by_user + same evidence hash -> keep that
+      evidence dismissed
+    - row exists + completed / deleted_by_user + changed evidence hash -> create
+      a new task, except true follow-ups whose source was resolved
+    - create transport is uncertain -> keep ``create_pending`` and verify the
+      embedded marker before any retry
 
     Gated by ``TODOIST_WRITE_ENABLED`` exactly like ``create_todoist_task``: when
     the gate is closed (flag off or no token/project) NO external HTTP call is
@@ -944,6 +952,7 @@ def surface_to_todoist(
         "integration_enabled": live,
         "sent": live,
         "created": 0,
+        "adopted": 0,
         "updated": 0,
         "skipped": 0,
         "resolved": 0,
@@ -1003,11 +1012,36 @@ def surface_to_todoist(
             (key,),
         ).fetchone()
 
-        # User already resolved this item by closing the task: never recreate.
+        # A true follow-up resolves its source. Every other completion only
+        # acknowledges the exact evidence hash carried by that task.
         if row is not None and row["status"] in ("completed", "deleted_by_user"):
-            summary["resolved"] += 1
-            summary["items"].append({"surface_key": key, "action": "resolved", "status": row["status"]})
-            continue
+            if _resolution_policy(key) == "source" or row["content_hash"] == new_hash:
+                summary["resolved"] += 1
+                summary["items"].append({
+                    "surface_key": key,
+                    "action": "resolved",
+                    "status": row["status"],
+                })
+                continue
+
+        if row is not None and row["status"] == "create_pending":
+            verification = _verify_pending_create(
+                conn,
+                key,
+                new_hash,
+                as_of_date=str(as_of_date),
+                token=token,
+                project_id=project_id,
+                list_func=list_func,
+            )
+            if verification["action"] == "adopted":
+                summary["adopted"] += 1
+                summary["items"].append(verification)
+                continue
+            if verification["action"] == "verify_required":
+                summary["failed"] += 1
+                summary["items"].append(verification)
+                continue
 
         # Open + unchanged: idempotent skip, no HTTP.
         if row is not None and row["status"] == "open" and row["content_hash"] == new_hash:
@@ -1058,7 +1092,9 @@ def surface_to_todoist(
             summary["items"].append({"surface_key": key, "action": "updated", "todoist_task_id": row["todoist_task_id"]})
             continue
 
-        # No ledger row: create the task, then insert the ledger row.
+        # No current task: persist intent before transport. If the response is
+        # lost, the next run verifies the marker before it is allowed to retry.
+        _record_create_intent(conn, key, new_hash)
         try:
             created = _create_surface_task(
                 token, project_id, content, description, key,
@@ -1069,33 +1105,180 @@ def surface_to_todoist(
             summary["items"].append({"surface_key": key, "action": "failed", "reason": f"{type(exc).__name__}: {exc}"[:200]})
             continue
         task_id = created.get("id")
-        # A malformed-but-200 response can omit the id. The ledger's
-        # todoist_task_id is NOT NULL, so inserting None would raise IntegrityError
-        # and abort the whole batch. Record this item failed (no ledger row, so a
-        # later run cleanly retries the create) and keep processing the rest.
+        # A malformed-but-200 response is ambiguous: keep create_pending so the
+        # next run searches for the marker before retrying.
         if not task_id:
             summary["failed"] += 1
             summary["items"].append({"surface_key": key, "action": "failed", "reason": "create returned no task id"})
             continue
         now = _now()
-        # INSERT OR REPLACE so a singleton surface_key (e.g. onboarding-digest)
-        # that was previously flipped to 'retired' resurfaces cleanly: the stale
-        # ledger row is replaced with a fresh open one rather than colliding on
-        # the surface_key primary key (rev 3 - retired must allow recreation). A
-        # genuinely new key is a plain insert. completed/deleted_by_user rows are
-        # already short-circuited above, so they never reach here.
         conn.execute(
             """
-            INSERT OR REPLACE INTO todoist_emissions (
-                surface_key, todoist_task_id, status, content_hash, created_at, last_seen
-            ) VALUES (?, ?, 'open', ?, ?, ?)
+            UPDATE todoist_emissions
+            SET todoist_task_id = ?, status = 'open', content_hash = ?,
+                created_at = ?, last_seen = ?, retire_requested_at = NULL
+            WHERE surface_key = ?
             """,
-            (key, task_id, new_hash, now, now),
+            (task_id, new_hash, now, now, key),
         )
         summary["created"] += 1
         summary["items"].append({"surface_key": key, "action": "created", "todoist_task_id": task_id})
 
     return summary
+
+
+def _resolution_policy(surface_key: str) -> str:
+    return "source" if surface_key.startswith("followup:") else "evidence"
+
+
+def _record_create_intent(
+    conn: sqlite3.Connection,
+    surface_key: str,
+    content_hash: str,
+) -> None:
+    now = _now()
+    intent_id = f"intent:{hashlib.sha256(surface_key.encode('utf-8')).hexdigest()[:24]}"
+    conn.execute(
+        """
+        INSERT INTO todoist_emissions (
+            surface_key, todoist_task_id, status, content_hash, created_at, last_seen
+        ) VALUES (?, ?, 'create_pending', ?, ?, ?)
+        ON CONFLICT(surface_key) DO UPDATE SET
+            todoist_task_id = excluded.todoist_task_id,
+            status = 'create_pending',
+            content_hash = excluded.content_hash,
+            last_seen = excluded.last_seen,
+            retire_requested_at = NULL
+        """,
+        (surface_key, intent_id, content_hash, now, now),
+    )
+    conn.commit()
+
+
+def _verify_pending_create(
+    conn: sqlite3.Connection,
+    surface_key: str,
+    content_hash: str,
+    *,
+    as_of_date: str,
+    token: str,
+    project_id: str,
+    list_func: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    report = list_todoist_project_for_db(
+        conn,
+        as_of_date=as_of_date,
+        write_enabled=False,
+        token=token,
+        project_id=project_id,
+        list_func=list_func,
+    )
+    if report.get("status") != "ok" or report.get("truncated"):
+        return {
+            "surface_key": surface_key,
+            "action": "verify_required",
+            "reason": "Todoist task list was incomplete; create not retried",
+        }
+    matches = [task for task in report["tasks"] if task.get("surface_key") == surface_key]
+    if matches:
+        task = min(matches, key=lambda item: str(item["task_id"]))
+        reconcile_emission(conn, surface_key, str(task["task_id"]), content_hash)
+        return {
+            "surface_key": surface_key,
+            "action": "adopted",
+            "todoist_task_id": str(task["task_id"]),
+        }
+    return {"surface_key": surface_key, "action": "verified_absent"}
+
+
+def verify_surface_coverage(
+    conn: sqlite3.Connection,
+    *,
+    action_queue: dict[str, Any],
+    surface_items: list[dict[str, Any]],
+    as_of_date: date | str,
+    token: str | None = None,
+    project_id: str | None = None,
+    env_path: str | None = None,
+    list_func: Callable[..., dict[str, Any]] = _list_tasks_request,
+) -> dict[str, Any]:
+    """Prove every actionable queue item has a current task or dismissal."""
+
+    ensure_app_schema(conn)
+    if token is None or project_id is None:
+        cfg = get_finance_config(env_path=env_path)
+        token = token if token is not None else cfg["todoist_api_token"]
+        project_id = project_id if project_id is not None else cfg["todoist_project_id"]
+
+    board = list_todoist_project_for_db(
+        conn,
+        as_of_date=str(as_of_date),
+        write_enabled=False,
+        token=token,
+        project_id=project_id,
+        list_func=list_func,
+    )
+    complete = board.get("status") == "ok" and not board.get("truncated")
+    managed_tasks = {
+        task["surface_key"]: task
+        for task in board.get("tasks", [])
+        if task.get("classification") == "managed" and task.get("surface_key")
+    }
+    expected_by_key = {item["surface_key"]: item for item in surface_items}
+    rows = conn.execute(
+        "SELECT surface_key, status, content_hash FROM todoist_emissions"
+    ).fetchall()
+    ledger = {row["surface_key"]: row for row in rows}
+
+    covered_open = 0
+    dismissed = 0
+    missing: list[str] = []
+    for queue_item in action_queue.get("items", []):
+        coverage = queue_item.get("coverage") or {}
+        key = coverage.get("surface_key")
+        expected = expected_by_key.get(key)
+        row = ledger.get(key)
+        if not key or expected is None or row is None:
+            missing.append(queue_item.get("id") or "unknown")
+            continue
+        expected_hash = content_hash_for(
+            expected.get("content") or "",
+            expected.get("description") or "",
+            expected.get("due_date"),
+            expected.get("priority"),
+        )
+        if row["content_hash"] != expected_hash:
+            missing.append(queue_item.get("id") or "unknown")
+        elif row["status"] == "open" and key in managed_tasks and complete:
+            live_task = managed_tasks[key]
+            if coverage.get("kind") == "rollup" and queue_item.get("id") not in (
+                live_task.get("description") or ""
+            ):
+                missing.append(queue_item.get("id") or "unknown")
+            else:
+                covered_open += 1
+        elif row["status"] in ("completed", "deleted_by_user"):
+            dismissed += 1
+        else:
+            missing.append(queue_item.get("id") or "unknown")
+
+    ok = complete and not missing
+    warnings: list[str] = []
+    if not complete:
+        warnings.append("Todoist task list was incomplete")
+    if missing:
+        warnings.append(f"{len(missing)} actionable item(s) lack current Todoist coverage")
+    return {
+        "status": "ok" if ok else "warn",
+        "ok": ok,
+        "todoist_read_complete": complete,
+        "actionable_total": len(action_queue.get("items", [])),
+        "covered_open": covered_open,
+        "dismissed_current_evidence": dismissed,
+        "missing_count": len(missing),
+        "missing": missing,
+        "warnings": warnings,
+    }
 
 
 # --- whole-project reconcile + cleanup -------------------------------------

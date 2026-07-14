@@ -22,6 +22,7 @@ from financial_agent.todoist_outbox import (
     reconcile_todoist_completions,
     surface_marker,
     surface_to_todoist,
+    verify_surface_coverage,
 )
 
 AS_OF = "2026-06-24"
@@ -164,20 +165,42 @@ def test_update_on_change_keeps_same_task(tmp_path):
 # --- completed-task-resolves-source ----------------------------------------
 
 
-def test_completed_task_resolves_source_no_recreate(tmp_path):
+def test_completed_snapshot_acknowledges_only_current_evidence(tmp_path):
     conn = _db(tmp_path / "f.db")
     spy = _Spy()
-    key = "goal:Emergency Fund:behind"
-    _enabled(conn, [{"surface_key": key, "content": "goal behind", "description": "x"}], spy)
+    key = "finance-status"
+    item = {"surface_key": key, "content": "Finance status", "description": "one warning"}
+    _enabled(conn, [item], spy)
 
-    # User completes the task in Todoist; the ledger records it.
+    # The checkbox acknowledges this exact snapshot, not every future snapshot.
+    mark_emission_status(conn, key, "completed")
+    same = _enabled(conn, [item], spy)
+    assert same["resolved"] == 1 and same["created"] == 0
+
+    changed = _enabled(
+        conn,
+        [{"surface_key": key, "content": "Finance status", "description": "two warnings"}],
+        spy,
+    )
+    assert changed["created"] == 1 and changed["resolved"] == 0
+    assert len(spy.creates) == 2
+
+
+def test_completed_followup_still_resolves_the_source_permanently(tmp_path):
+    conn = _db(tmp_path / "f.db")
+    spy = _Spy()
+    key = "followup:abc"
+    _enabled(conn, [{"surface_key": key, "content": "Call bank", "description": "today"}], spy)
     mark_emission_status(conn, key, "completed")
 
-    # Even with changed content, do not recreate or update; source is resolved.
-    r = _enabled(conn, [{"surface_key": key, "content": "changed", "description": "y"}], spy)
-    assert r["resolved"] == 1 and r["created"] == 0 and r["updated"] == 0
-    assert len(spy.creates) == 1  # still only the original create
-    assert not spy.updates
+    result = _enabled(
+        conn,
+        [{"surface_key": key, "content": "Call bank", "description": "new wording"}],
+        spy,
+    )
+
+    assert result["resolved"] == 1 and result["created"] == 0
+    assert len(spy.creates) == 1
 
 
 def test_deleted_by_user_also_resolves(tmp_path):
@@ -312,9 +335,186 @@ def test_send_failure_recorded_not_raised(tmp_path):
         send_func=boom,
     )
     assert r["failed"] == 1 and r["created"] == 0
-    # Ledger not written on failure, so a later run cleanly retries the create.
-    n = conn.execute("SELECT COUNT(*) FROM todoist_emissions").fetchone()[0]
-    assert n == 0
+    row = conn.execute(
+        "SELECT status, content_hash FROM todoist_emissions WHERE surface_key = 'followup:abc'"
+    ).fetchone()
+    assert row["status"] == "create_pending"
+
+
+def test_ambiguous_create_adopts_task_found_by_marker_before_retry(tmp_path):
+    conn = _db(tmp_path / "f.db")
+    item = {"surface_key": "snapshot-due:ACT-1", "content": "Update balance", "description": "Portal"}
+    sends = []
+
+    def lost_response(token, path, body, **kwargs):
+        pending = conn.execute(
+            "SELECT status FROM todoist_emissions WHERE surface_key = 'snapshot-due:ACT-1'"
+        ).fetchone()
+        assert pending["status"] == "create_pending"
+        sends.append(body)
+        raise TimeoutError("response lost after remote create")
+
+    first = surface_to_todoist(
+        conn, [item], AS_OF, write_enabled=True, token="tok", project_id="proj",
+        send_func=lost_response,
+    )
+    assert first["failed"] == 1 and len(sends) == 1
+
+    def found(token, project_id, *, cursor=None, timeout=30):
+        return {
+            "results": [{
+                "id": "REMOTE-1",
+                "content": "Update balance",
+                "description": "Portal\n\n[fa:snapshot-due:ACT-1]",
+                "labels": [FA_AUTO_LABEL],
+            }],
+            "next_cursor": None,
+        }
+
+    second = surface_to_todoist(
+        conn, [item], AS_OF, write_enabled=True, token="tok", project_id="proj",
+        send_func=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("blind retry")),
+        list_func=found,
+    )
+    assert second["adopted"] == 1 and second["created"] == 0
+    row = conn.execute(
+        "SELECT todoist_task_id, status FROM todoist_emissions WHERE surface_key = ?",
+        (item["surface_key"],),
+    ).fetchone()
+    assert tuple(row) == ("REMOTE-1", "open")
+
+
+def test_pending_create_does_not_retry_after_partial_todoist_read(tmp_path, monkeypatch):
+    conn = _db(tmp_path / "f.db")
+    item = {"surface_key": "snapshot-due:ACT-2", "content": "Update balance"}
+    conn.execute(
+        "INSERT INTO todoist_emissions (surface_key,todoist_task_id,status,content_hash,created_at,last_seen) "
+        "VALUES ('snapshot-due:ACT-2','intent:abc','create_pending','h','x','x')"
+    )
+    monkeypatch.setattr(tb, "MAX_LIST_PAGES", 1)
+
+    result = surface_to_todoist(
+        conn, [item], AS_OF, write_enabled=True, token="tok", project_id="proj",
+        send_func=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("blind retry")),
+        list_func=lambda token, project_id, *, cursor=None, timeout=30: {
+            "results": [], "next_cursor": "more"
+        },
+    )
+
+    assert result["failed"] == 1
+    assert result["items"][0]["action"] == "verify_required"
+
+
+def test_pending_create_retries_only_after_complete_absence_check(tmp_path):
+    conn = _db(tmp_path / "f.db")
+    item = {"surface_key": "snapshot-due:ACT-3", "content": "Update balance"}
+    conn.execute(
+        "INSERT INTO todoist_emissions (surface_key,todoist_task_id,status,content_hash,created_at,last_seen) "
+        "VALUES ('snapshot-due:ACT-3','intent:abc','create_pending','h','x','x')"
+    )
+    sends = []
+
+    result = surface_to_todoist(
+        conn, [item], AS_OF, write_enabled=True, token="tok", project_id="proj",
+        send_func=lambda token, path, body, **kwargs: sends.append(body) or {"id": "T3"},
+        list_func=lambda token, project_id, *, cursor=None, timeout=30: {
+            "results": [], "next_cursor": None
+        },
+    )
+
+    assert result["created"] == 1 and len(sends) == 1
+    assert tuple(conn.execute(
+        "SELECT todoist_task_id, status FROM todoist_emissions WHERE surface_key = 'snapshot-due:ACT-3'"
+    ).fetchone()) == ("T3", "open")
+
+
+def test_surface_coverage_accepts_open_task_or_current_evidence_dismissal(tmp_path):
+    conn = _db(tmp_path / "f.db")
+    queue = {
+        "items": [{
+            "id": "match:rent:2026-06-24",
+            "coverage": {"kind": "rollup", "surface_key": "finance-status"},
+        }]
+    }
+    surface_items = [{
+        "surface_key": "finance-status",
+        "content": "Finance status",
+        "description": "Queue member: match:rent:2026-06-24",
+    }]
+    _enabled(conn, surface_items, _Spy())
+
+    def listed(token, project_id, *, cursor=None, timeout=30):
+        return {
+            "results": [{
+                "id": "T1", "content": "Finance status",
+                "description": "Queue member: match:rent:2026-06-24\n\n[fa:finance-status]",
+                "labels": [FA_AUTO_LABEL],
+            }],
+            "next_cursor": None,
+        }
+
+    open_report = verify_surface_coverage(
+        conn, action_queue=queue, surface_items=surface_items, as_of_date=AS_OF,
+        token="tok", project_id="proj", list_func=listed,
+    )
+    assert open_report["ok"] is True and open_report["covered_open"] == 1
+
+    missing_membership = verify_surface_coverage(
+        conn, action_queue=queue, surface_items=surface_items, as_of_date=AS_OF,
+        token="tok", project_id="proj",
+        list_func=lambda token, project_id, *, cursor=None, timeout=30: {
+            "results": [{
+                "id": "T1", "content": "Finance status",
+                "description": "Summary without member list\n\n[fa:finance-status]",
+                "labels": [FA_AUTO_LABEL],
+            }],
+            "next_cursor": None,
+        },
+    )
+    assert missing_membership["ok"] is False
+    assert missing_membership["missing"] == ["match:rent:2026-06-24"]
+
+    mark_emission_status(conn, "finance-status", "completed")
+    dismissed_report = verify_surface_coverage(
+        conn, action_queue=queue, surface_items=surface_items, as_of_date=AS_OF,
+        token="tok", project_id="proj",
+        list_func=lambda token, project_id, *, cursor=None, timeout=30: {
+            "results": [], "next_cursor": None
+        },
+    )
+    assert dismissed_report["ok"] is True
+    assert dismissed_report["dismissed_current_evidence"] == 1
+
+
+def test_surface_coverage_is_non_green_for_missing_or_partial_board(tmp_path, monkeypatch):
+    conn = _db(tmp_path / "f.db")
+    queue = {"items": [{
+        "id": "match:x",
+        "coverage": {"kind": "rollup", "surface_key": "finance-status"},
+    }]}
+    surface_items = [{
+        "surface_key": "finance-status", "content": "Finance status",
+        "description": "Queue member: match:x",
+    }]
+    missing = verify_surface_coverage(
+        conn, action_queue=queue, surface_items=surface_items, as_of_date=AS_OF,
+        token="tok", project_id="proj",
+        list_func=lambda token, project_id, *, cursor=None, timeout=30: {
+            "results": [], "next_cursor": None
+        },
+    )
+    assert missing["ok"] is False and missing["status"] == "warn"
+    assert missing["missing"] == ["match:x"]
+
+    monkeypatch.setattr(tb, "MAX_LIST_PAGES", 1)
+    partial = verify_surface_coverage(
+        conn, action_queue={"items": []}, surface_items=[], as_of_date=AS_OF,
+        token="tok", project_id="proj",
+        list_func=lambda token, project_id, *, cursor=None, timeout=30: {
+            "results": [], "next_cursor": "more"
+        },
+    )
+    assert partial["ok"] is False and partial["todoist_read_complete"] is False
 
 
 def test_update_404_closes_emission_and_resolves_followup(tmp_path):
@@ -393,10 +593,13 @@ def test_missing_task_id_in_create_response_fails_that_item_only(tmp_path):
     good = next(i for i in r["items"] if i["surface_key"] == "followup:good")
     assert good["action"] == "created"
 
-    # No ledger row for the bad item (so a later run retries the create cleanly);
-    # a row for the good one.
-    keys = {row["surface_key"] for row in conn.execute("SELECT surface_key FROM todoist_emissions").fetchall()}
-    assert keys == {"followup:good"}
+    # The ambiguous bad response keeps durable intent for marker verification;
+    # the good item is open normally.
+    states = {
+        row["surface_key"]: row["status"]
+        for row in conn.execute("SELECT surface_key, status FROM todoist_emissions").fetchall()
+    }
+    assert states == {"followup:bad": "create_pending", "followup:good": "open"}
 
 
 # --- sync-failed flag (surface_due_items_to_todoist prepends the stale-data item) ---

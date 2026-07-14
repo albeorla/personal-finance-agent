@@ -12,6 +12,7 @@ from financial_agent.obligations import apply_obligation_instances
 from financial_agent.schema import ensure_app_schema
 from financial_agent.surface_queue import (
     SNAPSHOT_STALE_DAYS,
+    build_surface_items,
     _finance_status_surface_item,
     _short_title,
     get_surface_queue,
@@ -205,6 +206,34 @@ def test_match_confirmation_items_from_reconciliation_review(tmp_path):
     assert item["severity"] == "high"
     assert item["evidence"]["transaction_id"] == "TRN-x"
     assert item["evidence"]["obligation_id"] == "ap"
+
+
+def test_action_queue_explicitly_maps_rollups_and_direct_tasks(tmp_path):
+    conn = _db(tmp_path / "t.db")
+    _checking(conn)
+    _fresh_sync(conn)
+    _seed_needs_review_match(
+        conn, "ap", "Apple paydown", due_date="2026-06-10", amount=-300.0, txn_id="TRN-x"
+    )
+    _seed_estimate(
+        conn, "elec", "Electric bill", due_date="2026-06-28", amount=-140.0,
+        review_after="2026-06-20",
+    )
+    conn.commit()
+
+    queue = get_surface_queue(conn, as_of_date=AS_OF, limit=None)
+    match = next(item for item in queue["items"] if item["type"] == "match_confirmation")
+    estimate = next(item for item in queue["items"] if item["type"] == "estimate_review")
+
+    assert match["coverage"] == {"kind": "rollup", "surface_key": "finance-status"}
+    assert estimate["coverage"] == {
+        "kind": "task",
+        "surface_key": "estimate-review:elec:elec:2026-06-28",
+    }
+
+    surface_items = build_surface_items(conn, as_of_date=AS_OF, action_queue=queue)
+    status_rollup = next(item for item in surface_items if item["surface_key"] == "finance-status")
+    assert match["id"] in status_rollup["description"]
 
 
 def test_estimate_review_items_from_review_candidates(tmp_path):

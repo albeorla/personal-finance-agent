@@ -105,7 +105,7 @@ def run_scheduled_daily_sync(
 def _skipped_phases(reason: str) -> dict[str, dict[str, Any]]:
     return {
         name: {"status": "skipped", "reason": reason}
-        for name in ("sync", "pipeline", "surface", "reconcile_completions")
+        for name in ("sync", "pipeline", "surface", "reconcile_completions", "surface_coverage")
     }
 
 
@@ -136,12 +136,18 @@ def _phase_summary(run: dict[str, Any], *, sync: bool, surface: bool) -> dict[st
     def external_phase(name: str, enabled: bool) -> dict[str, Any]:
         if not enabled:
             return {"status": "skipped", "reason": "phase disabled"}
+        if name not in summary:
+            return {"status": "warn", "reason": "phase result missing"}
         result = summary.get(name) or {}
         if result.get("error"):
             return {"status": "failed"}
         failed = int(result.get("failed") or 0)
         source_status = result.get("status")
-        status = "warn" if failed or source_status == "awaiting-integration" else "ok"
+        status = (
+            "warn"
+            if failed or source_status in {"awaiting-integration", "warn"} or result.get("ok") is False
+            else "ok"
+        )
         return {
             "status": status,
             **{key: result[key] for key in ("created", "updated", "resolved", "failed") if key in result},
@@ -152,6 +158,7 @@ def _phase_summary(run: dict[str, Any], *, sync: bool, surface: bool) -> dict[st
         "pipeline": pipeline_phase,
         "surface": external_phase("surface_due_items", surface),
         "reconcile_completions": external_phase("reconcile_todoist_completions", True),
+        "surface_coverage": external_phase("verify_surface_coverage", surface),
     }
 
 

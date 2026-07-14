@@ -29,9 +29,13 @@ from .obligations import suppress_contradicted_estimates, suppress_dormant_avg_e
 from .onboarding import scan_charge_onboarding_candidates
 from .reconciliation import reconcile_obligation_instances
 from .schema import ensure_app_schema
-from .surface_queue import build_surface_items, build_surface_retire_keys
+from .surface_queue import build_surface_items, build_surface_retire_keys, get_surface_queue
 from .sync_simplefin import sync_simplefin
-from .todoist_outbox import reconcile_todoist_completions, surface_to_todoist
+from .todoist_outbox import (
+    reconcile_todoist_completions,
+    surface_to_todoist,
+    verify_surface_coverage,
+)
 from .verification import run_verification
 
 
@@ -60,8 +64,9 @@ def run_background_sync(
     reconcile transactions, detect drift, suppress dormant estimates, suppress
     contradicted estimates (enforce mode, on by default), verify the model's
     internal consistency (deterministic self-checks), and surface the day's due
-    items to Todoist (gated off by default). Each step is recorded as an event;
-    a failing step is logged and the run continues.
+    items to Todoist (gated off by default). A surfaced run then proves every
+    action is represented on a complete Todoist read. Each step is recorded as
+    an event; a failing step is logged and the run continues.
     """
 
     ensure_app_schema(conn)
@@ -131,6 +136,14 @@ def run_background_sync(
                     runner=adv_runner, model=adv_model))),
         ]
 
+    coverage_steps: list[tuple[str, Callable[[], dict[str, Any]]]] = []
+    if opts.get("surface"):
+        coverage_steps = [
+            ("verify_surface_coverage", lambda: _summarize_surface_coverage(
+                _verify_surface_coverage_step(conn, as_of_date, opts)
+            )),
+        ]
+
     steps: list[tuple[str, Callable[[], dict[str, Any]]]] = [
         *sync_steps,
         ("scan_charge_candidates", lambda: _summarize_scan(
@@ -167,6 +180,7 @@ def run_background_sync(
         # options["reconcile_completions"] (mirrors the adversarial-runner hook).
         ("reconcile_todoist_completions", lambda: _summarize_completions(
             _reconcile_completions_step(conn, as_of_date, opts))),
+        *coverage_steps,
     ]
 
     summary: dict[str, Any] = {}
@@ -484,28 +498,65 @@ def _surface_due_items_step(
     """
 
     surface_opts = opts.get("surface")
+    action_queue = get_surface_queue(conn, as_of_date=as_of_date, limit=None)
+    surface_items = build_surface_items(
+        conn, as_of_date=as_of_date, action_queue=action_queue
+    )
     retire_keys = build_surface_retire_keys(conn, as_of_date=as_of_date)
     if not surface_opts:
         # Default: gated off, hermetic. No live send, ledger untouched.
         return surface_to_todoist(
             conn,
-            build_surface_items(conn, as_of_date=as_of_date),
+            surface_items,
             as_of_date,
             write_enabled=False,
             retire_keys=retire_keys,
         )
     if not isinstance(surface_opts, dict):
         surface_opts = {}
-    return surface_to_todoist(
-        conn,
-        build_surface_items(conn, as_of_date=as_of_date),
-        as_of_date,
-        write_enabled=surface_opts.get("write_enabled"),
-        token=surface_opts.get("token"),
-        project_id=surface_opts.get("project_id"),
-        env_path=surface_opts.get("env_path", opts.get("env_path")),
-        retire_keys=retire_keys,
+    kwargs: dict[str, Any] = {
+        "write_enabled": surface_opts.get("write_enabled"),
+        "token": surface_opts.get("token"),
+        "project_id": surface_opts.get("project_id"),
+        "env_path": surface_opts.get("env_path", opts.get("env_path")),
+        "retire_keys": retire_keys,
+    }
+    for key in ("send_func", "list_func", "delete_func"):
+        if key in surface_opts:
+            kwargs[key] = surface_opts[key]
+    return surface_to_todoist(conn, surface_items, as_of_date, **kwargs)
+
+
+def _verify_surface_coverage_step(
+    conn: sqlite3.Connection, as_of_date: str, opts: dict[str, Any]
+) -> dict[str, Any]:
+    surface_opts = opts.get("surface") or {}
+    action_queue = get_surface_queue(conn, as_of_date=as_of_date, limit=None)
+    surface_items = build_surface_items(
+        conn, as_of_date=as_of_date, action_queue=action_queue
     )
+    kwargs: dict[str, Any] = {"env_path": surface_opts.get("env_path", opts.get("env_path"))}
+    for key in ("token", "project_id", "list_func"):
+        if key in surface_opts:
+            kwargs[key] = surface_opts[key]
+    return verify_surface_coverage(
+        conn,
+        action_queue=action_queue,
+        surface_items=surface_items,
+        as_of_date=as_of_date,
+        **kwargs,
+    )
+
+
+def _summarize_surface_coverage(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: result[key]
+        for key in (
+            "status", "ok", "todoist_read_complete", "actionable_total",
+            "covered_open", "dismissed_current_evidence", "missing_count", "warnings",
+        )
+        if key in result
+    }
 
 
 def _reconcile_completions_step(

@@ -108,6 +108,42 @@ def test_event_sequence_is_deterministic_across_runs(tmp_path):
     assert second["result_summary"]["scan_charge_candidates"]["created"] == 0
 
 
+def test_daily_surface_coverage_warning_makes_run_non_green(tmp_path, monkeypatch):
+    conn = _db(tmp_path / "b.sqlite")
+    task_ids = iter(f"T{index}" for index in range(1, 20))
+    monkeypatch.setattr(
+        background,
+        "verify_surface_coverage",
+        lambda *args, **kwargs: {
+            "status": "warn",
+            "ok": False,
+            "warnings": ["1 actionable item is missing from Todoist"],
+            "missing_count": 1,
+            "todoist_read_complete": True,
+        },
+    )
+
+    result = run_background_sync(
+        conn,
+        as_of_date="2026-06-30",
+        options={
+            "surface": {
+                "write_enabled": True,
+                "token": "tok",
+                "project_id": "proj",
+                "send_func": lambda token, path, body, **kwargs: {"id": next(task_ids)},
+                "list_func": lambda token, project_id, *, cursor=None, timeout=30: {
+                    "results": [], "next_cursor": None
+                },
+            }
+        },
+    )
+
+    assert result["status"] == "succeeded_with_warnings"
+    assert result["result_summary"]["verify_surface_coverage"]["ok"] is False
+    assert result["result_summary"]["verify_surface_coverage"]["missing_count"] == 1
+
+
 def _add_whole_foods(conn):
     """Add a card account with regular-but-variable grocery spend.
 
