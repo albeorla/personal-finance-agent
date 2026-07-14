@@ -145,7 +145,7 @@ More detailed architecture, state, and relationship diagrams live in
 - Recurring-charge candidate: a detected pattern that is not cash-flow truth
   until accepted and applied.
 - Surface queue: the prioritized set of items worth showing to the user today.
-- Todoist emission: a ledger row that maps one surface item to one Todoist task.
+- Todoist emission: a ledger row that maps one surface item to one Todoist task, stores its current evidence hash, and can persist a `create_pending` transport intent.
 - Parallel run: using the agent alongside the legacy/manual workflow to compare
   results before cutover.
 - Sole trusted source: the state where the agent replaces the legacy/manual
@@ -177,8 +177,16 @@ More detailed architecture, state, and relationship diagrams live in
   must perform no external mutation.
 - Idempotency: repeated surfacing of unchanged daily items should update or skip
   existing Todoist tasks rather than create duplicates.
+- Conservation: each current action-queue item must map to an open managed task,
+  a dismissal for the same evidence hash, or a named member of the live
+  `finance-status` rollup. A partial Todoist list is never healthy evidence.
+- Completion semantics: a checkbox acknowledges the task evidence it displayed.
+  New evidence can resurface under the same key. Only `followup:<id>` completions
+  resolve a source record, and a checkbox never approves a financial review.
 - Recovery: background runs, sync runs, action outbox rows, and Todoist emissions
   should leave enough state to explain what happened after a failed run.
+  Surface creates record intent before transport, then use the embedded marker to
+  adopt a task after an uncertain response or retry after verified absence.
 
 ## Monitoring and Alerting
 
@@ -377,4 +385,3 @@ artifacts when they contain live financial details.
   from canonical modeling.
 - Build a hosted service first: rejected because local-first storage and private
   data boundaries are central to the current workflow.
-
