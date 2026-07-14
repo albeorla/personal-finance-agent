@@ -473,6 +473,69 @@ def test_surface_tool_prepends_sync_failed_item_when_flag_set(tmp_path, monkeypa
     assert all(k != "data-sync-failed:2026-06-24" for k in [i["surface_key"] for i in result_ok["items"]])
 
 
+def test_surface_tool_with_synced_sources_does_not_lock_itself(tmp_path, monkeypatch):
+    import pytest
+
+    pytest.importorskip("mcp", reason="MCP server deps not installed")
+    from financial_agent import server
+
+    db = tmp_path / "f.db"
+    conn = _db(db)
+    conn.executescript(
+        """
+        CREATE TABLE accounts (
+            id TEXT PRIMARY KEY, name TEXT, org TEXT, kind TEXT, currency TEXT
+        );
+        CREATE TABLE balance_snapshots (
+            id INTEGER PRIMARY KEY, account_id TEXT, balance REAL, available REAL,
+            recorded_at TEXT, source TEXT, balance_date TEXT
+        );
+        CREATE TABLE sync_runs (
+            id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, mode TEXT,
+            accounts_seen INT, transactions_inserted INT,
+            transactions_updated INT, error TEXT
+        );
+        CREATE TABLE transactions (
+            id TEXT PRIMARY KEY, account_id TEXT, posted TEXT,
+            transacted_at TEXT, amount REAL, payee TEXT, description TEXT,
+            pending INTEGER, source TEXT
+        );
+        INSERT INTO accounts VALUES (
+            'chk', 'Checking 4321', 'Chase', 'checking', 'USD'
+        );
+        INSERT INTO balance_snapshots (
+            account_id, balance, available, recorded_at, source, balance_date
+        ) VALUES (
+            'chk', 9000, 9000, '2026-06-24T08:00:00-04:00',
+            'simplefin', '2026-06-24'
+        );
+        INSERT INTO sync_runs (
+            started_at, finished_at, mode, accounts_seen,
+            transactions_inserted, transactions_updated, error
+        ) VALUES (
+            '2026-06-24T08:00:00-04:00', '2026-06-24T08:01:00-04:00',
+            'i', 1, 0, 0, NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    promote_release(str(db))
+    monkeypatch.setattr(
+        tb,
+        "get_finance_config",
+        lambda **kw: {
+            "todoist_write_enabled": False,
+            "todoist_api_token": None,
+            "todoist_project_id": None,
+        },
+    )
+
+    result = server.surface_due_items_to_todoist(AS_OF, db_path=str(db))
+
+    assert result["status"] == "awaiting-integration"
+
+
 def test_due_date_and_priority_passed_through(tmp_path):
     conn = _db(tmp_path / "f.db")
     spy = _Spy()
