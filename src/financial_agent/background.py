@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from . import build_info
 from .adversarial import adversarial_review_enabled, run_adversarial_review
+from .backfill import extend_manual_recurring_instances
 from .config import get_finance_config
 from .drift import detect_drift
 from .obligations import suppress_contradicted_estimates, suppress_dormant_avg_estimates
@@ -36,7 +37,7 @@ from .todoist_outbox import (
     surface_to_todoist,
     verify_surface_coverage,
 )
-from .verification import run_verification
+from .verification import COVERAGE_HORIZON_DAYS, run_verification
 
 
 DEFAULT_RUN_TYPE = "daily_sync"
@@ -161,7 +162,7 @@ def run_background_sync(
         # identity, not a model guess. Findings persist (tagged with this run)
         # and feed the daily digest's verification block.
         ("verify", lambda: _summarize_verification(
-            run_verification(conn, as_of_date=as_of_date, run_id=run_id))),
+            _run_verification_step(conn, as_of_date=as_of_date, run_id=run_id))),
         # Gated adversarial review: an independent reviewer sanity-checks the
         # riskiest rows before they are surfaced. Empty (no event) unless enabled.
         *adversarial_steps,
@@ -606,6 +607,20 @@ def _summarize_verification(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _run_verification_step(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str,
+    run_id: str,
+) -> dict[str, Any]:
+    extend_manual_recurring_instances(
+        conn,
+        as_of_date=as_of_date,
+        horizon_days=COVERAGE_HORIZON_DAYS,
+    )
+    return run_verification(conn, as_of_date=as_of_date, run_id=run_id)
+
+
 def _should_run_adversarial(adversarial_opts: Any) -> bool:
     """Decide whether to append the gated adversarial step.
 
@@ -633,8 +648,6 @@ def _summarize_adversarial(result: dict[str, Any]) -> dict[str, Any]:
         "by_severity": result.get("by_severity"),
         "skipped": result.get("skipped"),
     }
-    if result.get("available") is False:
-        summary["warnings"] = ["Fable advisory review unavailable"]
     return summary
 
 
