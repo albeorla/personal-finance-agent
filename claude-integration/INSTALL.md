@@ -16,7 +16,7 @@ over — nothing here touches the legacy workspace until you copy it.
 ## Install steps (run from the finances workspace, when ready)
 
 1. **Register the server.** Either:
-   - `claude mcp add financial-agent -- uv run --directory /Users/owner/dev/financial-agent-mcp financial-agent-mcp`, or
+   - `claude mcp add financial-agent -- uv run --directory /path/to/personal-finance-agent financial-agent-mcp`, or
    - merge the `financial-agent` entry from `mcp-registration.json` into
      `~/dev/areas/finances/.mcp.json`.
 2. **Install the skill.** Copy `finance-skill/` to

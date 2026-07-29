@@ -5,8 +5,7 @@
 - Status: implemented baseline; parallel-run validation before sole-source use
 - Created: 2026-06-25
 - Project: `personal-finance-agent`
-- Repository: `/Users/aorlando/dev/financial-agent-mcp`
-- Reference method: `/Users/aorlando/dev/reference-notes/design-docs/refactoring-english-effective-design-doc.md`
+- Repository: `albeorla/personal-finance-agent`
 
 ## Objective
 
@@ -241,6 +240,7 @@ The command-line entry points are:
 - `uv run financial-agent-mcp`
 - `uv run financial-agent-daily`
 - `uv run financial-agent-ui`
+- `uv run financial-agent-release`
 - `python -m financial_agent.adversarial --as-of <YYYY-MM-DD>` — runs the
   adversarial review outside any MCP call (used by the Claude Code Stop hook).
   Safe with the gate off: it prints a disabled note and exits 0.
