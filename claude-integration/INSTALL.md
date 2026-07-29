@@ -1,9 +1,9 @@
 # Installing the finance harness into the finances workspace
 
-These assets are **staged here, not installed**. They wire Claude Code in
-`~/dev/areas/finances` to use the local finance MCP server as the source of
-truth for the daily ritual. Install them deliberately when you are ready to cut
-over — nothing here touches the legacy workspace until you copy it.
+These assets are **staged here, not installed**. They wire Claude Code in the
+finances workspace (`~/dev/finances-golive`) to use the local finance MCP
+server as the source of truth for the daily ritual. Install them deliberately;
+nothing here touches the workspace until you copy it.
 
 ## What's in this directory
 
@@ -18,14 +18,14 @@ over — nothing here touches the legacy workspace until you copy it.
 1. **Register the server.** Either:
    - `claude mcp add financial-agent -- uv run --directory /path/to/personal-finance-agent financial-agent-mcp`, or
    - merge the `financial-agent` entry from `mcp-registration.json` into
-     `~/dev/areas/finances/.mcp.json`.
+     `~/dev/finances-golive/.mcp.json`.
 2. **Install the skill.** Copy `finance-skill/` to
-   `~/dev/areas/finances/.claude/skills/finance/` (so the file lands at
+   `~/dev/finances-golive/.claude/skills/finance/` (so the file lands at
    `.claude/skills/finance/SKILL.md`).
 3. **Add the rule block.** Append the contents of `finance-instructions.md` to
    the workspace `CLAUDE.md` (or `AGENTS.md`).
 4. **Confirm credentials.** The server reads `SIMPLEFIN_ACCESS_URL` and
-   `TODOIST_API_TOKEN` from `~/dev/areas/finances/.env` at runtime (never logged
+   `TODOIST_API_TOKEN` from the workspace `.env` at runtime (never logged
    or committed).
 5. **Smoke test.** In a Claude Code session in the workspace, ask "what's my
    working cash and what's due this week" and confirm it calls `get_daily_digest`
