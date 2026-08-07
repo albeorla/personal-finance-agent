@@ -143,14 +143,17 @@ def test_incremental_floored_at_lookback_cap(tmp_path):
 
 def test_sync_incremental_uses_resumed_start(tmp_path, monkeypatch):
     conn = _db(tmp_path / "s.sqlite")
-    _insert_txn(conn, "a1", "ACT-a", "2026-06-19T08:00:00")
+    # Date-relative: sync_simplefin caps lookback at SAFE_REQUEST_LOOKBACK_DAYS
+    # (44), so a hardcoded posted date drifts under the floor as time passes.
+    last_posted = dt.date.today() - dt.timedelta(days=10)
+    _insert_txn(conn, "a1", "ACT-a", f"{last_posted.isoformat()}T08:00:00")
     captured = {}
     def _fetch(access_url, *, start_date=None, end_date=None, timeout=60):
         captured["start_date"] = start_date
         return ([], [])
     monkeypatch.setattr(sfin, "fetch_simplefin_accounts", _fetch)
     sync_simplefin(conn, access_url="https://u:p@host/simplefin", incremental=True, overlap_days=3, lookback_days=100000)
-    assert captured["start_date"] == "2026-06-16"  # 2026-06-19 minus 3
+    assert captured["start_date"] == (last_posted - dt.timedelta(days=3)).isoformat()  # last posted minus overlap
 
 
 def test_sync_incremental_falls_back_to_lookback_when_empty(tmp_path, monkeypatch):
