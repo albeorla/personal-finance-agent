@@ -14,13 +14,14 @@ guardrails) - see the ``provenance`` block.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sqlite3
 from typing import Any
 
 from .backfill import list_recently_cleared
 from .config import get_finance_config
 from .guardrails import CASH_FLOOR
-from .obligations import list_obligations
+from .obligations import CADENCE_PER_MONTH, list_obligations
 from .onboarding import ACTIVE_STATUSES
 from .reconciliation import list_reconciliation_review_items
 from .status import default_db_path, get_finance_status
@@ -38,6 +39,11 @@ SENSITIVITY_PCT: dict[str | None, float] = {
 }
 # Cap a per-instance cv so one wild historical month cannot blow the band open.
 _CV_CAP = 0.75
+
+# A payment at or above this size moves the runway on its own, so the close names
+# it with its date and amount instead of leaving the reader to ask whether it was
+# counted. Below it, listing every bill would bury the ones that matter.
+MATERIAL_AMOUNT = 1000.0
 
 
 def build_daily_digest(
@@ -148,7 +154,7 @@ def build_daily_digest(
         "estimated_material": [
             {"obligation_name": o["obligation_name"], "amount": o["amount"], "due_date": o["due_date"]}
             for o in upcoming
-            if o.get("amount_status") == "estimated" and abs(o.get("amount") or 0) >= 1000
+            if o.get("amount_status") == "estimated" and abs(o.get("amount") or 0) >= MATERIAL_AMOUNT
         ],
         "drift": status["drift_warnings"],
         "matches_to_confirm": _matches_to_confirm(resolved_db_path, as_of),
@@ -166,6 +172,7 @@ def build_daily_digest(
             "drift": "detect_drift (missing/stale/amount-changed)",
             "matches_to_confirm": "transaction_obligation_matches awaiting confirmation",
             "recently_cleared": "backfilled past instances matched to posted transactions",
+            "open_risks": "projection outflows >= $1,000 + pending follow_ups dated inside the window",
             "recurring_candidates": "charge_onboarding_candidates not yet applied",
             "guardrails": "evaluate_guardrails (cash floor / drift / window-age / avalanche)",
             "coverage": "obligation roster + projection events + manual-due surface rows + onboarding queue + board freshness",
@@ -192,6 +199,16 @@ def build_daily_digest(
     # a row; this proves the rows add up. A compact summary plus any open
     # findings so a broken identity is visible alongside the numbers it affects.
     digest["verification"] = _verification_block(resolved_db_path, as_of)
+    # Everything still open, named with its date and amount: the big payments
+    # ahead plus reminders nobody has resolved. Computed before the verdict on
+    # purpose - an open item holds back the all-clear (see _status_color).
+    digest["open_risks"] = _open_risks(
+        resolved_db_path,
+        as_of,
+        events=(longest or {}).get("events") or [],
+        horizon_end=(longest or {}).get("end_date_exclusive")
+        or (dt.date.fromisoformat(as_of) + dt.timedelta(days=max(windows))).isoformat(),
+    )
     digest["status_color"], digest["status_reason"] = _status_color(digest)
     # Advisory adversarial review: persisted findings from the independent
     # reviewer, read-only here (no subprocess is ever spawned in the digest, so
@@ -348,6 +365,9 @@ def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
         "trough_sensitivity": digest.get("trough_sensitivity"),
         "upcoming_14d": upcoming_14d,
         "upcoming_total": len(upcoming),
+        # Carried in full (not truncated): the point of the block is that nothing
+        # still open goes unnamed in the summary a session actually reads.
+        "open_risks": digest.get("open_risks", []),
         "estimated_material": digest.get("estimated_material", []),
         "drift": drift,
         "matches_to_confirm": matches,
@@ -359,6 +379,7 @@ def summarize_daily_digest(digest: dict[str, Any]) -> dict[str, Any]:
             "recurring_checking": digest.get("recurring_checking_count", 0),
             "recurring_checking_monthly": digest.get("recurring_checking_monthly", 0),
             "matches_to_confirm": len(matches),
+            "open_risks": len(digest.get("open_risks", [])),
             "recently_cleared_30d": len(digest.get("recently_cleared", [])),
             "onboarding_active": coverage.get("onboarding_active", 0),
         },
@@ -378,6 +399,8 @@ def render_digest_markdown(digest: dict[str, Any], verbose: bool = False) -> str
     lines: list[str] = []
     _render_headline(digest, lines)
     _render_do_this_today(digest, lines)
+    lines.append("")
+    _render_open_risks(digest, lines)
     lines.append("")
     _render_watch(digest, lines)
     if not verbose:
@@ -538,6 +561,28 @@ def _render_do_this_today(digest: dict[str, Any], lines: list[str]) -> None:
         lines.append(f"- RED: {digest.get('status_reason', '')}")
     elif (digest.get("trough_sensitivity") or {}).get("breach_risk"):
         lines.append(f"- CAUTION: {digest.get('status_reason', '')}")
+
+
+def _render_open_risks(digest: dict[str, Any], lines: list[str]) -> None:
+    """The "Still open" block: every unresolved dollar, with date and amount.
+
+    Rendered in the short close (not just the verbose one) because this is the
+    section that stops the reader from having to ask "did you count the card
+    payment / the transfer I mentioned?"."""
+
+    risks = digest.get("open_risks") or []
+    lines.append(f"## Still open ({len(risks)})")
+    if not risks:
+        lines.append(
+            f"- nothing unresolved: no payment of ${_money(MATERIAL_AMOUNT)} or more ahead, "
+            "and no open reminders"
+        )
+        return
+    for risk in risks:
+        amount = f"${_money(risk['amount'])}" if risk.get("amount") is not None else "amount not recorded"
+        counted = "in the runway" if risk.get("counted_in_runway") else "NOT in the runway"
+        flag = "OPEN" if risk.get("blocks_all_clear") else "counted"
+        lines.append(f"- [{flag}] {risk['date']}  {amount}  {risk['label']} - {risk['why']} ({counted})")
 
 
 def _render_watch(digest: dict[str, Any], lines: list[str]) -> None:
@@ -759,6 +804,137 @@ def _recently_cleared(db_path: str, as_of: str) -> list[dict[str, Any]]:
         return []
     finally:
         conn.close()
+
+
+# --- still-open money --------------------------------------------------------
+
+
+def _open_risks(
+    db_path: str,
+    as_of: str,
+    *,
+    events: list[dict[str, Any]],
+    horizon_end: str,
+) -> list[dict[str, Any]]:
+    """Money that is still open, each row carrying its own date and amount.
+
+    Two sources, because those are the two ways a dollar goes unnamed today:
+    every payment of ``MATERIAL_AMOUNT`` or more still ahead in the projection
+    window, and every pending follow-up reminder dated on or before the end of
+    that window (including overdue ones). ``blocks_all_clear`` marks the rows
+    that are genuinely unsettled - an estimated amount, a needs-review instance,
+    a past-due carry, a payment with no recurring schedule on file, or an
+    unresolved reminder - so the verdict cannot read clean while one is open.
+    A confirmed recurring bill is still listed (it is money leaving), but it does
+    not hold the verdict back: the projection already counted it.
+    """
+
+    cadences = _obligation_cadences(db_path)
+    risks: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("direction") != "outflow":
+            continue
+        amount = round(abs(float(event.get("signed_amount") or event.get("amount") or 0.0)), 2)
+        if amount < MATERIAL_AMOUNT:
+            continue
+        reasons: list[str] = []
+        if event.get("past_due_carried"):
+            reasons.append("past due and unreconciled")
+        if event.get("amount_status") == "estimated":
+            reasons.append("amount is still an estimate")
+        if event.get("status") == "needs_review":
+            reasons.append("flagged needs review")
+        if (cadences.get(event.get("obligation_id")) or "").strip().lower() not in CADENCE_PER_MONTH:
+            reasons.append("one-time payment (no recurring schedule on file)")
+        risks.append(
+            {
+                "kind": "payment",
+                "date": event.get("due_date"),
+                "amount": amount,
+                "label": event.get("obligation_name") or "unnamed obligation",
+                "why": "; ".join(reasons) or "confirmed recurring payment, not paid yet",
+                "counted_in_runway": True,
+                "blocks_all_clear": bool(reasons),
+            }
+        )
+
+    for followup in _pending_followups(db_path, horizon_end):
+        overdue = " (past its surface date)" if followup["surface_when"] < as_of else ""
+        risks.append(
+            {
+                "kind": "follow_up",
+                "date": followup["surface_when"],
+                "amount": _amount_in_text(followup["text"]),
+                "label": followup["text"],
+                "why": f"reminder is still unresolved{overdue}",
+                "counted_in_runway": False,
+                "blocks_all_clear": True,
+            }
+        )
+
+    risks.sort(key=lambda r: (r.get("date") or "", -(r.get("amount") or 0.0)))
+    return risks
+
+
+def _obligation_cadences(db_path: str) -> dict[str, str | None]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[0]: row[1] for row in conn.execute("SELECT id, cadence FROM obligations")}
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+
+def _pending_followups(db_path: str, horizon_end: str) -> list[dict[str, Any]]:
+    """Pending follow-ups dated on or before the end of the projection window.
+
+    Deliberately wider than ``list_due_followups`` (due today or earlier): a
+    reminder dated later this month is exactly the item the reader would
+    otherwise have to name themselves, so it belongs in today's close.
+    """
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT text, surface_when FROM follow_ups "
+            "WHERE status = 'pending' AND surface_when <= ? "
+            "ORDER BY surface_when, id",
+            (horizon_end,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    return [{"text": row["text"], "surface_when": row["surface_when"]} for row in rows]
+
+
+def _amount_in_text(text: str) -> float | None:
+    """First dollar figure written into a reminder ("move $4,000 to savings")."""
+
+    match = re.search(r"\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text or "")
+    if not match:
+        return None
+    try:
+        return round(float(match.group(1).replace(",", "")), 2)
+    except ValueError:
+        return None
+
+
+def _open_risk_phrase(risk: dict[str, Any]) -> str:
+    amount = f" ${_money(risk['amount'])}" if risk.get("amount") is not None else ""
+    label = str(risk.get("label") or "")
+    if len(label) > 60:
+        label = label[:57] + "..."
+    return f"{label}{amount} on {risk.get('date')}"
+
+
+def _open_risk_reason(risks: list[dict[str, Any]]) -> str:
+    noun = "item" if len(risks) == 1 else "items"
+    named = ", ".join(_open_risk_phrase(r) for r in risks[:2])
+    more = f", and {len(risks) - 2} more" if len(risks) > 2 else ""
+    return f"{len(risks)} {noun} still open: {named}{more}"
 
 
 # --- #7 trough sensitivity ---------------------------------------------------
@@ -1099,6 +1275,13 @@ def _status_color(digest: dict[str, Any]) -> tuple[str, str]:
         return "YELLOW", "a large bill is still an estimate, not a confirmed amount"
     if verification_severity.get("warning", 0):
         return "YELLOW", "deterministic verification found a warning in the finance model"
+    # Last gate before the all-clear: anything still open (a big payment with no
+    # settled amount or schedule, a past-due carry, an unresolved reminder) is
+    # named here rather than left for the reader to remember. GREEN means nothing
+    # is open, so it can be trusted when it does appear.
+    still_open = [r for r in (digest.get("open_risks") or []) if r.get("blocks_all_clear")]
+    if still_open:
+        return "YELLOW", _open_risk_reason(still_open)
     return "GREEN", "modeled runway clears the cash floor"
 
 

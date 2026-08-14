@@ -127,7 +127,9 @@ def test_capped_discretionary_sweep_renders_applied_amount(tmp_path):
     assert o["running_balance"] == 2500.0
 
     md = render_digest_markdown(digest, verbose=True)
-    line = next(ln for ln in md.splitlines() if "Card paydown sweep" in ln)
+    # The obligation bullet (the one carrying the running balance); the headline
+    # and the "Still open" block also name the sweep now.
+    line = next(ln for ln in md.splitlines() if "Card paydown sweep" in ln and "->" in ln)
     # Applied amount is the primary figure and it ties to the running balance.
     assert "-$2,500.00" in line
     assert "-> $2,500.00" in line
