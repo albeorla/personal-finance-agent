@@ -40,6 +40,11 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "exact_match_date_window": 2,
     "auto_mark_paid": False,
     "flag_unmatched_needs_review": False,
+    # A recurring charge that moves by more than BOTH of these against what the
+    # same bill actually charged last cycle is raised for review instead of
+    # clearing silently (a subscription price change, a downgrade that never took).
+    "amount_change_pct": 0.10,
+    "amount_change_abs": 5.0,
 }
 
 # Tokens too generic to carry merchant identity on their own.
@@ -61,10 +66,11 @@ def reconcile_obligation_instances(
     as_of = _coerce_date(as_of_date)
     now = _now()
 
-    instances = conn.execute(
+    rows = conn.execute(
         f"""
         SELECT oi.id, oi.obligation_id, o.name AS obligation_name, oi.due_date,
-               oi.amount, oi.direction, oi.status, oi.cash_flow_treatment
+               oi.amount, oi.direction, oi.status, oi.cash_flow_treatment,
+               o.active_until
         FROM obligation_instances oi
         JOIN obligations o ON o.id = oi.obligation_id
         WHERE oi.status IN ({",".join("?" for _ in RECONCILABLE_STATUSES)})
@@ -76,13 +82,30 @@ def reconcile_obligation_instances(
         (*RECONCILABLE_STATUSES, as_of.isoformat()),
     ).fetchall()
 
+    # An instance due after the bill's end date is not expected any more (same cut
+    # cashflow makes when projecting). Left in, it silently absorbs the charge that
+    # kept arriving after the cancellation, which is exactly the charge that has to
+    # be raised. Any match recorded before the end date was set is stale evidence,
+    # so drop it and let list_post_cancellation_charges see the transaction again.
+    instances: list[sqlite3.Row] = []
+    past_end = 0
+    for r in rows:
+        if r["active_until"] and r["due_date"] > r["active_until"]:
+            past_end += 1
+            _clear_match(conn, r["id"])
+            _clear_unmatched(conn, r["id"])
+        else:
+            instances.append(r)
+
     summary = {
         "as_of_date": as_of.isoformat(),
         "considered": len(instances),
+        "skipped_after_end_date": past_end,
         "matched_auto": 0,
         "matched_needs_review": 0,
         "matched_shared": 0,
         "unmatched": 0,
+        "amount_changed": 0,
         "marked_paid": 0,
         "flagged_needs_review": 0,
         "skipped_card_statement_input": 0,
@@ -103,6 +126,13 @@ def reconcile_obligation_instances(
             continue  # already recorded by the shared-transaction pre-pass
         best = _best_match(conn, inst, opts, claimed)
         if best is not None and best["match_type"] in {"auto", "needs_review"}:
+            change = _prior_amount_change(conn, inst, best, opts)
+            if change is not None:
+                # The bill was paid, but not at last cycle's price. Clearing it
+                # automatically is how a price change stays invisible for months,
+                # so it goes to review carrying both amounts and both dates.
+                best = {**best, "match_type": "needs_review", "amount_change": change}
+                summary["amount_changed"] += 1
             claimed.add(best["transaction_id"])
             _record_match(conn, inst, best, as_of, now)
             _clear_unmatched(conn, inst["id"])
@@ -133,6 +163,10 @@ def reconcile_obligation_instances(
 # exceed these sizes, raise the caps or switch to a subset-sum DP.
 _SHARED_MAX_GROUP = 4
 _SHARED_MAX_POOL = 12
+
+# How far back _prior_amount_change looks for a cycle this bill paid on its own,
+# skipping cycles that were settled inside a shared lump payment.
+_PRIOR_CYCLE_SCAN = 12
 
 
 def _match_shared_transactions(
@@ -285,6 +319,230 @@ def _unique_summing_subset(
     return found
 
 
+def _prior_amount_change(
+    conn: sqlite3.Connection, inst: sqlite3.Row, best: dict[str, Any], opts: dict[str, Any]
+) -> dict[str, Any] | None:
+    """How this cycle's charge moved against what the same bill charged last cycle.
+
+    Compares real charge to real charge (the transaction matched to the previous
+    instance), not charge to modeled amount: a subscription that raises its price
+    is raised even when the expected amount was re-estimated to follow the new
+    charge, which is exactly the case ``drift.find_payment_drift`` cannot see.
+    Returns None when there is no prior charge or the move is small.
+    """
+
+    if not _has_transactions_table(conn):
+        return None
+    # A cycle settled inside a shared lump payment carries the WHOLE lump's amount,
+    # which was never this bill's price. Skip those and compare against the most
+    # recent cycle this bill paid on its own.
+    prior = None
+    for row in conn.execute(
+        """
+        SELECT oi.due_date, COALESCE(oi.matched_transaction_id, m.transaction_id) AS txn_id,
+               m.evidence_json
+        FROM obligation_instances oi
+        LEFT JOIN transaction_obligation_matches m ON m.obligation_instance_id = oi.id
+        WHERE oi.obligation_id = ?
+          AND oi.due_date < ?
+          AND oi.id != ?
+          AND oi.status != 'deleted'
+          AND COALESCE(oi.matched_transaction_id, m.transaction_id) IS NOT NULL
+        ORDER BY oi.due_date DESC, oi.id DESC
+        LIMIT ?
+        """,
+        (inst["obligation_id"], inst["due_date"], inst["id"], _PRIOR_CYCLE_SCAN),
+    ):
+        if (_loads(row["evidence_json"]) or {}).get("group"):
+            continue
+        prior = row
+        break
+    if prior is None or prior["txn_id"] == best["transaction_id"]:
+        return None
+    txn = conn.execute(
+        "SELECT amount, substr(COALESCE(posted, transacted_at), 1, 10) AS charged_on "
+        "FROM transactions WHERE id = ?",
+        (prior["txn_id"],),
+    ).fetchone()
+    if txn is None:
+        return None
+
+    previous = round(abs(float(txn["amount"])), 2)
+    current = round(abs(float(best["txn_amount"])), 2)
+    if previous <= 0:
+        return None
+    delta = round(current - previous, 2)
+    floor = max(float(opts["amount_change_abs"]), previous * float(opts["amount_change_pct"]))
+    if abs(delta) <= floor:
+        return None
+    return {
+        "previous_amount": previous,
+        "previous_date": txn["charged_on"] or prior["due_date"],
+        "current_amount": current,
+        "current_date": best["txn_date"],
+        "delta": delta,
+        "pct_change": round(delta / previous, 3),
+    }
+
+
+def list_post_cancellation_charges(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: date | str | None = None,
+    options: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Charges that kept arriving after the bill behind them was cancelled.
+
+    Cancelling a bill (``deactivate_obligation``, or an ``active_until`` that has
+    passed) drops it out of reconciliation entirely, so a subscription that keeps
+    billing afterwards matches nothing and is never mentioned again. This finds
+    those charges by the merchant and amount the obligation actually billed before
+    the cancellation, and skips any transaction already settling another bill.
+    """
+
+    ensure_app_schema(conn)
+    if not _has_transactions_table(conn):
+        return []
+    opts = {**DEFAULT_OPTIONS, **(options or {})}
+    as_of = _coerce_date(as_of_date).isoformat() if as_of_date is not None else None
+
+    obligations = conn.execute(
+        """
+        SELECT id, name, status, active_until, updated_at
+        FROM obligations
+        WHERE status != 'active' OR active_until IS NOT NULL
+        ORDER BY id
+        """
+    ).fetchall()
+    if not obligations:
+        return []
+
+    spoken_for = {
+        tid for (tid,) in conn.execute(
+            "SELECT transaction_id FROM transaction_obligation_matches WHERE transaction_id IS NOT NULL"
+        )
+    }
+    spoken_for.update(
+        tid for (tid,) in conn.execute(
+            "SELECT matched_transaction_id FROM obligation_instances WHERE matched_transaction_id IS NOT NULL"
+        )
+    )
+
+    # ponytail: one transaction scan per cancelled obligation. Fine at personal
+    # scale; if the cancelled list ever gets long, scan transactions once and
+    # bucket them by merchant token instead.
+    items: list[dict[str, Any]] = []
+    for ob in obligations:
+        cancelled_on = _cancelled_on(ob, as_of)
+        if cancelled_on is None:
+            continue
+        profile = _last_billed_profile(conn, ob["id"])
+        if profile is None:
+            continue  # never billed, so nothing to recognize a zombie charge by
+        last_amount, last_date, tokens, last_direction = profile
+        tol = max(float(opts["amount_abs_tolerance"]), last_amount * float(opts["amount_pct_tolerance"]))
+        params: list[Any] = [cancelled_on]
+        window = "substr(COALESCE(posted, transacted_at), 1, 10) > ?"
+        if as_of is not None:
+            window += " AND substr(COALESCE(posted, transacted_at), 1, 10) <= ?"
+            params.append(as_of)
+        for txn in conn.execute(
+            f"""
+            SELECT id, amount, payee, description,
+                   substr(COALESCE(posted, transacted_at), 1, 10) AS charged_on
+            FROM transactions
+            WHERE {window}
+            ORDER BY charged_on, id
+            """,
+            params,
+        ):
+            if txn["id"] in spoken_for or not txn["charged_on"]:
+                continue
+            amount = float(txn["amount"])
+            if ("inflow" if amount > 0 else "outflow") != last_direction:
+                continue  # money running the other way is a refund, not a charge that kept coming
+            if abs(abs(amount) - last_amount) > tol:
+                continue
+            score = _merchant_score(tokens, _tokens(f"{txn['payee'] or ''} {txn['description'] or ''}"))
+            if score <= 0.0:
+                continue  # amount alone is a coincidence, not this subscription
+            items.append(
+                {
+                    "review_type": "charge_after_cancellation",
+                    # Synthetic id: there is no instance behind a charge the plan
+                    # stopped expecting. Stable per obligation+transaction so the
+                    # surfaced task dedupes across runs.
+                    "obligation_instance_id": f"post-cancellation:{ob['id']}:{txn['id']}",
+                    "obligation_id": ob["id"],
+                    "obligation_name": f"{ob['name']} (cancelled, still billing)",
+                    "due_date": txn["charged_on"],
+                    "amount": round(amount, 2),
+                    "direction": "inflow" if amount > 0 else "outflow",
+                    "transaction_id": txn["id"],
+                    "match_type": "needs_review",
+                    "match_score": score,
+                    "amount_delta": round(abs(amount) - last_amount, 2),
+                    "cancelled_on": cancelled_on,
+                    "previous_amount": last_amount,
+                    "previous_date": last_date,
+                }
+            )
+    return items
+
+
+def _cancelled_on(ob: sqlite3.Row, as_of: str | None) -> str | None:
+    """The date this obligation stopped being expected, or None if it still is."""
+
+    end = ob["active_until"]
+    if end and (as_of is None or end <= as_of):
+        return end
+    if ob["status"] != "active":
+        # deactivate_obligation carries no end date; it stamps updated_at instead.
+        return (ob["updated_at"] or "")[:10] or None
+    return None
+
+
+def _last_billed_profile(
+    conn: sqlite3.Connection, obligation_id: str
+) -> tuple[float, str | None, set[str], str] | None:
+    """(amount, date, merchant tokens, direction) of the last charge this settled.
+
+    ``direction`` is ``inflow``/``outflow``, the way the money actually moved, so a
+    refund can be told apart from a charge of the same size.
+    """
+
+    name = conn.execute("SELECT name FROM obligations WHERE id = ?", (obligation_id,)).fetchone()
+    tokens = _tokens((name["name"] if name else "") or "")
+    row = conn.execute(
+        """
+        SELECT t.amount, t.payee, t.description,
+               substr(COALESCE(t.posted, t.transacted_at), 1, 10) AS charged_on
+        FROM obligation_instances oi
+        LEFT JOIN transaction_obligation_matches m ON m.obligation_instance_id = oi.id
+        JOIN transactions t ON t.id = COALESCE(oi.matched_transaction_id, m.transaction_id)
+        WHERE oi.obligation_id = ?
+        ORDER BY charged_on DESC, oi.due_date DESC
+        LIMIT 1
+        """,
+        (obligation_id,),
+    ).fetchone()
+    if row is not None:
+        tokens |= _tokens(f"{row['payee'] or ''} {row['description'] or ''}")
+        billed = float(row["amount"])
+        return round(abs(billed), 2), row["charged_on"], tokens, ("inflow" if billed > 0 else "outflow")
+
+    # Never reconciled: fall back to the last modeled amount, name tokens only.
+    inst = conn.execute(
+        "SELECT amount, direction, due_date FROM obligation_instances "
+        "WHERE obligation_id = ? AND status != 'deleted' ORDER BY due_date DESC LIMIT 1",
+        (obligation_id,),
+    ).fetchone()
+    if inst is None or not tokens:
+        return None
+    direction = inst["direction"] or ("inflow" if float(inst["amount"]) > 0 else "outflow")
+    return round(abs(float(inst["amount"])), 2), inst["due_date"], tokens, direction
+
+
 def _individually_matchable(conn: sqlite3.Connection, inst: sqlite3.Row, opts: dict[str, Any]) -> bool:
     best = _best_match(conn, inst, opts)
     return best is not None and best["match_type"] in {"auto", "needs_review"}
@@ -432,7 +690,13 @@ def list_reconciliation_review_items(
     *,
     as_of_date: date | str | None = None,
 ) -> list[dict[str, Any]]:
-    """List recorded matches whose obligation instance still awaits confirmation."""
+    """List recorded matches whose obligation instance still awaits confirmation.
+
+    Also carries the two raises a clean match would otherwise hide: a charge that
+    moved materially against last cycle's charge (``amount_change``, with both
+    amounts and both dates), and a charge that kept arriving after the bill was
+    cancelled (``review_type = charge_after_cancellation``).
+    """
 
     ensure_app_schema(conn)
     # Only needs_review matches genuinely AWAIT confirmation. auto matches are
@@ -446,7 +710,8 @@ def list_reconciliation_review_items(
     rows = conn.execute(
         f"""
         SELECT m.obligation_instance_id, m.transaction_id, m.match_type, m.match_score, m.amount_delta,
-               oi.obligation_id, oi.due_date, oi.amount, oi.direction, oi.status, o.name AS obligation_name
+               m.evidence_json, oi.obligation_id, oi.due_date, oi.amount, oi.direction, oi.status,
+               o.name AS obligation_name
         FROM transaction_obligation_matches m
         JOIN obligation_instances oi ON oi.id = m.obligation_instance_id
         JOIN obligations o ON o.id = oi.obligation_id
@@ -456,8 +721,9 @@ def list_reconciliation_review_items(
         """,
         params,
     ).fetchall()
-    return [
+    items = [
         {
+            "review_type": "match_confirmation",
             "obligation_instance_id": r["obligation_instance_id"],
             "obligation_id": r["obligation_id"],
             "obligation_name": r["obligation_name"],
@@ -468,9 +734,12 @@ def list_reconciliation_review_items(
             "match_type": r["match_type"],
             "match_score": round(float(r["match_score"]), 3),
             "amount_delta": round(float(r["amount_delta"]), 2) if r["amount_delta"] is not None else None,
+            "amount_change": (_loads(r["evidence_json"]) or {}).get("amount_change"),
         }
         for r in rows
     ]
+    items.extend(list_post_cancellation_charges(conn, as_of_date=as_of_date))
+    return items
 
 
 def find_transaction_matches(
@@ -698,6 +967,8 @@ def _record_match(conn: sqlite3.Connection, inst: sqlite3.Row, best: dict[str, A
     }
     if best.get("group_evidence"):
         evidence["group"] = best["group_evidence"]
+    if best.get("amount_change"):
+        evidence["amount_change"] = best["amount_change"]
     conn.execute(
         """
         INSERT INTO transaction_obligation_matches (
