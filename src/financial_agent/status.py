@@ -80,6 +80,7 @@ def get_finance_status(
 
     with _connect(resolved_db_path) as conn:
         accounts = _latest_balances(conn, as_of=projection_start_date)
+        coverage = balance_coverage(conn, as_of=projection_start_date, accounts=accounts)
         source_freshness = _source_freshness(conn, observed_at)
         cash_flow_projections, cash_flow_warnings = build_cash_flow_projections(
             conn,
@@ -125,6 +126,10 @@ def get_finance_status(
             # card's negative available into the sum. (See digest/grounding.)
             "liquid_available": round(sum(a["available"] for a in accounts if a["balance"] >= 0), 2),
             "accounts": accounts,
+            # How current and how complete these numbers are. Every consumer that
+            # states a cash or runway figure reads this so the figure can never be
+            # quoted without its as-of date and its known gaps.
+            "coverage": coverage,
             "provenance": {
                 "database": str(resolved_db_path),
                 "tables": ["accounts", "balance_snapshots"],
@@ -138,6 +143,7 @@ def get_finance_status(
         "guardrail_findings": guardrail_findings,
         "todoist_review_candidates": [],
         "warnings": [
+            describe_balance_coverage(coverage),
             *cash_flow_warnings,
             *[g["message"] for g in guardrail_findings if not g.get("advisory")],
             "Todoist review candidates are not implemented yet",
@@ -287,6 +293,85 @@ def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> 
             }
         )
     return accounts
+
+
+def balance_coverage(
+    conn: sqlite3.Connection,
+    *,
+    as_of: date | None = None,
+    accounts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """How current and how complete the balances behind an answer are.
+
+    Any cash or runway answer has to be able to say two things: the date the
+    balances it used were actually good for, and which accounts it could not see
+    at all. An account row with no balance snapshot (a partner's card that was
+    never linked, a feed that has never returned) is invisible to
+    ``_latest_balances`` because that query joins through ``balance_snapshots``,
+    so it is found here by reading the account roster directly.
+
+    ``balances_as_of`` is the OLDEST balance date in play, because an answer is
+    only as current as its stalest input.
+    """
+
+    as_of_date = as_of or _finance_today()
+    if accounts is None:
+        accounts = _latest_balances(conn, as_of=as_of_date)
+
+    represented = {account.get("account_id") for account in accounts}
+    missing: list[dict[str, Any]] = []
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+    ).fetchone():
+        missing = [
+            {"account_id": row["id"], "account_name": row["name"], "org": row["org"]}
+            for row in conn.execute(
+                "SELECT id, name, org FROM accounts ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+            if row["id"] not in represented
+        ]
+
+    dates = sorted(a["balance_date"] for a in accounts if a.get("balance_date"))
+    stale = [
+        {
+            "account_id": a.get("account_id"),
+            "account_name": a.get("account_name"),
+            "balance_date": a.get("balance_date"),
+            "balance_age_days": a.get("balance_age_days"),
+        }
+        for a in accounts
+        if a.get("balance_date_stale")
+    ]
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "balances_as_of": dates[0] if dates else None,
+        "newest_balance_date": dates[-1] if dates else None,
+        "accounts_represented": len(accounts),
+        "accounts_missing_data": missing,
+        "stale_accounts": stale,
+        "complete": not missing and not stale,
+    }
+
+
+def describe_balance_coverage(coverage: dict[str, Any]) -> str:
+    """One sentence naming the as-of date and every account not represented."""
+
+    as_of = coverage.get("balances_as_of")
+    parts = [f"Balances are as of {as_of}" if as_of else "Balances carry no recorded as-of date"]
+    missing = coverage.get("accounts_missing_data") or []
+    if missing:
+        parts.append(
+            "no balance data for " + ", ".join(m["account_name"] for m in missing)
+        )
+    stale = coverage.get("stale_accounts") or []
+    if stale:
+        parts.append(
+            "stale: "
+            + ", ".join(f"{s['account_name']} ({s['balance_date']})" for s in stale)
+        )
+    if not missing and not stale:
+        parts.append("all known accounts represented")
+    return "; ".join(parts) + "."
 
 
 def _snapshot_date(value: Any) -> date | None:

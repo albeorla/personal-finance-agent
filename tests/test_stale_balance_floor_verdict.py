@@ -335,7 +335,9 @@ def test_missing_working_balance_surfaces_unverified_everywhere(tmp_path):
 
     status_floor = _cash_floor_findings({"findings": status["guardrail_findings"]})
     assert len(status_floor) == 1
-    assert status_floor[0]["evidence"] == {
+    evidence = dict(status_floor[0]["evidence"])
+    coverage = evidence.pop("coverage")
+    assert evidence == {
         "verdict": "unverified",
         "reason": "missing_working_balance",
         "account_id": None,
@@ -346,6 +348,8 @@ def test_missing_working_balance_surfaces_unverified_everywhere(tmp_path):
         "balance_source": None,
         "would_be_breach_windows": None,
     }
+    assert coverage["as_of_date"] == AS_OF
+    assert coverage["balances_as_of"] is None
 
     floor_items = [
         item

@@ -134,10 +134,26 @@ def list_guardrail_findings(
 
 
 def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
-    from .status import WORKING_BALANCE_STALE_DAYS, _latest_balances
+    """Floor verdict, withheld whenever the balances behind it are not trustworthy.
+
+    Three ways the verdict is withheld rather than stated: no working balance at
+    all, a working balance older than its refresh window, and an account on the
+    roster with no balance data (so the model cannot see part of the money). Both
+    the breach and the withheld verdict carry the as-of date and the named gaps,
+    so no number is ever quoted without saying how current and how complete it is.
+    """
+
+    from .status import (
+        WORKING_BALANCE_STALE_DAYS,
+        _latest_balances,
+        balance_coverage,
+        describe_balance_coverage,
+    )
 
     if accounts is None:
         accounts = _latest_balances(conn, as_of=as_of)
+    coverage = balance_coverage(conn, as_of=as_of, accounts=accounts)
+    coverage_note = describe_balance_coverage(coverage)
     projections, _ = build_cash_flow_projections(
         conn,
         accounts=accounts,
@@ -145,44 +161,36 @@ def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
         start_date=as_of,
         working_balance_stale_days=WORKING_BALANCE_STALE_DAYS,
     )
+    would_be_breach_windows = [
+        p["window_days"] for p in projections
+        if p.get("lowest_balance") is not None and p["lowest_balance"] < CASH_FLOOR
+    ]
     if not projections:
-        return [_finding(
-            "cash_floor", "guardrail:cash_floor:unverified", "medium",
+        return [_unverified(
+            "missing_working_balance",
             "Cash floor verdict is unverified because no working balance evidence "
             "exists; enter the current portal balance or provide a fresh export "
             "that updates the working balance.",
-            {
-                "verdict": "unverified",
-                "reason": "missing_working_balance",
-                "account_id": None,
-                "account_name": None,
-                "balance_date": None,
-                "balance_age_days": None,
-                "balance_recorded_at": None,
-                "balance_source": None,
-                "would_be_breach_windows": None,
-            },
+            coverage, coverage_note, working_account={}, would_be_breach_windows=None,
         )]
-    if projections[0]["working_account"]["balance_date_stale"]:
-        working_account = projections[0]["working_account"]
-        return [_finding(
-            "cash_floor", "guardrail:cash_floor:unverified", "medium",
+    working_account = projections[0]["working_account"]
+    if working_account["balance_date_stale"]:
+        return [_unverified(
+            "stale_working_balance",
             "Cash floor verdict is unverified because the working balance is stale; "
             "enter the current portal balance. If no manual correction is pinned, "
             "a fresh export that updates the working balance can also verify it.",
-            {
-                "verdict": "unverified",
-                "account_id": working_account.get("account_id"),
-                "account_name": working_account.get("account_name"),
-                "balance_date": working_account.get("source_balance_date"),
-                "balance_age_days": working_account.get("source_balance_age_days"),
-                "balance_recorded_at": working_account.get("recorded_at"),
-                "balance_source": working_account.get("source"),
-                "would_be_breach_windows": [
-                    p["window_days"] for p in projections
-                    if p.get("lowest_balance") is not None and p["lowest_balance"] < CASH_FLOOR
-                ],
-            },
+            coverage, coverage_note, working_account, would_be_breach_windows,
+        )]
+    if coverage["accounts_missing_data"]:
+        names = ", ".join(a["account_name"] for a in coverage["accounts_missing_data"])
+        return [_unverified(
+            "missing_account_data",
+            f"Cash floor verdict is unverified because {names} "
+            f"{'has' if len(coverage['accounts_missing_data']) == 1 else 'have'} no "
+            "balance data, so part of the money is missing from the model; link the "
+            "account or enter the current portal balance for it.",
+            coverage, coverage_note, working_account, would_be_breach_windows,
         )]
     findings: list[dict[str, Any]] = []
     for p in projections:
@@ -193,11 +201,32 @@ def _check_cash_floor(conn, as_of, accounts, windows) -> list[dict[str, Any]]:
         findings.append(_finding(
             "cash_floor", f"guardrail:cash_floor:{window}d",
             "high" if window <= 7 else "medium",
-            f"Projected low of ${lowest:,.2f} in the {window}-day window is below the ${CASH_FLOOR:,.0f} cash floor.",
-            {"window_days": window, "lowest_balance": lowest, "floor": CASH_FLOOR, "lowest_balance_date": p.get("lowest_balance_date")},
+            f"Projected low of ${lowest:,.2f} in the {window}-day window is below the "
+            f"${CASH_FLOOR:,.0f} cash floor. {coverage_note}",
+            {"window_days": window, "lowest_balance": lowest, "floor": CASH_FLOOR,
+             "lowest_balance_date": p.get("lowest_balance_date"), "coverage": coverage},
             cash_flow_impact=round(lowest - CASH_FLOOR, 2),
         ))
     return findings
+
+
+def _unverified(reason, message, coverage, coverage_note, working_account, would_be_breach_windows):
+    return _finding(
+        "cash_floor", "guardrail:cash_floor:unverified", "medium",
+        f"{message} {coverage_note}",
+        {
+            "verdict": "unverified",
+            "reason": reason,
+            "account_id": working_account.get("account_id"),
+            "account_name": working_account.get("account_name"),
+            "balance_date": working_account.get("source_balance_date"),
+            "balance_age_days": working_account.get("source_balance_age_days"),
+            "balance_recorded_at": working_account.get("recorded_at"),
+            "balance_source": working_account.get("source"),
+            "would_be_breach_windows": would_be_breach_windows,
+            "coverage": coverage,
+        },
+    )
 
 
 def _check_drift_threshold(conn, as_of, drift_findings) -> list[dict[str, Any]]:
