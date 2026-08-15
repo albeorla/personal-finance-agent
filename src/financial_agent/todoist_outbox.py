@@ -884,6 +884,34 @@ def reconcile_todoist_completions(
     return summary
 
 
+# Surface keys in these families carry a volatile trailing segment (the bill's
+# due date, the statement cycle). When that segment moves the item gets a NEW
+# key, and a plain create would put a SECOND open task for the same bill on the
+# board next to the first. These keys are re-pointed instead: the already-open
+# task is updated in place and the ledger row is re-keyed.
+_REKEY_PREFIXES = ("obligation-due:", "estimate-review:")
+
+
+def _open_emission_for_same_subject(
+    conn: sqlite3.Connection, surface_key: str
+) -> sqlite3.Row | None:
+    """An open emission for the same bill under an older key, if there is one."""
+
+    if not surface_key.startswith(_REKEY_PREFIXES) or surface_key.count(":") < 2:
+        return None
+    stem = surface_key.rsplit(":", 1)[0]
+    # ponytail: scans the open rows (a board's worth, tens); index it if the
+    # ledger ever grows past that.
+    rows = conn.execute(
+        "SELECT surface_key, todoist_task_id, created_at FROM todoist_emissions "
+        "WHERE status = 'open' ORDER BY created_at"
+    ).fetchall()
+    for row in rows:
+        if row["surface_key"] != surface_key and row["surface_key"].rsplit(":", 1)[0] == stem:
+            return row
+    return None
+
+
 def surface_to_todoist(
     conn: sqlite3.Connection,
     items: list[dict[str, Any]],
@@ -899,10 +927,18 @@ def surface_to_todoist(
 ) -> dict[str, Any]:
     """Push due items to Todoist with automatic de-duplication via the ledger.
 
-    Each item is ``{surface_key, content, description?, due_date?, priority?}``.
+    Each item is ``{surface_key, content, description?, due_date?, priority?}``,
+    plus an optional ``subject`` naming the bill it is about. Items sharing a
+    subject are collapsed to one here (``one_task_per_subject``) so the board
+    never asks two questions about one bill; the item list the caller passed in
+    is not modified, and readers of it (the digest) still see every item.
+
     For every item, against the ``todoist_emissions`` ledger:
     - no ledger row -> create task (with ``[fa:<key>]`` marker + ``fa-auto``
       label), insert ledger row (status='open')
+    - no ledger row, but the same bill is open under an older key (its due date
+      or statement cycle moved) -> update that task in place and re-key the
+      ledger row, so the board never shows the same bill twice
     - row exists + open + content_hash unchanged -> skip (idempotent)
     - row exists + open + content_hash changed -> update the same task in place,
       refresh the ledger hash (never recreate)
@@ -925,6 +961,14 @@ def surface_to_todoist(
 
     ensure_app_schema(conn)
     _coerce_date(as_of_date)  # validate shape; surfacing is date-agnostic per item
+
+    # The board is the only place a duplicate can appear, so the one-task-per-bill
+    # rule is applied here and not in the builder: the daily digest keeps reading
+    # the complete list and still names every bill. Imported locally to keep
+    # todoist_outbox off surface_queue's import chain.
+    from .surface_queue import one_task_per_subject
+
+    items = one_task_per_subject(items)
 
     # Resolve the gate. When write_enabled is explicitly False, do NOT read config
     # so tests stay hermetic and can never fire a live send. Config fills gaps only.
@@ -1057,6 +1101,48 @@ def surface_to_todoist(
             summary["updated"] += 1
             summary["items"].append({"surface_key": key, "action": "updated", "todoist_task_id": row["todoist_task_id"]})
             continue
+
+        # No ledger row, but the same bill may already be open under an older key
+        # (its due date moved). Update that task in place and re-key the ledger row
+        # so the board never carries the same question twice.
+        prior = _open_emission_for_same_subject(conn, key)
+        if prior is not None:
+            try:
+                _update_surface_task(
+                    token, prior["todoist_task_id"], content, description, key,
+                    due_date=due_date, priority=priority, send_func=send_func,
+                )
+            except Exception as exc:  # noqa: BLE001 - record, never crash the batch
+                if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    # Prior task deleted in Todoist: close its row and fall through
+                    # to a clean create rather than failing this push every day.
+                    mark_emission_status(conn, prior["surface_key"], "deleted_by_user")
+                    prior = None
+                else:
+                    summary["failed"] += 1
+                    summary["items"].append({"surface_key": key, "action": "failed", "reason": f"{type(exc).__name__}: {exc}"[:200]})
+                    continue
+            if prior is not None:
+                now = _now()
+                conn.execute(
+                    "DELETE FROM todoist_emissions WHERE surface_key = ?", (prior["surface_key"],)
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO todoist_emissions (
+                        surface_key, todoist_task_id, status, content_hash, created_at, last_seen
+                    ) VALUES (?, ?, 'open', ?, ?, ?)
+                    """,
+                    (key, prior["todoist_task_id"], new_hash, prior["created_at"] or now, now),
+                )
+                summary["updated"] += 1
+                summary["items"].append({
+                    "surface_key": key,
+                    "action": "updated",
+                    "todoist_task_id": prior["todoist_task_id"],
+                    "rekeyed_from": prior["surface_key"],
+                })
+                continue
 
         # No ledger row: create the task, then insert the ledger row.
         try:

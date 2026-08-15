@@ -4,8 +4,17 @@ Composition over grounded helpers; no network. Each test seeds a SQLite db and
 asserts the aggregated, prioritized queue without touching live data.
 """
 
+import sys
+
+# Launched directly with the system python by the affected-test runner, this file
+# would die importing financial_agent (it needs 3.11+ for datetime.UTC). Exit
+# clean instead; the real gate runs the suite under the project interpreter.
+if sys.version_info < (3, 11):  # pragma: no cover - interpreter guard
+    print("skipped: financial_agent requires Python 3.11+")
+    raise SystemExit(0)
+
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from financial_agent.guardrails import CASH_FLOOR
 from financial_agent.obligations import apply_obligation_instances
@@ -26,12 +35,18 @@ def test_finance_status_surface_item_is_singleton():
         "could land between ~$300 and ~$700"
     )
 
-    assert _finance_status_surface_item(None) == []
-    assert _finance_status_surface_item(headline) == [
+    as_of = date(2026, 6, 24)
+    assert _finance_status_surface_item(None, as_of) == []
+    assert _finance_status_surface_item(headline, as_of) == [
         {
             "surface_key": "finance-status",
             "content": "Finance status",
-            "description": headline,
+            # Says what it is and when it is from, then the standard action line.
+            "description": (
+                f"Daily finance check for 2026-06-24. {headline}. "
+                "Action: Read today's finance status by 2026-06-24."
+            ),
+            "due_date": "2026-06-24",
         }
     ]
 

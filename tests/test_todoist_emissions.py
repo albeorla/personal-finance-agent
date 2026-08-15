@@ -6,6 +6,15 @@ These tests drive surface_to_todoist / reconcile_emission with a mock send_func
 so no real network call is ever made.
 """
 
+import sys
+
+# Launched directly with the system python by the affected-test runner, this file
+# would die importing financial_agent (it needs 3.11+ for datetime.UTC). Exit
+# clean instead; the real gate runs the suite under the project interpreter.
+if sys.version_info < (3, 11):  # pragma: no cover - interpreter guard
+    print("skipped: financial_agent requires Python 3.11+")
+    raise SystemExit(0)
+
 import sqlite3
 
 import financial_agent.todoist_outbox as tb
@@ -412,7 +421,12 @@ def test_build_sync_failed_item_shape():
     assert item["surface_key"] == "data-sync-failed:2026-06-24"
     assert item["content"] == "Data sync failed - balances stale"
     assert item["priority"] == 4  # highest in Todoist
-    assert "did not refresh" in item["description"]
+    # Says what happened in plain words (no internal function name) and closes
+    # with the standard dated action line; never dateless.
+    assert "did not finish" in item["description"]
+    assert "run_background_sync" not in item["description"]
+    assert item["description"].endswith("Action: Re-run the daily sync by 2026-06-24.")
+    assert item["due_date"] == "2026-06-24"
 
 
 def test_sync_failed_item_prepended_then_pushed_and_deduped(tmp_path):

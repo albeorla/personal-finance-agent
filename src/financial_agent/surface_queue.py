@@ -202,17 +202,22 @@ def build_sync_failed_item(as_of_date: date | str) -> dict[str, Any]:
     the visible flag that the data is stale and the guardrail checks were skipped
     this run. Its ``surface_key`` is keyed by date (``data-sync-failed:<today>``)
     so the emissions ledger dedupes a same-day re-run instead of nagging twice.
+
+    The body says what happened in plain words (no internal function name) and
+    closes with the same dated action line every other surfaced task uses.
     """
 
     as_of = _coerce_date(as_of_date).isoformat()
+    action = render_next_action(NextAction(verb="Re-run the daily sync", by=as_of))
     return {
         "surface_key": f"data-sync-failed:{as_of}",
         "content": "Data sync failed - balances stale",
         "description": (
-            f"run_background_sync failed for {as_of}; balances did not refresh. "
-            "Cash-floor / drift checks were skipped this run. Re-run the daily "
-            "after the source is back."
+            f"The {as_of} pull of bank and card data did not finish, so the "
+            "balances behind these tasks are stale and the cash-floor and drift "
+            f"checks were skipped. {action}"
         ),
+        "due_date": as_of,
         # Todoist priority 4 = highest (p1 in the UI).
         "priority": 4,
     }
@@ -241,6 +246,12 @@ def build_surface_items(
 
     Read-only. Returns items in a deterministic order (follow-ups, goals,
     manual-due, estimates, snapshots, check suggestions) for stable re-runs.
+
+    This is the COMPLETE read of what needs attention today, and the daily digest
+    renders from it, so nothing is dropped here. Items that two builders can raise
+    for the same bill carry a ``subject``; the one-task-per-subject rule is
+    applied by the Todoist push (``one_task_per_subject``), which is the only
+    place a duplicate task can actually appear.
     """
 
     ensure_app_schema(conn)
@@ -253,7 +264,7 @@ def build_surface_items(
     items += _snapshot_due_surface_items(conn, as_of)
     items += _check_suggestion_surface_items(conn, as_of)
     items += _onboarding_digest_surface_item(conn, as_of)
-    items += _finance_status_surface_item(headline)
+    items += _finance_status_surface_item(headline, as_of)
     return items
 
 
@@ -292,7 +303,116 @@ def build_surface_retire_keys(
             "WHERE status = 'open' AND surface_key LIKE 'check-suggestion:%'"
         ).fetchall()
         retire_keys += [row[0] for row in rows if row[0] not in active_check_keys]
-    return retire_keys
+
+    retire_keys += _subject_dedupe_retire_keys(conn, as_of)
+    # Two rules can name the same key (a rejected suggestion that also lost its
+    # subject); retire it once, in the order it was found.
+    return list(dict.fromkeys(retire_keys))
+
+
+def _subject_dedupe_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[str]:
+    """Tasks already on the board for a bill that a different task now speaks for.
+
+    ``one_task_per_subject`` only trims THIS run's pushed items, and the bill's pay
+    task is normally raised days before a check that may have paid it shows up. By
+    then the pay task is on the board with an open ledger row, so suppressing the
+    item leaves the duplicate standing. These are those already-open keys, deleted
+    by the write path in the same run that raises the winner. Rejecting the check
+    puts the pay task back (``_rejected_check_past_due_rows``), so a bill is never
+    left unpaid with nothing on the board.
+
+    Only cross-family losers are retired. A stale key in the WINNER's own family
+    (the bill's due date moved) is re-pointed in place by ``surface_to_todoist``'s
+    re-key path, which keeps the same Todoist task instead of churning it.
+    """
+
+    try:
+        tagged = (
+            _manual_obligation_due_surface_items(conn, as_of)
+            + _estimate_review_surface_items(conn, as_of)
+            + _check_suggestion_surface_items(conn, as_of)
+        )
+    except sqlite3.OperationalError:
+        return []
+    winners = {
+        subject: tagged[idx]["surface_key"] for subject, idx in _subject_winners(tagged).items()
+    }
+    if not winners:
+        return []
+    # A check-suggestion key carries the suggestion id, not the bill, so its
+    # subject can only be read off the item that built it.
+    subject_by_check_key = {
+        item["surface_key"]: item["subject"]
+        for item in tagged
+        if item["surface_key"].startswith("check-suggestion:")
+    }
+
+    stale: list[str] = []
+    rows = conn.execute(
+        "SELECT surface_key FROM todoist_emissions WHERE status = 'open'"
+    ).fetchall()
+    for (key,) in rows:
+        family = key.split(":", 1)[0]
+        if family in ("obligation-due", "estimate-review"):
+            subject = f"obligation:{key.split(':')[1]}" if key.count(":") >= 2 else None
+        else:
+            subject = subject_by_check_key.get(key)
+        winner = winners.get(subject) if subject else None
+        if winner is None or winner == key or winner.split(":", 1)[0] == family:
+            continue
+        stale.append(key)
+    return stale
+
+
+# --- one task per subject --------------------------------------------------
+# Three builders can raise the SAME bill in the same run: the payment task, the
+# estimate refresh, and a check that may already have paid it. All three on the
+# BOARD reads as duplicates (and the worst pair asks for a payment that may have
+# already cleared), so the builders that can collide tag their item with a
+# ``subject`` and the Todoist push raises only the highest-precedence item per
+# subject. This is a push-time rule, not a read-time one: the digest still names
+# every one of them, so a bill is never silently missing from the daily close.
+# Precedence is answer-before-act: settle whether the bill is already paid, then
+# pay it, then refine its estimate. The loser is not retired here - the winner is
+# simply the only task raised while it is open.
+_SUBJECT_PRECEDENCE: dict[str, int] = {
+    "check-suggestion": 0,
+    "obligation-due": 1,
+    "estimate-review": 2,
+}
+
+
+def _subject_winners(items: list[dict[str, Any]]) -> dict[str, int]:
+    """subject -> index of the one item that gets to speak for it this run."""
+
+    ranked: dict[str, tuple[int, int]] = {}  # subject -> (precedence, index)
+    for idx, item in enumerate(items):
+        subject = item.get("subject")
+        if not subject:
+            continue
+        rank = _SUBJECT_PRECEDENCE.get(item["surface_key"].split(":", 1)[0], 99)
+        if subject not in ranked or rank < ranked[subject][0]:
+            ranked[subject] = (rank, idx)
+    return {subject: idx for subject, (_, idx) in ranked.items()}
+
+
+def one_task_per_subject(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one item per ``subject``; drop the rest. Untagged items pass through.
+
+    Called by the Todoist push, never by the digest read. Returns copies so the
+    caller's item list (which the digest may still be rendering from) is left
+    intact, and strips ``subject`` so the internal routing field never ships.
+    """
+
+    keep = set(_subject_winners(items).values())
+    kept: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        if item.get("subject") and idx not in keep:
+            continue
+        if "subject" in item:
+            item = {k: v for k, v in item.items() if k != "subject"}
+        kept.append(item)
+    return kept
 
 
 def _check_suggestion_surface_items(
@@ -310,34 +430,59 @@ def _check_suggestion_surface_items(
         eligible = suggestion["evidence"]["competition"]["eligible_bill_count"]
         ambiguous = "yes" if suggestion["ambiguous"] else "no"
         suggestion_id = suggestion["suggestion_id"]
+        by = as_of.isoformat()
+        action = render_next_action(
+            NextAction(
+                verb=f"Reply approve {suggestion_id} or reject {suggestion_id} to the agent",
+                by=by,
+            )
+        )
         items.append(
             {
                 "surface_key": f"check-suggestion:{suggestion_id}",
+                "subject": f"obligation:{bill['obligation_id']}",
                 "content": f"Review check match: {bill['name']}",
                 "description": (
-                    f"Possible payment: ${_money(abs(bill['amount']))} due "
-                    f"{bill['due_date']}; CHECK {transaction['check_identifier']} "
-                    f"posted {transaction['date']} for "
-                    f"${_money(abs(transaction['amount']))} from "
-                    f"{transaction['account_name']}. Ambiguous: {ambiguous} "
-                    f"({eligible} eligible bills). Suggestion: {suggestion_id}. "
-                    "Tell the agent approve to mark this bill paid, or reject to keep it "
-                    "open. Checking this Todoist task is not financial approval."
+                    f"{bill['name']} for ${_money(abs(bill['amount']))} is due "
+                    f"{bill['due_date']} and still open, and check "
+                    f"{transaction['check_identifier']} for "
+                    f"${_money(abs(transaction['amount']))} cleared "
+                    f"{transaction['account_name']} on {transaction['date']}. That "
+                    "check may be this payment (ambiguous: "
+                    f"{ambiguous}, {eligible} eligible "
+                    f"{'bill' if eligible == 1 else 'bills'}). Approving marks the "
+                    "bill paid; rejecting keeps it open. Checking this Todoist task "
+                    f"off is not financial approval. {action}"
                 ),
-                "due_date": as_of.isoformat(),
+                "due_date": by,
             }
         )
     return items
 
 
-def _finance_status_surface_item(headline: str | None) -> list[dict[str, Any]]:
+def _finance_status_surface_item(headline: str | None, as_of: date) -> list[dict[str, Any]]:
+    """The standing status task: says what it is, and closes with a dated action.
+
+    The headline alone reads as a bare number with no reason for existing, so the
+    body names the run it came from and ends with the same action line every other
+    surfaced task uses (reading it IS the whole action here).
+    """
+
     if not headline:
         return []
+    by = as_of.isoformat()
+    action = render_next_action(NextAction(verb="Read today's finance status", by=by))
+    # The headline is free text and often ends mid-clause; close it so it does not
+    # run into the action line.
+    summary = headline.strip()
+    if summary[-1] not in ".!?":
+        summary += "."
     return [
         {
             "surface_key": _FINANCE_STATUS_KEY,
             "content": "Finance status",
-            "description": headline,
+            "description": f"Daily finance check for {by}. {summary} {action}",
+            "due_date": by,
         }
     ]
 
@@ -428,8 +573,12 @@ def _manual_obligation_due_surface_items(
         items.append(
             {
                 "surface_key": it["id"],  # obligation-due:<obligation_id>:<due_date>
+                "subject": f"obligation:{ev['obligation_id']}",
                 "content": content,
-                "description": f"Manual bill (no autopay). {render_next_action(action)}",
+                "description": (
+                    f"{name} is due {ev['due_date']} and has no autopay, so nothing "
+                    f"pays it unless you do. {render_next_action(action)}"
+                ),
                 "due_date": by,
             }
         )
@@ -468,17 +617,31 @@ def _followup_surface_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
         by = r["surface_when"]
         # The follow-up text IS the action verb/instruction; render the full text
         # on the standard dated line (description) so the deadline is explicit,
-        # and derive a short one-line title so the board stays scannable.
+        # and derive a short one-line title so the board stays scannable. The
+        # trigger sentence says where the note came from, so the task does not
+        # need the session that raised it to make sense.
         action = render_next_action(NextAction(verb=r["text"], by=by))
         items.append(
             {
                 "surface_key": f"followup:{r['id']}",
                 "content": _short_title(r["text"]),
-                "description": action,
+                "description": f"{_followup_trigger(r)} {action}",
                 "due_date": by,
             }
         )
     return items
+
+
+def _followup_trigger(row: dict[str, Any]) -> str:
+    """One plain sentence naming who raised this follow-up and when."""
+
+    raised_on = _date_part(row.get("created_at"))
+    who = (row.get("source") or "").strip()
+    tail = f" on {raised_on.isoformat()}" if raised_on else ""
+    if not who or who == "manual":
+        # "manual" means Albert asked for the reminder himself.
+        return f"Follow-up you asked for{tail}." if tail else "Follow-up you asked for."
+    return f"Follow-up raised by {who}{tail}."
 
 
 def _goal_behind_surface_items(conn: sqlite3.Connection, as_of: date) -> list[dict[str, Any]]:
@@ -510,8 +673,9 @@ def _goal_behind_surface_items(conn: sqlite3.Connection, as_of: date) -> list[di
                 "surface_key": f"goal:{g['name']}:behind",
                 "content": f"Goal behind: {g['name']}",
                 "description": (
-                    f"${_money(g['current_progress'])} of ${_money(g['target_amount'])}. "
-                    f"{action}"
+                    f"{g['name']} is behind the pace it needs: "
+                    f"${_money(g['current_progress'])} saved of "
+                    f"${_money(g['target_amount'])}. {action}"
                 ),
                 "due_date": by,
             }
@@ -544,10 +708,12 @@ def _estimate_review_surface_items(conn: sqlite3.Connection, as_of: date) -> lis
         items.append(
             {
                 "surface_key": f"estimate-review:{r['obligation_id']}:{cycle}",
+                "subject": f"obligation:{r['obligation_id']}",
                 "content": f"Refresh estimate: {r['obligation_name']}",
                 "description": (
-                    f"Amount is estimated (${_money(r['amount'])}); review_after "
-                    f"{r['review_after']} has passed. {action}"
+                    f"{r['obligation_name']} is still carrying an estimated amount "
+                    f"(${_money(r['amount'])}) and its {r['review_after']} check-back "
+                    f"date has passed. {action}"
                 ),
                 "due_date": by,
             }
@@ -673,13 +839,18 @@ def _manual_obligation_due_rows(conn: sqlite3.Connection, as_of: date) -> list[s
     ``[as_of, as_of + MANUAL_DUE_LEAD_DAYS]``. Autopay obligations are excluded so
     they stay quiet. Older databases without the ``autopay`` column raise
     OperationalError, which the callers turn into an empty list.
+
+    Past-due instances are normally left out (the window starts today), with ONE
+    exception: a bill whose "did this check pay it?" question was answered NO
+    after it came due. Saying no means nobody has paid it, so it comes back
+    (see ``_rejected_check_past_due_rows``).
     """
 
     window_start = as_of.isoformat()
     window_end = (as_of + timedelta(days=MANUAL_DUE_LEAD_DAYS)).isoformat()
     open_statuses = tuple(sorted(_MANUAL_DUE_OPEN_STATUSES))
     placeholders = ",".join("?" for _ in open_statuses)
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT
             o.id AS obligation_id,
@@ -701,6 +872,59 @@ def _manual_obligation_due_rows(conn: sqlite3.Connection, as_of: date) -> list[s
         """,
         (*open_statuses, window_start, window_end),
     ).fetchall()
+    rows += _rejected_check_past_due_rows(conn, as_of, open_statuses, placeholders)
+    rows.sort(key=lambda r: (r["due_date"], r["instance_id"]))
+    return rows
+
+
+def _rejected_check_past_due_rows(
+    conn: sqlite3.Connection,
+    as_of: date,
+    open_statuses: tuple[str, ...],
+    placeholders: str,
+) -> list[sqlite3.Row]:
+    """Past-due manual bills whose check match was rejected after they came due.
+
+    When a check may have paid a bill, the push takes the pay task down and asks
+    about the check instead. If Albert then says that check is NOT this payment,
+    the bill is unpaid, past its due date, and no longer inside the normal window,
+    so without this it would have no task at all. Rejecting re-raises it.
+
+    The rejection must be dated on or after the due date: an older rejection was
+    about a check written before the bill came due and never took a pay task
+    down. Databases predating the rejections table raise OperationalError, which
+    degrades to "no re-raise" instead of losing the whole manual-due read.
+    """
+
+    try:
+        return conn.execute(
+            f"""
+            SELECT
+                o.id AS obligation_id,
+                o.name AS obligation_name,
+                o.amount_discretionary AS amount_discretionary,
+                oi.id AS instance_id,
+                oi.due_date,
+                oi.amount,
+                oi.direction,
+                oi.status
+            FROM obligation_instances oi
+            JOIN obligations o ON o.id = oi.obligation_id
+            WHERE o.status = 'active'
+              AND o.autopay = 0
+              AND oi.status IN ({placeholders})
+              AND oi.due_date < ?
+              AND EXISTS (
+                  SELECT 1 FROM check_suggestion_rejections r
+                  WHERE r.obligation_instance_id = oi.id
+                    AND substr(r.rejected_at, 1, 10) >= oi.due_date
+              )
+            ORDER BY oi.due_date, oi.id
+            """,
+            (*open_statuses, as_of.isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
 
 def _manual_due_severity(days_until: int) -> str:

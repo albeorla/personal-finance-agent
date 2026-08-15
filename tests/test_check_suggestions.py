@@ -1,5 +1,14 @@
 """Integration contract for reviewing generic-check payment suggestions."""
 
+import sys
+
+# Launched directly with the system python by the affected-test runner, this file
+# would die importing financial_agent (it needs 3.11+ for datetime.UTC). Exit
+# clean instead; the real gate runs the suite under the project interpreter.
+if sys.version_info < (3, 11):  # pragma: no cover - interpreter guard
+    print("skipped: financial_agent requires Python 3.11+")
+    raise SystemExit(0)
+
 import importlib
 import sqlite3
 from datetime import date
@@ -361,13 +370,18 @@ def test_daily_surface_shows_check_match_evidence_and_retires_decided_pair(
     assert item["due_date"] == "2026-07-12"
     assert "$3,000.00" in item["description"]
     assert "due 2026-07-01" in item["description"]
-    assert "posted 2026-07-05" in item["description"]
-    assert "CHECK 1233" in item["description"]
+    assert "on 2026-07-05" in item["description"]
+    assert "check 1233" in item["description"]
     assert "PREMIER PLUS CKG (4321)" in item["description"]
-    assert "Ambiguous: yes (2 eligible bills)" in item["description"]
+    assert "ambiguous: yes, 2 eligible bills" in item["description"]
     assert suggestion["suggestion_id"] in item["description"]
-    assert "Tell the agent approve to mark this bill paid" in item["description"]
-    assert "Checking this Todoist task is not financial approval." in item["description"]
+    assert "Approving marks the bill paid" in item["description"]
+    assert "is not financial approval" in item["description"]
+    # One dated action line, last: what to say and by when.
+    assert item["description"].endswith(
+        f"Action: Reply approve {suggestion['suggestion_id']} or reject "
+        f"{suggestion['suggestion_id']} to the agent by 2026-07-12."
+    )
 
     conn.executemany(
         """
