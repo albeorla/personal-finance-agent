@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import date, datetime, timedelta
 from statistics import median as _stat_median
 from typing import Any
 
+from .cashflow import PROJECTABLE_STATUSES
 from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
 from .schema import ensure_app_schema
 
@@ -327,6 +329,7 @@ def list_obligation_review_candidates(
         """,
         (review_date,),
     ).fetchall()
+    cache: dict[str, Any] = {}
     return [
         {
             "review_type": "estimated_amount_ready_for_refresh",
@@ -346,6 +349,14 @@ def list_obligation_review_candidates(
             "review_after": row["review_after"],
             "estimation_method": row["estimation_method"],
             "estimation_inputs": _decode_json(row["estimation_inputs_json"]),
+            "estimate_provenance": describe_estimate_provenance(
+                conn,
+                estimation_method=row["estimation_method"],
+                estimation_inputs=_decode_json(row["estimation_inputs_json"]),
+                source=row["source"],
+                due_date=row["due_date"],
+                cache=cache,
+            ),
             "cash_flow_treatment": row["cash_flow_treatment"],
             "statement_target_obligation_id": row["statement_target_obligation_id"],
             "source": row["source"],
@@ -399,6 +410,7 @@ def list_statement_input_estimates(
             oi.status,
             oi.confidence,
             oi.notes,
+            oi.source,
             oi.amount_status,
             oi.amount_source,
             oi.estimation_method,
@@ -426,6 +438,7 @@ def list_statement_input_estimates(
             }
             for row in rows
         ]
+    cache: dict[str, Any] = {}
     return [
         {
             "instance_id": row["instance_id"],
@@ -440,12 +453,335 @@ def list_statement_input_estimates(
             "amount_source": row["amount_source"],
             "estimation_method": row["estimation_method"],
             "estimation_inputs": _decode_json(row["estimation_inputs_json"]),
+            "estimate_provenance": describe_estimate_provenance(
+                conn,
+                estimation_method=row["estimation_method"],
+                estimation_inputs=_decode_json(row["estimation_inputs_json"]),
+                source=row["source"],
+                due_date=row["due_date"],
+                cache=cache,
+            ),
             "cash_flow_treatment": row["cash_flow_treatment"],
             "statement_target_obligation_id": row["statement_target_obligation_id"],
             "notes": row["notes"],
         }
         for row in rows
     ]
+
+
+def describe_estimate_provenance(
+    conn: sqlite3.Connection,
+    *,
+    estimation_method: str | None,
+    estimation_inputs: Any,
+    source: str | None,
+    due_date: str | None = None,
+    cache: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Explain an estimated amount as data: method, inputs, months, and gaps.
+
+    An estimate is only as good as the history behind it, so the derivation
+    travels with the number instead of living in prose. ``source_months`` are the
+    calendar months that actually contributed evidence; ``missing_months`` are
+    the months inside the covered span (through the instance's own due month)
+    with no evidence at all, which is how "7 charges over 6 months, nothing since
+    May" becomes visible next to the dollar figure.
+
+    ``complete`` is false whenever the method, the inputs, or the months are
+    missing - that is the null-provenance condition ``validate`` fails on.
+    """
+
+    months, evidence_count, derived_from = _estimate_source_months(
+        conn, estimation_inputs, source, cache if cache is not None else {}
+    )
+    missing = _missing_evidence_months(months, (due_date or "")[:7] or None)
+
+    gaps: list[str] = []
+    if not estimation_method:
+        gaps.append("no estimation method recorded")
+    if not estimation_inputs:
+        gaps.append("no estimation inputs recorded")
+    if not months:
+        gaps.append("no source months recorded")
+    elif evidence_count is not None and evidence_count != len(months):
+        gaps.append(f"{evidence_count} evidence charges across {len(months)} months")
+    if missing:
+        gaps.append("no evidence for " + ", ".join(missing))
+
+    return {
+        "method": estimation_method,
+        "inputs": estimation_inputs,
+        "source_months": months,
+        "months_covered": len(months),
+        "evidence_count": evidence_count,
+        "missing_months": missing,
+        "derived_from": derived_from,
+        "complete": bool(estimation_method and estimation_inputs and months),
+        "gaps": gaps,
+    }
+
+
+def list_estimate_provenance(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: date | str | None = None,
+    through_date: date | str | None = None,
+    incomplete_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Estimated amounts that reach the forecast, each with its derivation.
+
+    Pass ``incomplete_only`` to get just the rows whose provenance is missing a
+    method, inputs, or source months - the estimates a forecast cannot defend.
+    """
+
+    ensure_app_schema(conn)
+    where = [
+        "o.status = 'active'",
+        f"oi.status IN ({','.join('?' * len(PROJECTABLE_STATUSES))})",
+        "oi.amount_status = 'estimated'",
+    ]
+    params: list[Any] = sorted(PROJECTABLE_STATUSES)
+    if as_of_date is not None:
+        where.append("oi.due_date >= ?")
+        params.append(_coerce_date(as_of_date).isoformat())
+    if through_date is not None:
+        where.append("oi.due_date <= ?")
+        params.append(_coerce_date(through_date).isoformat())
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            oi.id AS instance_id, oi.obligation_id, o.name AS obligation_name,
+            oi.due_date, oi.amount, oi.direction, oi.status, oi.confidence,
+            oi.source, oi.notes, oi.amount_source, oi.estimation_method,
+            oi.estimation_inputs_json
+        FROM obligation_instances oi
+        JOIN obligations o ON o.id = oi.obligation_id
+        WHERE {" AND ".join(where)}
+        ORDER BY oi.due_date, oi.id
+        """,
+        params,
+    ).fetchall()
+
+    cache: dict[str, Any] = {}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        provenance = describe_estimate_provenance(
+            conn,
+            estimation_method=row["estimation_method"],
+            estimation_inputs=_decode_json(row["estimation_inputs_json"]),
+            source=row["source"],
+            due_date=row["due_date"],
+            cache=cache,
+        )
+        if incomplete_only and provenance["complete"]:
+            continue
+        out.append(
+            {
+                "instance_id": row["instance_id"],
+                "obligation_id": row["obligation_id"],
+                "obligation_name": row["obligation_name"],
+                "due_date": row["due_date"],
+                "amount": round(float(row["amount"]), 2),
+                "direction": row["direction"],
+                "status": row["status"],
+                "confidence": row["confidence"],
+                "amount_source": row["amount_source"],
+                "estimate_provenance": provenance,
+            }
+        )
+    return out
+
+
+def list_note_contradictions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Flag rows whose free-text note disagrees with the record it sits on.
+
+    A note reading "quarterly now" on a monthly schedule, or "account closed" on
+    a row still projecting, is a correction nobody applied. Trusting the prose
+    silently means projecting a bill that is not coming (or missing one that is),
+    so each disagreement comes back as a review item naming both sides.
+    """
+
+    ensure_app_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            oi.id AS instance_id, oi.obligation_id, o.name AS obligation_name,
+            o.cadence, oi.due_date, oi.amount, oi.status, oi.amount_status, oi.notes
+        FROM obligation_instances oi
+        JOIN obligations o ON o.id = oi.obligation_id
+        WHERE o.status = 'active'
+          AND oi.notes IS NOT NULL AND oi.notes != ''
+          AND oi.status NOT IN ('deleted', 'canceled')
+        ORDER BY oi.due_date, oi.id
+        """
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        note = row["notes"]
+        for field, note_says, record_says in _note_conflicts(
+            note,
+            cadence=row["cadence"],
+            status=row["status"],
+            amount_status=row["amount_status"],
+        ):
+            out.append(
+                {
+                    "review_type": "note_contradicts_record",
+                    "instance_id": row["instance_id"],
+                    "obligation_id": row["obligation_id"],
+                    "obligation_name": row["obligation_name"],
+                    "due_date": row["due_date"],
+                    "amount": round(float(row["amount"]), 2),
+                    "field": field,
+                    "note_says": note_says,
+                    "record_says": record_says,
+                    "notes": note,
+                    "recommended_action": (
+                        f"Note says {note_says} but {field} is {record_says}; "
+                        "correct the record or clear the note."
+                    ),
+                }
+            )
+    return out
+
+
+# Cadence words a note might use, mapped onto the cadence values the record
+# stores. Both sides go through this map so 'yearly' and 'annual' do not read as
+# a disagreement.
+_CADENCE_SYNONYMS = {
+    "weekly": "weekly",
+    "biweekly": "biweekly",
+    "bi-weekly": "biweekly",
+    "monthly": "monthly",
+    "quarterly": "quarterly",
+    "semiannual": "semiannual",
+    "semi-annual": "semiannual",
+    "annual": "annual",
+    "annually": "annual",
+    "yearly": "annual",
+}
+
+# Note wording that says the charge has stopped. On a row still headed for the
+# forecast, that is a contradiction rather than a footnote.
+_INACTIVE_NOTE_WORDS = ("canceled", "cancelled", "closed", "terminated", "discontinued", "no longer active")
+
+# Note wording that says the amount is a guess, which contradicts a confirmed
+# amount_status.
+_UNCONFIRMED_NOTE_WORDS = ("estimate", "estimated", "placeholder", "guess", "guessed", "assumed")
+
+
+def _note_conflicts(
+    note: str, *, cadence: str | None, status: str, amount_status: str | None
+) -> list[tuple[str, str, str]]:
+    lowered = note.lower()
+
+    def says(word: str) -> bool:
+        return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", lowered) is not None
+
+    conflicts: list[tuple[str, str, str]] = []
+
+    recorded_cadence = _CADENCE_SYNONYMS.get((cadence or "").lower())
+    if recorded_cadence:
+        claimed = {canonical for word, canonical in _CADENCE_SYNONYMS.items() if says(word)}
+        for claim in sorted(claimed - {recorded_cadence}):
+            conflicts.append(("cadence", claim, recorded_cadence))
+
+    if status in PROJECTABLE_STATUSES:
+        for word in _INACTIVE_NOTE_WORDS:
+            if says(word):
+                conflicts.append(("status", word, status))
+                break
+
+    if amount_status == "confirmed":
+        for word in _UNCONFIRMED_NOTE_WORDS:
+            if says(word):
+                conflicts.append(("amount_status", word, amount_status))
+                break
+
+    return conflicts
+
+
+def _estimate_source_months(
+    conn: sqlite3.Connection,
+    estimation_inputs: Any,
+    source: str | None,
+    cache: dict[str, Any],
+) -> tuple[list[str], int | None, str | None]:
+    """Months the estimate was derived from, preferring what the estimate declares."""
+
+    if isinstance(estimation_inputs, dict) and estimation_inputs.get("source_months"):
+        months = sorted({str(m)[:7] for m in estimation_inputs["source_months"] if m})
+        count = estimation_inputs.get("evidence_count")
+        return months, int(count) if isinstance(count, int) else len(months), "estimation_inputs"
+
+    prefix = "charge_onboarding:"
+    if source and source.startswith(prefix):
+        months, count = _candidate_evidence_months(conn, source[len(prefix):], cache)
+        if months:
+            return months, count, "charge_onboarding_evidence"
+
+    return [], None, None
+
+
+def _candidate_evidence_months(
+    conn: sqlite3.Connection, candidate_id: str, cache: dict[str, Any]
+) -> tuple[list[str], int | None]:
+    if candidate_id in cache:
+        return cache[candidate_id]
+
+    result: tuple[list[str], int | None] = ([], None)
+    try:
+        row = conn.execute(
+            "SELECT evidence_transaction_ids_json, evidence_count "
+            "FROM charge_onboarding_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is not None:
+            txn_ids = _decode_json(row["evidence_transaction_ids_json"]) or []
+            months: set[str] = set()
+            if txn_ids:
+                placeholders = ",".join("?" * len(txn_ids))
+                for txn in conn.execute(
+                    f"SELECT posted, transacted_at FROM transactions WHERE id IN ({placeholders})",
+                    list(txn_ids),
+                ).fetchall():
+                    posted = txn["posted"] or txn["transacted_at"]
+                    if posted:
+                        months.add(str(posted)[:7])
+            result = (sorted(months), row["evidence_count"])
+    except sqlite3.OperationalError:
+        # App-only database with no synced transactions: no months to report,
+        # which the caller reports as a provenance gap rather than a crash.
+        result = ([], None)
+
+    cache[candidate_id] = result
+    return result
+
+
+# ponytail: a 60-month cap keeps one bad date in the evidence from generating a
+# decade of "missing month" noise. Raise it if a real estimate ever spans longer.
+_MAX_PROVENANCE_SPAN_MONTHS = 60
+
+
+def _missing_evidence_months(months: list[str], through_month: str | None) -> list[str]:
+    if not months:
+        return []
+    end = max(months[-1], through_month) if through_month else months[-1]
+    covered = set(months)
+    span = _month_sequence(months[0], end)
+    return [m for m in span if m not in covered]
+
+
+def _month_sequence(start_month: str, end_month: str) -> list[str]:
+    year, month = int(start_month[:4]), int(start_month[5:7])
+    end = (int(end_month[:4]), int(end_month[5:7]))
+    out: list[str] = []
+    while (year, month) <= end and len(out) < _MAX_PROVENANCE_SPAN_MONTHS:
+        out.append(f"{year:04d}-{month:02d}")
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return out
 
 
 def delete_obligation_instance(
@@ -1414,28 +1750,50 @@ def _instances_for_obligation(
             }
             for row in rows
         ]
-    return [
-        {
-            "id": row["id"],
-            "due_date": row["due_date"],
-            "amount": round(float(row["amount"]), 2),
-            "direction": row["direction"],
-            "status": row["status"],
-            "source": row["source"],
-            "confidence": row["confidence"],
-            "notes": row["notes"],
-            "amount_status": row["amount_status"],
-            "amount_source": row["amount_source"],
-            "amount_observed_at": row["amount_observed_at"],
-            "statement_close_date": row["statement_close_date"],
-            "review_after": row["review_after"],
-            "estimation_method": row["estimation_method"],
-            "estimation_inputs": _decode_json(row["estimation_inputs_json"]),
-            "cash_flow_treatment": row["cash_flow_treatment"],
-            "statement_target_obligation_id": row["statement_target_obligation_id"],
-        }
-        for row in rows
-    ]
+    # This is the per-bill view a session opens when a bill drives a cash trough,
+    # so an estimated amount carries its months and gaps here too. The review and
+    # statement-input views do not cover it: charge-onboarded estimates have no
+    # review_after, and most estimates are not card statement inputs.
+    cache: dict[str, Any] = {}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        estimation_inputs = _decode_json(row["estimation_inputs_json"])
+        out.append(
+            {
+                "id": row["id"],
+                "due_date": row["due_date"],
+                "amount": round(float(row["amount"]), 2),
+                "direction": row["direction"],
+                "status": row["status"],
+                "source": row["source"],
+                "confidence": row["confidence"],
+                "notes": row["notes"],
+                "amount_status": row["amount_status"],
+                "amount_source": row["amount_source"],
+                "amount_observed_at": row["amount_observed_at"],
+                "statement_close_date": row["statement_close_date"],
+                "review_after": row["review_after"],
+                "estimation_method": row["estimation_method"],
+                "estimation_inputs": estimation_inputs,
+                # None on an observed amount: nothing was estimated, so there is
+                # no derivation to defend.
+                "estimate_provenance": (
+                    describe_estimate_provenance(
+                        conn,
+                        estimation_method=row["estimation_method"],
+                        estimation_inputs=estimation_inputs,
+                        source=row["source"],
+                        due_date=row["due_date"],
+                        cache=cache,
+                    )
+                    if row["amount_status"] == "estimated"
+                    else None
+                ),
+                "cash_flow_treatment": row["cash_flow_treatment"],
+                "statement_target_obligation_id": row["statement_target_obligation_id"],
+            }
+        )
+    return out
 
 
 def _coerce_date(value: date | str) -> date:

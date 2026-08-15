@@ -355,6 +355,7 @@ def test_list_obligations_includes_instances(tmp_path):
                     "review_after": None,
                     "estimation_method": None,
                     "estimation_inputs": None,
+                    "estimate_provenance": None,
                     "cash_flow_treatment": None,
                     "statement_target_obligation_id": None,
                 }
@@ -480,6 +481,23 @@ def test_list_obligation_review_candidates_finds_estimates_due_for_refresh(tmp_p
             "review_after": "2026-06-22",
             "estimation_method": None,
             "estimation_inputs": None,
+            # A portal-balance estimate records no method, inputs, or months, so
+            # its provenance comes back incomplete rather than silently absent.
+            "estimate_provenance": {
+                "method": None,
+                "inputs": None,
+                "source_months": [],
+                "months_covered": 0,
+                "evidence_count": None,
+                "missing_months": [],
+                "derived_from": None,
+                "complete": False,
+                "gaps": [
+                    "no estimation method recorded",
+                    "no estimation inputs recorded",
+                    "no source months recorded",
+                ],
+            },
             "cash_flow_treatment": None,
             "statement_target_obligation_id": None,
             "source": "obligations_yaml_manual",
@@ -864,6 +882,23 @@ def test_gault_card_spend_input_does_not_project_as_direct_checking_outflow(tmp_
                 "summer_amount": 175.0,
                 "winter_observed_amounts": [532.10, 602.48],
                 "expected_pattern": "low summer/fall charge, larger winter charges",
+            },
+            "estimate_provenance": {
+                "method": "seasonal_card_spend_pattern",
+                "inputs": {
+                    "summer_amount": 175.0,
+                    "winter_observed_amounts": [532.10, 602.48],
+                    "expected_pattern": "low summer/fall charge, larger winter charges",
+                },
+                # The inputs name amounts but no months, so this estimate cannot
+                # say which history it came from.
+                "source_months": [],
+                "months_covered": 0,
+                "evidence_count": None,
+                "missing_months": [],
+                "derived_from": None,
+                "complete": False,
+                "gaps": ["no source months recorded"],
             },
             "cash_flow_treatment": "card_statement_input",
             "statement_target_obligation_id": "amex_statement_payment",

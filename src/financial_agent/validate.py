@@ -21,6 +21,7 @@ from typing import Any
 from .config import get_finance_config
 from .drift import detect_drift
 from .guardrails import evaluate_guardrails
+from .obligations import list_estimate_provenance, list_note_contradictions
 from .onboarding import scan_charge_onboarding_candidates
 from .reconciliation import (
     list_matched_obligation_instances,
@@ -159,6 +160,47 @@ def _integrity_checks(conn: sqlite3.Connection, working_hint: str | None = None)
         "SELECT COUNT(*) FROM obligation_instances WHERE amount < 0 OR direction NOT IN ('inflow','outflow')"
     ).fetchone()[0]
     checks.append(_check("instance_amounts_normalized", bad == 0, {"bad_rows": bad}))
+
+    # Every estimate the forecast leans on has to say how it was computed, from
+    # what, and over which months. A row with null provenance is a guess wearing
+    # a dollar sign, so it fails validation rather than passing quietly.
+    unprovenanced = list_estimate_provenance(conn, incomplete_only=True)
+    checks.append(_check(
+        "estimated_amounts_carry_provenance",
+        not unprovenanced,
+        {
+            "unprovenanced_count": len(unprovenanced),
+            "instances": [
+                {
+                    "instance_id": row["instance_id"],
+                    "due_date": row["due_date"],
+                    "amount": row["amount"],
+                    "gaps": row["estimate_provenance"]["gaps"],
+                }
+                for row in unprovenanced[:10]
+            ],
+        },
+    ))
+
+    # A note that disagrees with the schedule or status it sits on is an
+    # uncorrected correction; surface it instead of projecting on the stale side.
+    contradictions = list_note_contradictions(conn)
+    checks.append(_check(
+        "notes_agree_with_records",
+        not contradictions,
+        {
+            "contradiction_count": len(contradictions),
+            "instances": [
+                {
+                    "instance_id": row["instance_id"],
+                    "field": row["field"],
+                    "note_says": row["note_says"],
+                    "record_says": row["record_says"],
+                }
+                for row in contradictions[:10]
+            ],
+        },
+    ))
 
     return checks
 
