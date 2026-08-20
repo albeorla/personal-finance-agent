@@ -892,11 +892,6 @@ def reconcile_todoist_completions(
 _REKEY_PREFIXES = ("obligation-due:", "estimate-review:")
 
 
-# Mirrors surface_queue._MANUAL_DUE_OPEN_STATUSES: an instance in one of these
-# states is a live, unpaid bill that must keep its own task.
-_REKEY_LIVE_INSTANCE_STATUSES = ("expected", "needs_review", "partially_paid")
-
-
 def _open_emission_for_same_subject(
     conn: sqlite3.Connection, surface_key: str, batch_keys: set[str]
 ) -> sqlite3.Row | None:
@@ -928,15 +923,18 @@ def _open_emission_for_same_subject(
         if row["surface_key"] in batch_keys or row["retire_requested_at"]:
             continue
         if surface_key.startswith("obligation-due:"):
+            from .surface_queue import _MANUAL_DUE_OPEN_STATUSES
+
             prior_due = row["surface_key"].rsplit(":", 1)[1]
             obligation_id = stem.split(":", 1)[1]
-            placeholders = ",".join("?" for _ in _REKEY_LIVE_INSTANCE_STATUSES)
+            open_statuses = tuple(sorted(_MANUAL_DUE_OPEN_STATUSES))
+            placeholders = ",".join("?" for _ in open_statuses)
             try:
                 live = conn.execute(
                     f"SELECT 1 FROM obligation_instances "
                     f"WHERE obligation_id = ? AND due_date = ? "
                     f"AND status IN ({placeholders}) LIMIT 1",
-                    (obligation_id, prior_due, *_REKEY_LIVE_INSTANCE_STATUSES),
+                    (obligation_id, prior_due, *open_statuses),
                 ).fetchone()
             except sqlite3.OperationalError:
                 continue

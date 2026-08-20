@@ -596,3 +596,51 @@ def test_whitespace_headline_raises_no_status_task(tmp_path):
     conn = _db(tmp_path / "t.db")
     items = build_surface_items(conn, as_of_date=AS_OF, headline="   ")
     assert not any(i["surface_key"] == "finance-status" for i in items)
+
+
+def test_two_future_instances_of_one_obligation_both_get_tasks(tmp_path):
+    """Instance-scoped subjects: a semi-monthly bill raises one task per due date."""
+
+    conn = _db(tmp_path / "t.db")
+    board = _Board()
+    _manual_bill(conn, "rent", "Rent", "2026-07-14", -1500.0)
+    _manual_bill(conn, "rent", "Rent", "2026-07-16", -1500.0)
+    conn.commit()
+
+    result = _surface(conn, AS_OF, board)
+
+    assert result["created"] == 2, result["items"]
+    assert board.live_task_ids == ["T1", "T2"]
+    assert board.updates == [], "the second instance must not adopt the first's task"
+    assert _open_keys(conn) == [
+        "obligation-due:rent:2026-07-14",
+        "obligation-due:rent:2026-07-16",
+    ]
+
+
+def test_paid_month_task_comes_down_even_while_the_next_month_is_live(tmp_path):
+    """A settled bill's task is retired even when a sibling month has its own task."""
+
+    conn = _db(tmp_path / "t.db")
+    board = _Board()
+    _manual_bill(conn, "rent", "Rent", AS_OF.isoformat(), -3000.0)
+    conn.commit()
+    _surface(conn, AS_OF, board)
+
+    _manual_bill(conn, "rent", "Rent", "2026-08-12", -3000.0)
+    conn.commit()
+    august = date(2026, 8, 12)
+    _surface(conn, august, board)
+    assert len(board.live_task_ids) == 2
+
+    # July gets settled without anyone ticking its task.
+    conn.execute(
+        "UPDATE obligation_instances SET status = 'paid' WHERE id = ?",
+        (f"rent:{AS_OF.isoformat()}",),
+    )
+    conn.commit()
+    _surface(conn, august, board)
+
+    assert _open_keys(conn) == ["obligation-due:rent:2026-08-12"]
+    assert board.live_task_ids == ["T2"]
+    assert board.deleted == ["T1"]

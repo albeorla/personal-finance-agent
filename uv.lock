@@ -1,5 +1,4 @@
 version = 1
-revision = 1
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -197,7 +196,7 @@ wheels = [
 
 [[package]]
 name = "financial-agent"
-version = "0.3.31"
+version = "0.3.32"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -213,7 +212,6 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.12.4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
 ]
-provides-extras = ["dev"]
 
 [[package]]
 name = "h11"

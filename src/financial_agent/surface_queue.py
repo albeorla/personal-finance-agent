@@ -372,17 +372,24 @@ def _resolved_bill_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[st
     Approving a check match, reconciling a payment, or canceling the bill all
     resolve the instance without anyone ticking the Todoist task, and the subject
     dedupe above never deletes a pay task, so this is the one place a settled
-    bill's task comes down. A key whose bill still surfaces today under a moved
-    key is skipped: the re-key path re-points that task instead of churning it.
+    bill's task comes down. The one skip is a stem whose bill surfaces today
+    under a brand-new key (no ledger row yet): that is the moved-date case, and
+    the re-key path re-points the old task instead of churning it. A sibling
+    month that already has its own row gives no such shelter, so a paid month's
+    task still comes down while the next month's is live.
     """
 
     try:
-        live_stems = {
-            item["surface_key"].rsplit(":", 1)[0]
-            for item in _manual_obligation_due_surface_items(conn, as_of)
-        }
+        todays_items = _manual_obligation_due_surface_items(conn, as_of)
     except sqlite3.OperationalError:
         return []
+    adopting_stems = set()
+    for item in todays_items:
+        key = item["surface_key"]
+        if conn.execute(
+            "SELECT 1 FROM todoist_emissions WHERE surface_key = ?", (key,)
+        ).fetchone() is None:
+            adopting_stems.add(key.rsplit(":", 1)[0])
     open_statuses = tuple(sorted(_MANUAL_DUE_OPEN_STATUSES))
     placeholders = ",".join("?" for _ in open_statuses)
     stale: list[str] = []
@@ -393,7 +400,7 @@ def _resolved_bill_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[st
     for (key,) in rows:
         stem, _, due = key.rpartition(":")
         obligation_id = stem.split(":", 1)[1] if ":" in stem else ""
-        if not obligation_id or stem in live_stems:
+        if not obligation_id or stem in adopting_stems:
             continue
         try:
             still_open = conn.execute(
