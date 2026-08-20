@@ -305,6 +305,7 @@ def build_surface_retire_keys(
         retire_keys += [row[0] for row in rows if row[0] not in active_check_keys]
 
     retire_keys += _subject_dedupe_retire_keys(conn, as_of)
+    retire_keys += _resolved_bill_retire_keys(conn, as_of)
     # Two rules can name the same key (a rejected suggestion that also lost its
     # subject); retire it once, in the order it was found.
     return list(dict.fromkeys(retire_keys))
@@ -313,17 +314,23 @@ def build_surface_retire_keys(
 def _subject_dedupe_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[str]:
     """Tasks already on the board for a bill that a different task now speaks for.
 
-    ``one_task_per_subject`` only trims THIS run's pushed items, and the bill's pay
-    task is normally raised days before a check that may have paid it shows up. By
-    then the pay task is on the board with an open ledger row, so suppressing the
-    item leaves the duplicate standing. These are those already-open keys, deleted
-    by the write path in the same run that raises the winner. Rejecting the check
-    puts the pay task back (``_rejected_check_past_due_rows``), so a bill is never
-    left unpaid with nothing on the board.
+    ``one_task_per_subject`` only trims THIS run's pushed items; an already-open
+    loser is retired here so the winner is the one task asking about the bill.
 
-    Only cross-family losers are retired. A stale key in the WINNER's own family
-    (the bill's due date moved) is re-pointed in place by ``surface_to_todoist``'s
-    re-key path, which keeps the same Todoist task instead of churning it.
+    Two hard limits protect the board:
+    - A pay task (``obligation-due:``) is NEVER retired by this rule. An unpaid
+      bill keeps its task until the bill is confirmed paid (owner decision
+      2026-08-20); a check question may hold a NEW pay task off the board, but it
+      never takes an existing one down. ``_resolved_bill_retire_keys`` is what
+      removes a pay task, and only once its instance is actually settled.
+    - A key is only judged by the subject of the item that built it THIS run
+      (subjects are per bill instance). An open task the current run did not
+      rebuild has no subject here and is left alone, so a task about a different
+      month can never be swept up as a "duplicate".
+
+    A stale key in the WINNER's own family (the bill's due date moved) is
+    re-pointed in place by ``surface_to_todoist``'s re-key path, which keeps the
+    same Todoist task instead of churning it.
     """
 
     try:
@@ -339,12 +346,8 @@ def _subject_dedupe_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[s
     }
     if not winners:
         return []
-    # A check-suggestion key carries the suggestion id, not the bill, so its
-    # subject can only be read off the item that built it.
-    subject_by_check_key = {
-        item["surface_key"]: item["subject"]
-        for item in tagged
-        if item["surface_key"].startswith("check-suggestion:")
+    subject_by_key = {
+        item["surface_key"]: item["subject"] for item in tagged if item.get("subject")
     }
 
     stale: list[str] = []
@@ -353,14 +356,56 @@ def _subject_dedupe_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[s
     ).fetchall()
     for (key,) in rows:
         family = key.split(":", 1)[0]
-        if family in ("obligation-due", "estimate-review"):
-            subject = f"obligation:{key.split(':')[1]}" if key.count(":") >= 2 else None
-        else:
-            subject = subject_by_check_key.get(key)
+        if family == "obligation-due":
+            continue
+        subject = subject_by_key.get(key)
         winner = winners.get(subject) if subject else None
         if winner is None or winner == key or winner.split(":", 1)[0] == family:
             continue
         stale.append(key)
+    return stale
+
+
+def _resolved_bill_retire_keys(conn: sqlite3.Connection, as_of: date) -> list[str]:
+    """Open pay tasks whose bill instance is settled (paid, canceled, deleted).
+
+    Approving a check match, reconciling a payment, or canceling the bill all
+    resolve the instance without anyone ticking the Todoist task, and the subject
+    dedupe above never deletes a pay task, so this is the one place a settled
+    bill's task comes down. A key whose bill still surfaces today under a moved
+    key is skipped: the re-key path re-points that task instead of churning it.
+    """
+
+    try:
+        live_stems = {
+            item["surface_key"].rsplit(":", 1)[0]
+            for item in _manual_obligation_due_surface_items(conn, as_of)
+        }
+    except sqlite3.OperationalError:
+        return []
+    open_statuses = tuple(sorted(_MANUAL_DUE_OPEN_STATUSES))
+    placeholders = ",".join("?" for _ in open_statuses)
+    stale: list[str] = []
+    rows = conn.execute(
+        "SELECT surface_key FROM todoist_emissions "
+        "WHERE status = 'open' AND surface_key LIKE 'obligation-due:%'"
+    ).fetchall()
+    for (key,) in rows:
+        stem, _, due = key.rpartition(":")
+        obligation_id = stem.split(":", 1)[1] if ":" in stem else ""
+        if not obligation_id or stem in live_stems:
+            continue
+        try:
+            still_open = conn.execute(
+                f"SELECT 1 FROM obligation_instances "
+                f"WHERE obligation_id = ? AND due_date = ? "
+                f"AND status IN ({placeholders}) LIMIT 1",
+                (obligation_id, due, *open_statuses),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if still_open is None:
+            stale.append(key)
     return stale
 
 
@@ -440,7 +485,7 @@ def _check_suggestion_surface_items(
         items.append(
             {
                 "surface_key": f"check-suggestion:{suggestion_id}",
-                "subject": f"obligation:{bill['obligation_id']}",
+                "subject": f"obligation-instance:{bill['instance_id']}",
                 "content": f"Review check match: {bill['name']}",
                 "description": (
                     f"{bill['name']} for ${_money(abs(bill['amount']))} is due "
@@ -468,13 +513,13 @@ def _finance_status_surface_item(headline: str | None, as_of: date) -> list[dict
     surfaced task uses (reading it IS the whole action here).
     """
 
-    if not headline:
+    summary = (headline or "").strip()
+    if not summary:
         return []
     by = as_of.isoformat()
     action = render_next_action(NextAction(verb="Read today's finance status", by=by))
     # The headline is free text and often ends mid-clause; close it so it does not
     # run into the action line.
-    summary = headline.strip()
     if summary[-1] not in ".!?":
         summary += "."
     return [
@@ -570,18 +615,21 @@ def _manual_obligation_due_surface_items(
                 account=account,
             )
             content = f"Pay {name} ${_money(ev['amount'])}"
-        items.append(
-            {
-                "surface_key": it["id"],  # obligation-due:<obligation_id>:<due_date>
-                "subject": f"obligation:{ev['obligation_id']}",
-                "content": content,
-                "description": (
-                    f"{name} is due {ev['due_date']} and has no autopay, so nothing "
-                    f"pays it unless you do. {render_next_action(action)}"
-                ),
-                "due_date": by,
-            }
-        )
+        item = {
+            "surface_key": it["id"],  # obligation-due:<obligation_id>:<due_date>
+            "content": content,
+            "description": (
+                f"{name} is due {ev['due_date']} and has no autopay, so nothing "
+                f"pays it unless you do. {render_next_action(action)}"
+            ),
+            "due_date": by,
+        }
+        # A bill already past due is never held off the board by another
+        # question about it (owner decision 2026-08-20): re-raised past-due
+        # rows carry no subject, so they always push.
+        if ev["days_until_due"] >= 0:
+            item["subject"] = f"obligation-instance:{ev['obligation_instance_id']}"
+        items.append(item)
     return items
 
 
@@ -708,7 +756,7 @@ def _estimate_review_surface_items(conn: sqlite3.Connection, as_of: date) -> lis
         items.append(
             {
                 "surface_key": f"estimate-review:{r['obligation_id']}:{cycle}",
-                "subject": f"obligation:{r['obligation_id']}",
+                "subject": f"obligation-instance:{r['instance_id']}",
                 "content": f"Refresh estimate: {r['obligation_name']}",
                 "description": (
                     f"{r['obligation_name']} is still carrying an estimated amount "

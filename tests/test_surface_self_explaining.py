@@ -331,14 +331,15 @@ def test_resolved_bill_does_not_resurrect_through_the_rekey(tmp_path):
     assert len(spy.updates) == 0
 
 
-def test_pay_task_already_on_the_board_is_removed_when_the_check_question_wins(tmp_path):
+def test_pay_task_already_on_the_board_stays_when_the_check_question_arrives(tmp_path):
     """Two runs, three days apart: the pay task goes up first, then the check.
 
     The pay task is raised days before the bill is due; a check that may have paid
-    it can only turn up later, once Albert has written it. So "pay task already
-    open, check question second" is the normal order, and holding the pay ITEM on
-    the second run is not enough: its task is already on the board. The second run
-    must take the stale pay task down, leaving one task asking one question.
+    it can only turn up later, once Albert has written it. The check question goes
+    up next to the pay task, and the pay task STAYS: an unpaid bill never loses
+    its task until the bill is confirmed paid (owner decision 2026-08-20). The
+    check task, once answered, is what settles whether the pay task comes down
+    (approve resolves the bill) or stays (reject leaves it due).
     """
 
     conn = _db(tmp_path / "t.db")
@@ -359,14 +360,13 @@ def test_pay_task_already_on_the_board_is_removed_when_the_check_question_wins(t
     second = _surface(conn, AS_OF, board)
 
     open_keys = _open_keys(conn)
-    assert len(open_keys) == 1, f"one open emission for the bill, got {open_keys}"
-    assert open_keys[0].startswith("check-suggestion:")
-    assert len(board.live_task_ids) == 1, f"one live task, got {board.live_task_ids}"
-    assert board.deleted == ["T1"], "the stale pay task must be deleted, not left up"
-    assert second["retired"] == 1 and second["created"] == 1
-    # The pay task's row is 'retired' (not deleted_by_user), so the bill can
-    # resurface if the check suggestion is later rejected.
-    assert _status(conn, "obligation-due:santiguida:2026-07-12") == "retired"
+    assert len(open_keys) == 2, f"pay task and check question, got {open_keys}"
+    assert any(k.startswith("check-suggestion:") for k in open_keys)
+    assert "obligation-due:santiguida:2026-07-12" in open_keys
+    assert board.deleted == [], "an unpaid bill's task is never deleted"
+    assert len(board.live_task_ids) == 2
+    assert second["created"] == 1 and second["retired"] == 0
+    assert _status(conn, "obligation-due:santiguida:2026-07-12") == "open"
 
 
 def test_approving_the_check_leaves_the_board_clean(tmp_path):
@@ -385,41 +385,42 @@ def test_approving_the_check_leaves_the_board_clean(tmp_path):
     assert after["created"] == 0, "a paid bill must not raise a pay task"
 
 
-def test_rejecting_the_check_brings_the_pay_task_back(tmp_path):
-    """Reject = nobody paid it: the bill is due, past due, and must be visible.
+def test_rejecting_the_check_leaves_the_pay_task_standing(tmp_path):
+    """Reject = nobody paid it: the bill stays visible, the question comes down.
 
-    The check question took the pay task down. Saying "that check is not this
-    payment" leaves the bill unpaid and outside the normal due window, so without
-    the re-raise it would have no task at all and go silently unpaid.
+    The pay task never left the board while the check question was open, so a
+    rejection only removes the answered question. The bill is past due by now,
+    and its task stays up on later days too.
     """
 
     conn = _db(tmp_path / "t.db")
     board = _Board()
     suggestion_id = _bill_with_pending_check(conn, board)
-    check_task_id = board.live_task_ids[0]
+    pay_task_id, check_task_id = board.live_task_ids
 
     reject_check_suggestion(conn, suggestion_id)
     conn.commit()
 
     after = _surface(conn, AS_OF + timedelta(days=1), board)
 
-    assert board.deleted[-1] == check_task_id, "the answered question comes down"
+    assert board.deleted == [check_task_id], "only the answered question comes down"
     open_keys = _open_keys(conn)
     assert open_keys == ["obligation-due:santiguida:2026-07-12"], open_keys
-    assert after["created"] == 1
-    assert len(board.live_task_ids) == 1
-    body = board.creates[-1]["body"]
-    assert "Santiguida rent" in body["content"]
-    assert "$3,000.00" in body["description"]
+    assert after["created"] == 0, "the pay task was never taken down, so none is created"
+    assert board.live_task_ids == [pay_task_id]
 
     # And it stays up on later days, not just the day of the rejection.
     _surface(conn, AS_OF + timedelta(days=5), board)
     assert _open_keys(conn) == ["obligation-due:santiguida:2026-07-12"]
-    assert len(board.live_task_ids) == 1
+    assert board.live_task_ids == [pay_task_id]
 
 
 def _bill_with_pending_check(conn, board):
-    """Bill due, pay task up, then a check lands and wins the board. -> its id."""
+    """Bill due, pay task up, then a check question joins it. -> suggestion id.
+
+    The pay task stays up next to the check question (owner decision 2026-08-20);
+    the question only decides how the pay task eventually comes down.
+    """
 
     _manual_bill(conn, "santiguida", "Santiguida rent", AS_OF.isoformat(), -3000.0)
     conn.commit()
@@ -430,8 +431,9 @@ def _bill_with_pending_check(conn, board):
     _surface(conn, AS_OF, board)
 
     open_keys = _open_keys(conn)
-    assert open_keys and open_keys[0].startswith("check-suggestion:"), open_keys
-    return open_keys[0].split(":", 1)[1]
+    check_keys = [k for k in open_keys if k.startswith("check-suggestion:")]
+    assert check_keys and "obligation-due:santiguida:2026-07-12" in open_keys, open_keys
+    return check_keys[0].split(":", 1)[1]
 
 
 def _surface(conn, as_of, board):
@@ -485,3 +487,112 @@ class _Board(_Spy):
         self.live_task_ids.remove(task_id)
         self.deleted.append(task_id)
         return True
+
+
+# --- 3. a month is its own question -----------------------------------------
+
+
+def test_rekey_never_hijacks_a_still_unpaid_previous_month(tmp_path):
+    """July unpaid, August due: August gets a NEW task, July's stays as July.
+
+    The re-key path exists for a nudged due date. A month-apart sibling with its
+    own still-open instance is a different unpaid bill, and adopting its task
+    would silently erase an overdue bill from the board.
+    """
+
+    conn = _db(tmp_path / "t.db")
+    board = _Board()
+    _manual_bill(conn, "rent", "Rent", AS_OF.isoformat(), -3000.0)
+    conn.commit()
+    _surface(conn, AS_OF, board)
+    assert board.live_task_ids == ["T1"]
+
+    # August's instance arrives; July is still unpaid (status 'expected').
+    _manual_bill(conn, "rent", "Rent", "2026-08-12", -3000.0)
+    conn.commit()
+    august = date(2026, 8, 12)
+    result = _surface(conn, august, board)
+
+    assert result["created"] == 1, result["items"]
+    assert board.live_task_ids == ["T1", "T2"], "July's task must survive untouched"
+    assert board.deleted == []
+    assert board.updates == [], "July's task must not be rewritten into August"
+    assert _open_keys(conn) == [
+        "obligation-due:rent:2026-07-12",
+        "obligation-due:rent:2026-08-12",
+    ]
+
+
+def test_past_due_bill_and_current_bill_both_surface_next_to_the_check_question(tmp_path):
+    """A re-raised past-due bill is never suppressed, and a sibling month keeps
+    its own task.
+
+    The past-due July-1 instance (an earlier check was rejected after it came
+    due) pushes even while a NEW check question about it is open (owner decision
+    2026-08-20). The July-14 instance is a different question entirely and is
+    untouched by either.
+    """
+
+    conn = _db(tmp_path / "t.db")
+    _manual_bill(conn, "rent", "Rent", "2026-07-01", -3000.0)
+    _manual_bill(conn, "rent", "Rent", "2026-07-14", -3000.0)
+    conn.execute(
+        "INSERT INTO check_suggestion_rejections "
+        "(suggestion_id, obligation_instance_id, transaction_id, rejected_at) "
+        "VALUES ('s-1', 'rent:2026-07-01', 'check-june', ?)",
+        (f"{AS_OF.isoformat()}T08:00:00",),
+    )
+    # Posted inside the suggestion grace window of the July-1 due date.
+    _check(conn, "check-july", "2026-07-05T09:00:00", -3000.0, "1233")
+    conn.commit()
+
+    pushed = one_task_per_subject(build_surface_items(conn, as_of_date=AS_OF))
+    keys = [i["surface_key"] for i in pushed]
+    assert "obligation-due:rent:2026-07-01" in keys, keys
+    assert any(k.startswith("check-suggestion:") for k in keys), keys
+    assert "obligation-due:rent:2026-07-14" in keys, keys
+
+
+def test_rekey_does_not_adopt_a_task_already_flagged_for_removal(tmp_path):
+    """A condemned task (retire failed mid-run) is not recycled for a new key."""
+
+    from financial_agent.todoist_outbox import request_emission_retire
+
+    conn = _db(tmp_path / "t.db")
+    spy = _Spy()
+    first = [
+        {
+            "surface_key": "obligation-due:rent:2026-07-14",
+            "content": "Pay Rent $3,000.00",
+            "description": "Rent is due 2026-07-14. Action: Pay by 2026-07-12.",
+            "due_date": "2026-07-12",
+        }
+    ]
+    surface_to_todoist(
+        conn, first, AS_OF, write_enabled=True, token="tok", project_id="proj",
+        send_func=spy,
+    )
+    request_emission_retire(conn, "obligation-due:rent:2026-07-14")
+
+    def failing_delete(token, task_id):
+        raise RuntimeError("todoist down")
+
+    moved = [dict(first[0], surface_key="obligation-due:rent:2026-07-16")]
+    summary = surface_to_todoist(
+        conn, moved, AS_OF, write_enabled=True, token="tok", project_id="proj",
+        send_func=spy, delete_func=failing_delete,
+    )
+
+    assert summary["created"] == 1, "a fresh task, not an adoption"
+    assert not any("rekeyed_from" in i for i in summary["items"])
+    row = conn.execute(
+        "SELECT status, retire_requested_at FROM todoist_emissions "
+        "WHERE surface_key = 'obligation-due:rent:2026-07-14'"
+    ).fetchone()
+    assert row is not None and row["status"] == "open" and row["retire_requested_at"]
+
+
+def test_whitespace_headline_raises_no_status_task(tmp_path):
+    conn = _db(tmp_path / "t.db")
+    items = build_surface_items(conn, as_of_date=AS_OF, headline="   ")
+    assert not any(i["surface_key"] == "finance-status" for i in items)

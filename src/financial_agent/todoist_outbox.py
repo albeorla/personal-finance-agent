@@ -892,10 +892,26 @@ def reconcile_todoist_completions(
 _REKEY_PREFIXES = ("obligation-due:", "estimate-review:")
 
 
+# Mirrors surface_queue._MANUAL_DUE_OPEN_STATUSES: an instance in one of these
+# states is a live, unpaid bill that must keep its own task.
+_REKEY_LIVE_INSTANCE_STATUSES = ("expected", "needs_review", "partially_paid")
+
+
 def _open_emission_for_same_subject(
-    conn: sqlite3.Connection, surface_key: str
+    conn: sqlite3.Connection, surface_key: str, batch_keys: set[str]
 ) -> sqlite3.Row | None:
-    """An open emission for the same bill under an older key, if there is one."""
+    """An open emission for the same bill under an older key, if there is one.
+
+    Adoption is a claim that the old key and the new key are the SAME question
+    (a due date nudge, a cycle relabel). It is refused when the old key is still
+    a live question of its own:
+    - the old key is in this run's batch (both months surfaced today), or
+    - the old key is condemned (retire tombstone set; the drain owns it), or
+    - for a pay task, the old key's bill instance is still open in the database,
+      which means a different, still-unpaid month, not a moved date. When that
+      check cannot run, adoption is refused: the worst case of refusing is a
+      duplicate task, the worst case of adopting is an unpaid bill overwritten.
+    """
 
     if not surface_key.startswith(_REKEY_PREFIXES) or surface_key.count(":") < 2:
         return None
@@ -903,12 +919,30 @@ def _open_emission_for_same_subject(
     # ponytail: scans the open rows (a board's worth, tens); index it if the
     # ledger ever grows past that.
     rows = conn.execute(
-        "SELECT surface_key, todoist_task_id, created_at FROM todoist_emissions "
-        "WHERE status = 'open' ORDER BY created_at"
+        "SELECT surface_key, todoist_task_id, created_at, retire_requested_at "
+        "FROM todoist_emissions WHERE status = 'open' ORDER BY created_at"
     ).fetchall()
     for row in rows:
-        if row["surface_key"] != surface_key and row["surface_key"].rsplit(":", 1)[0] == stem:
-            return row
+        if row["surface_key"] == surface_key or row["surface_key"].rsplit(":", 1)[0] != stem:
+            continue
+        if row["surface_key"] in batch_keys or row["retire_requested_at"]:
+            continue
+        if surface_key.startswith("obligation-due:"):
+            prior_due = row["surface_key"].rsplit(":", 1)[1]
+            obligation_id = stem.split(":", 1)[1]
+            placeholders = ",".join("?" for _ in _REKEY_LIVE_INSTANCE_STATUSES)
+            try:
+                live = conn.execute(
+                    f"SELECT 1 FROM obligation_instances "
+                    f"WHERE obligation_id = ? AND due_date = ? "
+                    f"AND status IN ({placeholders}) LIMIT 1",
+                    (obligation_id, prior_due, *_REKEY_LIVE_INSTANCE_STATUSES),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                continue
+            if live is not None:
+                continue
+        return row
     return None
 
 
@@ -1030,6 +1064,7 @@ def surface_to_todoist(
         summary["retired"] += 1
         summary["items"].append({"surface_key": r["surface_key"], "action": "retired", "todoist_task_id": r["todoist_task_id"]})
 
+    batch_keys = {item.get("surface_key") for item in items if item.get("surface_key")}
     for item in items:
         key = item.get("surface_key")
         if not key:
@@ -1105,7 +1140,7 @@ def surface_to_todoist(
         # No ledger row, but the same bill may already be open under an older key
         # (its due date moved). Update that task in place and re-key the ledger row
         # so the board never carries the same question twice.
-        prior = _open_emission_for_same_subject(conn, key)
+        prior = _open_emission_for_same_subject(conn, key, batch_keys)
         if prior is not None:
             try:
                 _update_surface_task(
