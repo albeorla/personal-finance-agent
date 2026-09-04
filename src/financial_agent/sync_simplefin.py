@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .config import ensure_source_tables, get_finance_config
+from .paste_dedup import absorb_paste_twins
 
 
 # SimpleFIN recommends requesting at most ~45 elapsed days per pull; larger
@@ -311,6 +312,8 @@ def _upsert_transaction(conn: sqlite3.Connection, account_id: str, txn: dict[str
         (txn["id"], account_id, posted, transacted_at, txn["amount"], txn["payee"], txn["description"],
          txn["pending"], source, txn["fetched_at"], txn["fetched_at"], txn["fetched_at"]),
     )
+    # A pasted copy of this same transaction (feed lag backfill) is now redundant.
+    absorb_paste_twins(conn, txn["id"], account_id, posted, txn["amount"])
     return "inserted"
 
 

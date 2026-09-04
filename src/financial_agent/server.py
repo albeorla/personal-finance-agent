@@ -72,6 +72,7 @@ from .memory import (
 )
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
 from .card_import import import_card_statement_for_db, import_checking_activity_for_db
+from .paste_dedup import dedupe_pasted_transactions_for_db
 from .migration import (
     apply_obligation_migration as apply_obligation_migration_for_db,
     parse_obligation_migration_source,
@@ -669,6 +670,30 @@ def import_checking_activity(
         )
         if result.get("status") != "ok":
             conn.rollback()
+    return result
+
+
+@mcp.tool()
+def dedupe_pasted_transactions(dry_run: bool = True, db_path: str | None = None) -> dict:
+    """Remove pasted checking rows that duplicate bank-feed rows (one-time cleanup).
+
+    A pasted checking CSV used to be deduped only against earlier pastes, so rows
+    the SimpleFIN feed also delivered ended up twice. This pairs each
+    ``checking_paste`` row with a feed row on the same account, posted date, and
+    amount, re-points reconciliation matches and evidence at the feed row, and
+    deletes the paste copy. The feed row always wins.
+
+    Default dry_run=True: report the pairs and the double-counted total, write
+    nothing. Re-run with dry_run=false to apply.
+    """
+
+    resolved_db_path = db_path or str(default_db_path())
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = dedupe_pasted_transactions_for_db(conn, dry_run=True)
+        return {**result, "release_warning": release_status.warning}
+    with guarded_write(resolved_db_path) as conn:
+        result = dedupe_pasted_transactions_for_db(conn, dry_run=False)
     return result
 
 
