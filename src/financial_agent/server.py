@@ -72,6 +72,7 @@ from .memory import (
 )
 from .manual_balance import set_manual_balance as set_manual_balance_for_db
 from .card_import import import_card_statement_for_db, import_checking_activity_for_db
+from .paste_dedup import dedupe_pasted_transactions_for_db
 from .migration import (
     apply_obligation_migration as apply_obligation_migration_for_db,
     parse_obligation_migration_source,
@@ -507,13 +508,13 @@ def get_finance_status(
     db_path: str | None = None,
     working_account_id: str | None = None,
     start_date: str | None = None,
-    compact: bool = False,
+    compact: bool = True,
 ) -> dict:
     """Return read-only finance status: balances, source freshness, trace ids, and stable V1 slots.
 
-    Set compact=True to drop the per-day cash-flow event arrays (replaced by an
-    events_count per window) while keeping all balance and projection summary
-    stats. Use it when the full response is too large for the model context.
+    Compact by default: per-day cash-flow event arrays are replaced by an
+    events_count per window while balance and projection summaries remain.
+    Set compact=False for the full event arrays.
     """
 
     return build_finance_status(
@@ -669,6 +670,30 @@ def import_checking_activity(
         )
         if result.get("status") != "ok":
             conn.rollback()
+    return result
+
+
+@mcp.tool()
+def dedupe_pasted_transactions(dry_run: bool = True, db_path: str | None = None) -> dict:
+    """Remove pasted checking rows that duplicate bank-feed rows (one-time cleanup).
+
+    A pasted checking CSV used to be deduped only against earlier pastes, so rows
+    the SimpleFIN feed also delivered ended up twice. This pairs each
+    ``checking_paste`` row with a feed row on the same account, posted date, and
+    amount, re-points reconciliation matches and evidence at the feed row, and
+    deletes the paste copy. The feed row always wins.
+
+    Default dry_run=True: report the pairs and the double-counted total, write
+    nothing. Re-run with dry_run=false to apply.
+    """
+
+    resolved_db_path = db_path or str(default_db_path())
+    if dry_run:
+        with guarded_read(resolved_db_path) as (conn, release_status):
+            result = dedupe_pasted_transactions_for_db(conn, dry_run=True)
+        return {**result, "release_warning": release_status.warning}
+    with guarded_write(resolved_db_path) as conn:
+        result = dedupe_pasted_transactions_for_db(conn, dry_run=False)
     return result
 
 
@@ -1661,8 +1686,8 @@ def surface_due_items_to_todoist(
     against the todoist_emissions ledger keyed by a stable surface_key. The same
     item maps to the same Todoist task across days and re-runs: a new item is
     created (with a [fa:<key>] marker and the fa-auto label), an unchanged item is
-    skipped, a changed item updates the same task in place, and a task the user
-    completed or deleted is treated as resolved and never recreated.
+    skipped, and changed evidence updates or resurfaces the item. A completion
+    acknowledges its evidence hash; only true follow-ups resolve their source.
 
     ``sync_failed`` (default off): set it when the day's run_background_sync FAILED.
     Balances are then stale, so the daily routine drops cash-floor / drift items
@@ -1689,7 +1714,25 @@ def surface_due_items_to_todoist(
             headline = summarize_daily_digest_for_db(digest).get("headline")
         else:
             headline = None
-        items = build_surface_items_for_db(conn, as_of_date=as_of_date, headline=headline)
+        if _has_synced_sources(conn):
+            balances = digest.get("balances") or {}
+            action_queue = get_surface_queue_for_db(
+                conn,
+                as_of_date=as_of_date,
+                limit=None,
+                trough_sensitivity=digest.get("trough_sensitivity"),
+                working_account_balance_stale={
+                    "stale": balances.get("working_account_balance_date_stale"),
+                    "account_name": balances.get("working_account"),
+                    "balance_age_days": balances.get("working_account_balance_age_days"),
+                    "balance_date": balances.get("working_account_balance_date"),
+                },
+            )
+        else:
+            action_queue = get_surface_queue_for_db(conn, as_of_date=as_of_date, limit=None)
+        items = build_surface_items_for_db(
+            conn, as_of_date=as_of_date, headline=headline, action_queue=action_queue
+        )
         retire_keys = build_surface_retire_keys_for_db(conn, as_of_date=as_of_date)
         if sync_failed:
             # Prepend the stale-data flag so it leads the push; the ledger dedupes
@@ -1731,9 +1774,9 @@ def reconcile_todoist_completions(
     nothing else records that, so the next surface run recreates it. This checks
     each open emission against its live Todoist task (GET /tasks/<id>): a 404 means
     the task was completed or deleted; a returned task that is checked/completed
-    means the user closed it. Either way the emission is marked resolved (so
-    surface_due_items_to_todoist will not recreate it) and any follow-up linked by
-    a followup:<id> surface_key is resolved too.
+    means the user closed it. The emission records the acknowledged evidence hash,
+    so changed evidence can resurface. A followup:<id> completion also resolves
+    its source follow-up.
 
     Gated by TODOIST_WRITE_ENABLED like the other Todoist calls. With the gate off
     (no token/flag) this makes no external call and no-ops. The Todoist read is

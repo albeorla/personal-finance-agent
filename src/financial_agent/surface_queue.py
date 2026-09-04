@@ -115,7 +115,7 @@ def get_surface_queue(
     conn: sqlite3.Connection,
     *,
     as_of_date: date | str,
-    limit: int = DEFAULT_LIMIT,
+    limit: int | None = DEFAULT_LIMIT,
     suppress_balance_guardrails: bool = False,
     trough_sensitivity: dict[str, Any] | None = None,
     working_account_balance_stale: dict[str, Any] | None = None,
@@ -162,6 +162,9 @@ def get_surface_queue(
         as_of,
         suppress_balance_guardrails=suppress_balance_guardrails or working_balance_stale,
     )
+
+    for item in items:
+        item["coverage"] = _coverage_for_queue_item(item)
 
     items.sort(
         key=lambda it: (
@@ -228,6 +231,7 @@ def build_surface_items(
     *,
     as_of_date: date | str,
     headline: str | None = None,
+    action_queue: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build de-dupe-ready items for ``surface_to_todoist``.
 
@@ -264,7 +268,12 @@ def build_surface_items(
     items += _snapshot_due_surface_items(conn, as_of)
     items += _check_suggestion_surface_items(conn, as_of)
     items += _onboarding_digest_surface_item(conn, as_of)
-    items += _finance_status_surface_item(headline, as_of)
+    rollup_members = [
+        item
+        for item in (action_queue or {}).get("items", [])
+        if item.get("coverage") == {"kind": "rollup", "surface_key": _FINANCE_STATUS_KEY}
+    ]
+    items += _finance_status_surface_item(headline, as_of, rollup_members=rollup_members)
     return items
 
 
@@ -512,31 +521,68 @@ def _check_suggestion_surface_items(
     return items
 
 
-def _finance_status_surface_item(headline: str | None, as_of: date) -> list[dict[str, Any]]:
+def _finance_status_surface_item(
+    headline: str | None,
+    as_of: date,
+    *,
+    rollup_members: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """The standing status task: says what it is, and closes with a dated action.
 
     The headline alone reads as a bare number with no reason for existing, so the
     body names the run it came from and ends with the same action line every other
-    surfaced task uses (reading it IS the whole action here).
+    surfaced task uses (reading it IS the whole action here). Queue items that the
+    action queue rolls up into this task are listed by id so the board carries the
+    membership the coverage check verifies.
     """
 
     summary = (headline or "").strip()
-    if not summary:
+    members = rollup_members or []
+    if not summary and not members:
         return []
     by = as_of.isoformat()
     action = render_next_action(NextAction(verb="Read today's finance status", by=by))
     # The headline is free text and often ends mid-clause; close it so it does not
     # run into the action line.
-    if summary[-1] not in ".!?":
+    if summary and summary[-1] not in ".!?":
         summary += "."
+    description_parts = [f"Daily finance check for {by}."]
+    if summary:
+        description_parts.append(summary)
+    description_parts.append(action)
+    description = " ".join(description_parts)
+    if members:
+        description += "\n\nRollup members:\n" + "\n".join(
+            f"- {item['id']}: {item['message']}" for item in members
+        )
     return [
         {
             "surface_key": _FINANCE_STATUS_KEY,
             "content": "Finance status",
-            "description": f"Daily finance check for {by}. {summary} {action}",
+            "description": description,
             "due_date": by,
         }
     ]
+
+
+def _coverage_for_queue_item(item: dict[str, Any]) -> dict[str, str]:
+    """Map one actionable queue item to its task or the finance-status rollup."""
+
+    item_type = item["type"]
+    evidence = item.get("evidence") or {}
+    if item_type == "obligation_due":
+        return {"kind": "task", "surface_key": item["id"]}
+    if item_type == "estimate_review":
+        cycle = evidence.get("statement_close_date") or evidence["instance_id"]
+        return {
+            "kind": "task",
+            "surface_key": f"estimate-review:{evidence['obligation_id']}:{cycle}",
+        }
+    if item_type == "snapshot_refresh":
+        return {"kind": "task", "surface_key": f"snapshot-due:{evidence['account_id']}"}
+    if item_type == "goal_review" and evidence.get("status") == "behind":
+        return {"kind": "task", "surface_key": f"goal:{evidence['name']}:behind"}
+    return {"kind": "rollup", "surface_key": _FINANCE_STATUS_KEY}
 
 
 def _onboarding_digest_surface_item(
@@ -1079,6 +1125,7 @@ def _goal_review_items(conn: sqlite3.Connection, as_of: date) -> list[dict[str, 
                 "related_ids": [g["goal_id"]],
                 "evidence": {
                     "goal_id": g["goal_id"],
+                    "name": g["name"],
                     "status": g["status"],
                     "deadline": g["deadline"],
                     "remaining_amount": g["remaining_amount"],
@@ -1115,6 +1162,7 @@ def _estimate_review_items(conn: sqlite3.Connection, as_of: date) -> list[dict[s
                 "evidence": {
                     "obligation_id": r["obligation_id"],
                     "instance_id": iid,
+                    "statement_close_date": r.get("statement_close_date"),
                     "amount_status": r["amount_status"],
                     "review_after": r["review_after"],
                     "due_date": r["due_date"],

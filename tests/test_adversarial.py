@@ -180,11 +180,13 @@ def test_forced_on_runner_that_raises_fails_open(tmp_path):
         options={"adversarial": {"enabled": True, "runner": boom}},
     )
 
-    # The run still finishes; the broken reviewer is recorded as unavailable.
-    assert result["status"] == "succeeded_with_warnings"
+    # The optional reviewer is recorded as unavailable without degrading an
+    # otherwise clean scheduled run.
+    assert result["status"] == "succeeded"
     summary = result["result_summary"]["adversarial_review"]
     assert summary["available"] is False
     assert summary["skipped"]
+    assert "warnings" not in summary
 
 
 # --- persistence + cross-source isolation ----------------------------------

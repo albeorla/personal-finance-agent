@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>v0.2.0, 76 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>89 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -87,22 +87,32 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 ### 3. SURFACE — push what needs attention
 
 - A daily routine collects everything worth acting on today (matches to confirm, goals behind pace, estimates past review, stale balance-only snapshots, guardrail trips) into one prioritized queue (`get_surface_queue` / `get_daily_digest`).
-- `surface_due_items_to_todoist` pushes those items to Todoist through an **idempotent emissions ledger**. Each item maps to a stable surface key, so the same item maps to the same task across days and re-runs: a new item is created, an unchanged item is skipped, a changed item updates the existing task *in place*, and a task the user completed or deleted is treated as resolved and never recreated. No duplicates.
+- `surface_due_items_to_todoist` pushes those items to Todoist through an **idempotent emissions ledger**. Each action-queue item names either its direct task or its membership in the `finance-status` rollup. Completing a snapshot task acknowledges only that task's evidence hash, so changed evidence resurfaces. A true `followup:<id>` completion still resolves its source follow-up.
+- The surfaced daily run finishes with a conservation check against a fully paginated Todoist read. Every current action must have an open managed task, a dismissal for the current evidence hash, or documented membership in the live `finance-status` rollup. Missing coverage and partial Todoist reads make the run non-green.
 
 ---
 
 ## Tool catalog
 
-The server registers 76 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 89 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+
+**Ingest**
+- `sync_simplefin`: pull accounts, balances, and transactions from SimpleFIN by idempotent upsert (read-only against the feed).
+- `set_manual_balance`: record an authoritative-for-the-day balance snapshot for a slow-refreshing, balance-only feed.
+- `import_checking_activity`: paste checking-account activity as CSV for the manual-sourced operating account. Parses date/description/amount rows, fuzzy-matches the account, stamps deterministic synthetic ids so a re-paste is idempotent, and writes real transaction rows (`source='checking_paste'`). Pass `balance` to record a sticky manual balance in the same write. Dry-run by default.
+- `import_card_statement`: the card-statement equivalent (see Statement cycles, below).
 
 **Status, projection, and digest**
-- `get_finance_status` — balances, source freshness, deterministic cash-flow projection over requested windows, guardrail findings, with `trace_id` and result references.
+- `get_finance_status` — compact by default: balances, source freshness, projection summaries, guardrail findings, `trace_id`, and result references. Pass `compact=false` for full per-day event arrays.
 - `get_daily_digest` — the human-readable morning summary (working cash, multi-window projection, upcoming obligations with running balances, drift/review items, recurring candidates, and a GREEN/YELLOW/RED status), each with provenance. Also includes an obligation coverage summary (how much of what you owe is modeled vs silent autopay vs unmodeled discovered charges) and a trough-sensitivity line that shows how much the projected low point swings on its estimated outflows, so a precise-looking low point is not read as fact. Also carries a read-only `verification` block (ok flag plus per-severity finding counts and details) from the deterministic verification phase, so a digest that reads clean while its source rows disagree shows up immediately. When the adversarial reviewer has run, it also carries an `adversarial_review` block: the persisted advisory flags from an independent reviewer, clearly labeled attention-routing (look here, this looks off), never a verdict. The digest only reads these persisted rows; it never spawns the reviewer.
 - `summarize_spending` — outflow spending by category / merchant / month with totals, a month-over-month trend, and the transaction ids behind each bucket (rules-based, no LLM).
+- `list_transactions`: individual transactions, newest first, so an exact charge amount can be quoted instead of only the aggregates from `summarize_spending`. Filters: date range, substring query over payee and description, minimum absolute amount, account, pending. Limit caps at 500 and a `truncated` flag signals more rows matched.
 - `verify_grounding` — the "is the agent allowed to say this number" gate: confirms each headline figure traces to a source row.
 
 **Obligations and instances**
 - `apply_obligation_instances`, `delete_obligation_instance`, `list_obligations`
+- `set_obligation_end`: set or clear the date a recurring bill stops projecting (a lease, a loan payoff, a subscription being cancelled), so it does not fill the runway forever. Reversible: instances are excluded past the end date, not deleted.
+- `deactivate_obligation`: retire a whole obligation so all its instances drop out of the projection, listings, reconciliation, and drift. Rows are preserved for audit and it reports how many upcoming bills it pulled from the runway.
 - `list_obligation_review_candidates` — estimated amounts whose review date has arrived (for example a statement estimate to refresh after close).
 - `list_statement_input_estimates` — card-spend estimates that feed statement estimates without directly reducing checking cash flow.
 
@@ -114,19 +124,28 @@ The server registers 76 MCP tools. They group by area as follows. (Names are exa
 - `scan_charge_onboarding_candidates` — deterministic background discovery; proposes candidates, never writes canonical obligations.
 - `list_charge_onboarding_queue`, `get_next_charge_onboarding_candidate` — work the queue, prioritized by estimated monthly cash impact.
 - `record_charge_onboarding_decision` — `defer` / `reject` / `needs_more_evidence` / `in_review` / `accept` / `reset`.
+- `record_charge_onboarding_decisions`: the same decision for many candidates in one call, to clear a large queue without the one-at-a-time grind. Items apply independently inside one transaction, so a bad item is reported as an error instead of aborting the rest.
 - `preview_charge_onboarding_apply` — read-only preview of what applying would create.
 - `apply_charge_onboarding_candidate` — guarded write that promotes an accepted candidate into a canonical obligation plus instances (idempotent: re-applying a window updates in place).
 - `auto_model_high_confidence_recurring`, `backfill_recurring_instances`
 
 **Statement cycles** (for card-statement-payment obligations)
 - `aggregate_statement_inputs`, `list_statement_cycles`, `recompute_statement_estimates` — roll card-input charges into the statement cycle that pays them; never overwrites a confirmed/observed amount.
+- `get_statement_status`: the latest closed statement plus the open cycle's pace for one card: spend so far, modeled amount, variance, and whether spend is running ahead of or behind the model.
+- `set_statement_actual`: record an observed statement balance directly (for example a portal-read Apple Card balance) on the matching statement instance, picked by cycle close date or due date. Written as confirmed with provenance, and never overwritten by the rollup estimator.
 - `import_card_statement` — paste a monthly card statement (CSV or statement text) for a card with no live transaction feed (for example the Apple Card) to fill the balance-only blind spot. Parses into real transaction rows, dedups against prior pastes, fuzzy-matches the account, feeds the onboarding scanner and statement rollup, and (when a total is supplied) promotes the statement instance to that observed amount. Dry-run by default; re-run with `dry_run=false` to write.
 
 **Reconciliation and drift**
 - `reconcile_obligation_instances` — match expected instances to observed transactions (conservative by default; never silently marks paid).
 - `list_matched_obligation_instances`, `list_unmatched_obligation_instances`
 - `list_reconciliation_review_items`, `confirm_reconciliation_match`, `unconfirm_reconciliation_match` — confirming a match marks an instance paid using its recorded transaction match (guarded — never auto-pays).
+- `list_check_suggestions`, `confirm_check_suggestion`, `reject_check_suggestion`: advisory pairings between a posted generic check and the bill it probably paid. Confirming returns the refreshed projection; rejecting is durable and leaves the bill untouched.
+- `suppress_contradicted_estimates`: lower or retire an averaged estimate that the account's real burn contradicts (for example a card payment still projecting at full size after actual spending on that card collapsed). Compares modeled monthly outflow to observed burn over a lookback window and either rewrites the amount down or routes the obligation to dormant. Both paths are reversible and emit a drift finding.
 - `detect_drift`, `list_drift_findings`
+
+**Debts**
+- `set_debt_terms`: create or update a debt's terms (APR, linked account, revolving flag, minimum payment). Re-running with the same id updates in place. Use `balance_source='manual'` with an override for debts that have no synced account.
+- `list_debts`: debts with live balances, modeled monthly interest, autopay and revolving flags, plus total monthly interest across the revolving debts only.
 
 **Guardrails**
 - `evaluate_guardrails`, `list_guardrail_findings`, `apply_guardrail_rules`
@@ -136,25 +155,29 @@ The server registers 76 MCP tools. They group by area as follows. (Names are exa
 
 **Follow-ups and the surface queue**
 - `capture_followup`, `list_due_followups`, `resolve_followup`
+- `update_followup`: edit a follow-up in place by id (reschedule, reword, re-prioritize, relink). Re-capturing instead would create a new row, because the capture id is derived from the content.
 - `get_surface_queue` — the single read for the daily surfacing job.
 
 **Todoist output and the action outbox** (writes gated OFF by default; Todoist is output-only)
-- `surface_due_items_to_todoist` — idempotent push via the emissions ledger.
-- `reconcile_todoist_emission`, `reconcile_todoist_completions` — adopt pre-existing tasks; absorb user completions of tasks we pushed.
+- `surface_due_items_to_todoist` — idempotent push via the emissions ledger. It records `create_pending` before transport; after an uncertain response it searches for the embedded `[fa:<surface_key>]` marker and retries only after a complete read proves absence.
+- `reconcile_todoist_emission`, `reconcile_todoist_completions` — adopt pre-existing tasks and record the evidence hash acknowledged by a completion. Checkboxes never approve financial reviews; only true follow-ups resolve their source records.
 - `reconcile_todoist_project` — server-side LIST + classify of the whole Finance project, cleaning drift via a safe three-rule deletion model (ritual/manual tasks are never deleted). `list_todoist_project` — the read-only counterpart (LIST + classify, no delete path), so the agent's board read goes through the server, never raw HTTP. Each task entry includes its `due_date` and `description`, so a due-date audit can run through the MCP without touching the raw Todoist API.
 - `create_todoist_task`, `execute_action_outbox`, `list_action_outbox` — create a one-off reminder and process the durable outbox; nothing is sent externally unless write-back is explicitly enabled.
 - `update_todoist_task`, `complete_todoist_task`, `reopen_todoist_task`, `delete_todoist_task` — edit, close, reopen, or delete an existing task by id for routine board maintenance; gated the same way (no external call unless write-back is enabled).
+- `list_today_tasks_all_projects`: read-only sweep of tasks due today or overdue across every project, the companion to the Finance-only `list_todoist_project`. It catches finance-relevant tasks filed under Personal or elsewhere, and leaves relevance to the reader rather than hiding them behind a keyword filter.
 
 **Verification** (deterministic row-tie checks; no LLM)
 - `run_verification` — runs the verification phase: four pure-SQL/Python checks that prove the source rows tie together — projection identity (each window's ending balance equals its start plus its signed events), duplicate instances (no two projectable instances share an obligation and due date), statement identity (a cycle's denormalized input_sum/input_count matches its input rows), and instance sign sanity (no projectable instance has a negative stored amount). Persists each finding by default; `persist=False` is read-only.
 - `list_verification_findings` — read the recorded verification findings (open by default), newest first, optionally filtered by `check_id` or by `source` (`deterministic` for the pure-code identity checks, `adversarial` for the spawned-reviewer's advisory flags).
+- `acknowledge_verification_findings`: mark known-open findings as seen so later runs report only new ones. Acknowledged findings stay listable and still resolve automatically once the underlying identity is fixed, but stop flipping the verify summary's `ok`. Without explicit ids it blanket-acknowledges open `warn` findings and deliberately skips `error` severity.
 
 **Adversarial review** (non-deterministic; an independent reviewer, advisory only)
 - `run_adversarial_review` — spawn the Claude Code CLI (`claude -p`) as a read-only subprocess on the user's Claude subscription (OAuth; no Anthropic API key) and ask it to try to refute the riskiest part of the forecast: the estimated, low-confidence outflows that land on the projected low point, the large estimated obligations that move the projection, and the freshly-classified recurring-charge candidates with their evidence. Each flag persists into `verification_findings` tagged `source='adversarial'` and surfaces alongside the deterministic checks. Findings are ATTENTION-ROUTING ("look here, this looks off"), never verdicts — the reviewer is a language model and can be wrong. Fail-open: a missing CLI, error, timeout, or unparseable reply returns `available=False` and writes nothing, so a broken reviewer never breaks the run. Runs automatically inside the daily `run_background_sync` only when enabled (see Adversarial review enforcement, below); call it directly to review on demand.
 
 **Background runner and job health**
-- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> verify -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues. The `verify` step persists its findings tagged with the run id. When the adversarial reviewer is enabled, an extra `adversarial_review` step runs between `verify` and `surface_due_items`; with the gate off the step does not appear and the default sequence is unchanged.
+- `run_background_sync` — orchestrates the whole pipeline (sync -> scan -> reconcile -> detect drift -> suppress dormant estimates -> verify -> surface due items) as one auditable run with an ordered event log; a failing step is recorded and the run continues. Surfaced runs add a final Todoist coverage check after completion reconciliation. The `verify` step persists its findings tagged with the run id. When the adversarial reviewer is enabled, an extra `adversarial_review` step runs between `verify` and `surface_due_items`; with the gate off the step does not appear and the default sequence is unchanged.
 - `get_background_run`, `list_background_runs`, `get_job_health`
+- `get_version`: the version and git commit of the code the server process is actually running. The server is long-running, so code merged to main only takes effect after a restart; these values are captured at startup, which makes a stale live session visible.
 
 **Memory** (corrections, decisions, facts to recall)
 - `write_finance_memory`, `search_finance_memory`, `list_finance_memories`, `delete_finance_memory` — a deterministic, dependency-free bag-of-words embedding with a context-control retrieval policy (similarity threshold, then top-k, then a token budget).

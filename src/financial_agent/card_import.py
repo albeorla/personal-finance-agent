@@ -37,6 +37,7 @@ import uuid
 from typing import Any
 
 from .manual_balance import _MATCH_FLOOR, _TIE_BAND, _score, set_manual_balance
+from .paste_dedup import find_feed_twin
 from .schema import ensure_app_schema
 
 PASTE_SOURCE = "apple_card_paste"
@@ -368,12 +369,18 @@ def import_card_statement_for_db(
     # Dedup against transactions already stored (any prior paste reproduces ids).
     new_rows: list[dict[str, Any]] = []
     duplicate = 0
+    feed_duplicate = 0
     for txn in txns:
         exists = conn.execute("SELECT 1 FROM transactions WHERE id = ?", (txn["id"],)).fetchone()
         if exists:
             duplicate += 1
+        elif find_feed_twin(conn, account_id, txn["transacted_date"], txn["amount"]):
+            # The bank feed already delivered this transaction; the feed row wins.
+            feed_duplicate += 1
         else:
             new_rows.append(txn)
+    if feed_duplicate:
+        warnings.append(f"{feed_duplicate} row(s) already present from the bank feed; skipped, feed rows kept.")
 
     spend_rows = [t for t in txns if not t["inflow"]]
     inflow_rows = [t for t in txns if t["inflow"]]
@@ -541,12 +548,18 @@ def import_checking_activity_for_db(
 
     new_rows: list[dict[str, Any]] = []
     duplicate = 0
+    feed_duplicate = 0
     for txn in txns:
         exists = conn.execute("SELECT 1 FROM transactions WHERE id = ?", (txn["id"],)).fetchone()
         if exists:
             duplicate += 1
+        elif find_feed_twin(conn, account_id, txn["transacted_date"], txn["amount"]):
+            # The bank feed already delivered this transaction; the feed row wins.
+            feed_duplicate += 1
         else:
             new_rows.append(txn)
+    if feed_duplicate:
+        warnings.append(f"{feed_duplicate} row(s) already present from the bank feed; skipped, feed rows kept.")
 
     inflow_rows = [t for t in txns if t["inflow"]]
     outflow_rows = [t for t in txns if not t["inflow"]]
@@ -568,6 +581,7 @@ def import_checking_activity_for_db(
         "skipped_rows": parsed["skipped"],
         "new": len(new_rows),
         "duplicate": duplicate,
+        "feed_duplicate": feed_duplicate,
         "balance": round(float(balance), 2) if balance is not None else None,
         "balance_snapshot": None,
         "warnings": warnings,

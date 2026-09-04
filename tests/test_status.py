@@ -225,19 +225,20 @@ def test_compact_parameters_flow_through_server(tmp_path):
     _build_status_db(db_path)
     _seed_many_instances(db_path)
 
-    # get_finance_status server wrapper honors compact.
-    full_status = server.get_finance_status(
-        db_path=str(db_path),
-        windows=[7, 14, 30],
-        working_account_id="checking-1",
-        start_date="2026-06-20",
-    )
+    # get_finance_status is compact by default; compact=False is the explicit
+    # full-detail escape hatch.
     compact_status = server.get_finance_status(
         db_path=str(db_path),
         windows=[7, 14, 30],
         working_account_id="checking-1",
         start_date="2026-06-20",
-        compact=True,
+    )
+    full_status = server.get_finance_status(
+        db_path=str(db_path),
+        windows=[7, 14, 30],
+        working_account_id="checking-1",
+        start_date="2026-06-20",
+        compact=False,
     )
     assert all("events" in p for p in full_status["cash_flow_projections"])
     assert all("events" not in p for p in compact_status["cash_flow_projections"])

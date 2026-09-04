@@ -5,7 +5,7 @@ No live HTTP: every Todoist call is injected via fake ``send_func`` / ``delete_f
 mirroring the existing ledger tests (test_todoist_emissions.py). The two highest-
 value guards here are the resurrection contrast in
 ``test_retire_then_recreate_resurfaces`` (a ``retired`` ledger row must NOT
-suppress recreation, while ``deleted_by_user`` MUST) and the singleton digest
+suppress recreation, while ``deleted_by_user`` suppresses matching evidence) and the singleton digest
 round-trip in ``test_digest_retire_then_resurface``.
 """
 
@@ -19,6 +19,7 @@ from financial_agent.server import (
 )
 from financial_agent.surface_queue import build_surface_items
 from financial_agent.todoist_outbox import (
+    content_hash_for,
     request_emission_retire,
     request_emission_retire_prefix,
     surface_to_todoist,
@@ -168,13 +169,19 @@ def test_surface_drains_retire_live(tmp_path):
 
 
 def test_retire_then_recreate_resurfaces(tmp_path):
-    """A 'retired' row must NOT suppress recreation; 'deleted_by_user' MUST."""
+    """Retired resurfaces; deleted_by_user suppresses only matching evidence."""
     conn = _db(tmp_path / "f.db")
     # A previously-retired recurring instance: surfacing the SAME key again
     # recreates it (the underlying need recurred).
     _seed_emission(conn, "obligation-due:OB1:2026-06-01", "OLD1", status="retired")
-    # A user-deleted instance: surfacing the SAME key is a permanent suppressor.
-    _seed_emission(conn, "obligation-due:OB2:2026-06-01", "OLD2", status="deleted_by_user")
+    # A user-deleted instance with the same evidence stays acknowledged.
+    _seed_emission(
+        conn,
+        "obligation-due:OB2:2026-06-01",
+        "OLD2",
+        status="deleted_by_user",
+        content_hash=content_hash_for("Pay OB2", "d"),
+    )
     send, delete = _Send(), _Delete()
 
     summary = _live(

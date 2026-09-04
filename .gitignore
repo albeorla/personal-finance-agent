@@ -13,3 +13,6 @@ data/
 *.sqlite3
 *.db
 
+# Agent runtime state (session-local, never shared)
+.claude/scheduled_tasks.lock
+

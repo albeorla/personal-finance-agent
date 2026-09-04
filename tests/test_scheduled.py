@@ -80,6 +80,7 @@ def test_live_runner_enables_sync_surface_and_completion_reconciliation(tmp_path
                 "sync_simplefin": {"accounts": 2, "inserted": 3, "updated": 0},
                 "surface_due_items": {"status": "ok", "created": 1, "failed": 0},
                 "reconcile_todoist_completions": {"status": "ok", "resolved": 1, "failed": 0},
+                "verify_surface_coverage": {"status": "ok", "ok": True, "missing_count": 0},
             },
         }
 
@@ -98,6 +99,34 @@ def test_live_runner_enables_sync_surface_and_completion_reconciliation(tmp_path
     assert result["phases"]["sync"]["status"] == "ok"
     assert result["phases"]["surface"]["status"] == "ok"
     assert result["phases"]["reconcile_completions"]["status"] == "ok"
+    assert result["phases"]["surface_coverage"]["status"] == "ok"
+
+
+def test_surface_coverage_warning_is_visible_in_scheduled_result(tmp_path, monkeypatch):
+    db = _db(tmp_path / "s.sqlite")
+    monkeypatch.setattr(
+        scheduled,
+        "run_background_sync",
+        lambda conn, **kwargs: {
+            "run_id": "run_coverage_warn",
+            "status": "succeeded_with_warnings",
+            "duration_ms": 10,
+            "result_summary": {
+                "surface_due_items": {"status": "ok", "created": 0, "failed": 0},
+                "reconcile_todoist_completions": {"status": "ok", "resolved": 0, "failed": 0},
+                "verify_surface_coverage": {
+                    "status": "warn", "ok": False, "missing_count": 1, "warnings": ["missing"]
+                },
+            },
+        },
+    )
+
+    result = run_scheduled_daily_sync(
+        db, lock_dir=str(tmp_path), as_of_date="2026-07-09", surface=True
+    )
+
+    assert result["semantic_status"] == "warn"
+    assert result["phases"]["surface_coverage"]["status"] == "warn"
 
 
 def test_sync_error_is_a_visible_warning_and_not_fresh(tmp_path, monkeypatch):
@@ -176,7 +205,9 @@ def test_dry_run_reports_every_phase_without_running_background(tmp_path, monkey
     )
     assert result["status"] == "dry_run"
     assert result["semantic_status"] == "ok"
-    assert set(result["phases"]) == {"sync", "pipeline", "surface", "reconcile_completions"}
+    assert set(result["phases"]) == {
+        "sync", "pipeline", "surface", "reconcile_completions", "surface_coverage"
+    }
 
 
 def test_cli_forwards_explicit_lock_directory(tmp_path, monkeypatch, capsys):

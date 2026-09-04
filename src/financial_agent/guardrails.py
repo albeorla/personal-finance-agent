@@ -79,7 +79,8 @@ def evaluate_guardrails(
     """Evaluate all guardrails and return findings ordered by severity."""
 
     ensure_app_schema(conn)
-    apply_guardrail_rules(conn)
+    if persist:
+        apply_guardrail_rules(conn)
     as_of = _coerce_date(as_of_date)
     observed = now or datetime.now(UTC)
 

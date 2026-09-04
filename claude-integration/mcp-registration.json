@@ -6,7 +6,7 @@
       "args": [
         "run",
         "--directory",
-        "/Users/owner/dev/financial-agent-mcp",
+        "/path/to/personal-finance-agent",
         "financial-agent-mcp"
       ]
     }
