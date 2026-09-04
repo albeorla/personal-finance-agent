@@ -6,7 +6,7 @@ Durable Mermaid diagrams for the local finance MCP server. These diagrams descri
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>89 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>90 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"read-only sync"| Server
     Portals["Bank/card portals<br/>manual balances and one-off facts"] -->|"manual inputs"| Server
@@ -540,8 +540,11 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> open: surface_to_todoist creates or adopts task
+    [*] --> create_pending: surface_to_todoist records intent before transport
+    create_pending --> open: task created, or adopted by its [fa:key] marker after an uncertain response
+    [*] --> open: surface_to_todoist adopts an existing task
     open --> open: content changed, update same task
+    open --> open: due date moved, same task re-keyed to the new surface key
     open --> completed: read back completion
     open --> deleted_by_user: task disappears
     open --> retired: retire request or project cleanup

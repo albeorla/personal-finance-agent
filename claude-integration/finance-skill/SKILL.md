@@ -26,18 +26,26 @@ are the same one; confirm the specific account first.
 
 ## Daily ritual (the common path)
 
-1. **Refresh** live data: `run_background_sync` with `options={"sync": true}`
+1. **Collect inputs up front**: ask for any portal screenshots or statement
+   exports NOW, not mid-flow. Apple Card especially: its feed is balance-only,
+   so its statement balance only enters the system when the user supplies it.
+   Checking CSV pastes are safe to import since 2026-09-04 (MCP 0.3.35): the
+   importer skips rows the SimpleFIN feed already has (reported as
+   `feed_duplicate`), and a feed row that lands after a paste absorbs the paste
+   copy. Feed row always wins. If a double count ever shows up anyway, run
+   `dedupe_pasted_transactions` (dry run first).
+2. **Refresh** live data: `run_background_sync` with `options={"sync": true}`
    (pulls SimpleFIN, then scans/reconciles/detects drift and surfaces due items
    in one audited run). For a quick manual refresh use `sync_simplefin`
    (`incremental=true`).
-2. **Read the digest**: `get_daily_digest` (working cash, 7/14/30/60d projection,
+3. **Read the digest**: `get_daily_digest` (working cash, 7/14/30/60d projection,
    upcoming obligations, drift, matches to confirm, guardrail status). This is
    the morning summary. Lead your answer with its `status_color` and working cash.
-3. **Close out matches**: `list_reconciliation_review_items` shows matches
+4. **Close out matches**: `list_reconciliation_review_items` shows matches
    awaiting confirmation. For each one the user confirms, call
    `confirm_reconciliation_match(instance_id)`. Use
    `unconfirm_reconciliation_match` to reverse. Never confirm without the user.
-4. **Triage discovered charges**: `list_charge_onboarding_queue` /
+5. **Triage discovered charges**: `list_charge_onboarding_queue` /
    `get_next_charge_onboarding_candidate`; record a decision with
    `record_charge_onboarding_decision`; preview then apply with
    `preview_charge_onboarding_apply` and `apply_charge_onboarding_candidate`.

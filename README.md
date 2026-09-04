@@ -12,7 +12,7 @@ The server runs entirely on your machine, talks to your own data sources (a bank
 
 ```mermaid
 flowchart LR
-    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>89 tools"]
+    Claude["Claude / MCP client"] <-->|"tool calls"| Server["Finance MCP Server<br/>90 tools"]
 
     SimpleFIN["SimpleFIN<br/>balances + transactions"] -->|"sync_simplefin"| Server
     Portals["Bank/card portals<br/>manual balance inputs"] -->|"set_manual_balance"| Server
@@ -87,19 +87,20 @@ The server implements a single loop. Each stage is deterministic and idempotent,
 ### 3. SURFACE — push what needs attention
 
 - A daily routine collects everything worth acting on today (matches to confirm, goals behind pace, estimates past review, stale balance-only snapshots, guardrail trips) into one prioritized queue (`get_surface_queue` / `get_daily_digest`).
-- `surface_due_items_to_todoist` pushes those items to Todoist through an **idempotent emissions ledger**. Each action-queue item names either its direct task or its membership in the `finance-status` rollup. Completing a snapshot task acknowledges only that task's evidence hash, so changed evidence resurfaces. A true `followup:<id>` completion still resolves its source follow-up.
+- `surface_due_items_to_todoist` pushes those items to Todoist through an **idempotent emissions ledger**. Each action-queue item names either its direct task or its membership in the `finance-status` rollup. A bill whose due date moved is re-keyed onto its existing open task rather than getting a second one, so the board never carries the same question twice. Completing a snapshot task acknowledges only that task's evidence hash, so changed evidence resurfaces. A true `followup:<id>` completion still resolves its source follow-up.
 - The surfaced daily run finishes with a conservation check against a fully paginated Todoist read. Every current action must have an open managed task, a dismissal for the current evidence hash, or documented membership in the live `finance-status` rollup. Missing coverage and partial Todoist reads make the run non-green.
 
 ---
 
 ## Tool catalog
 
-The server registers 89 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
+The server registers 90 MCP tools. They group by area as follows. (Names are exact; see `src/financial_agent/server.py` for signatures.)
 
 **Ingest**
-- `sync_simplefin`: pull accounts, balances, and transactions from SimpleFIN by idempotent upsert (read-only against the feed).
+- `sync_simplefin`: pull accounts, balances, and transactions from SimpleFIN by idempotent upsert (read-only against the feed). A feed row that lands after a checking paste absorbs the pasted copy (same account, posted date, and amount), re-pointing any matches or evidence at the feed row.
 - `set_manual_balance`: record an authoritative-for-the-day balance snapshot for a slow-refreshing, balance-only feed.
-- `import_checking_activity`: paste checking-account activity as CSV for the manual-sourced operating account. Parses date/description/amount rows, fuzzy-matches the account, stamps deterministic synthetic ids so a re-paste is idempotent, and writes real transaction rows (`source='checking_paste'`). Pass `balance` to record a sticky manual balance in the same write. Dry-run by default.
+- `import_checking_activity`: paste checking-account activity as CSV for the manual-sourced operating account. Parses date/description/amount rows, fuzzy-matches the account, stamps deterministic synthetic ids so a re-paste is idempotent, skips rows the SimpleFIN feed already has (reported as `feed_duplicate`; the feed row wins), and writes real transaction rows (`source='checking_paste'`). Pass `balance` to record a sticky manual balance in the same write. Dry-run by default.
+- `dedupe_pasted_transactions`: one-time cleanup for history imported before the feed-duplicate skip. Pairs each `checking_paste` row with a feed row on the same account, posted date, and amount, re-points reconciliation matches and evidence at the feed row, and deletes the paste copy. Dry-run by default; reports the pairs and the double-counted total.
 - `import_card_statement`: the card-statement equivalent (see Statement cycles, below).
 
 **Status, projection, and digest**
