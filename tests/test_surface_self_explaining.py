@@ -182,7 +182,7 @@ def test_bill_that_may_already_be_paid_raises_one_task_not_two(tmp_path):
     """A bill due today with a check that may have paid it: ONE task.
 
     Both builders fire on the same bill (pay it / confirm the check paid it).
-    Asking Albert to pay a bill that may have already cleared is the duplicate he
+    Asking the owner to pay a bill that may have already cleared is the duplicate he
     had to dedupe by hand, so the check question wins on the board and the pay
     task is held. The suppression happens at the push, so the read stays complete.
     """
@@ -335,7 +335,7 @@ def test_pay_task_already_on_the_board_stays_when_the_check_question_arrives(tmp
     """Two runs, three days apart: the pay task goes up first, then the check.
 
     The pay task is raised days before the bill is due; a check that may have paid
-    it can only turn up later, once Albert has written it. The check question goes
+    it can only turn up later, once the owner has written it. The check question goes
     up next to the pay task, and the pay task STAYS: an unpaid bill never loses
     its task until the bill is confirmed paid (owner decision 2026-08-20). The
     check task, once answered, is what settles whether the pay task comes down
@@ -353,7 +353,7 @@ def test_pay_task_already_on_the_board_stays_when_the_check_question_arrives(tmp
     assert board.live_task_ids == ["T1"]
     assert _open_keys(conn) == ["obligation-due:santiguida:2026-07-12"]
 
-    # Albert writes the check; it clears three days later.
+    # The owner writes the check; it clears three days later.
     _check(conn, "check-july", f"{AS_OF.isoformat()}T09:00:00", -3000.0, "1233")
     conn.commit()
 

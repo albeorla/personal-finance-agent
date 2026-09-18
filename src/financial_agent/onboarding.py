@@ -1398,7 +1398,7 @@ def _match_existing_obligation(merchant_key: str, obligations: list[tuple[str, s
 
     Only distinctive tokens (>= 5 chars, not generic finance/location words) are
     allowed to match, so "Volvo ... Auto Finan ..." does not match an "autopay"
-    obligation and a Greenwich merchant does not match a Greenwich paycheck.
+    obligation and a merchant in the owner's town does not match a paycheck from that town.
     """
 
     tokens = [

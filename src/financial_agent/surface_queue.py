@@ -740,7 +740,7 @@ def _followup_trigger(row: dict[str, Any]) -> str:
     who = (row.get("source") or "").strip()
     tail = f" on {raised_on.isoformat()}" if raised_on else ""
     if not who or who == "manual":
-        # "manual" means Albert asked for the reminder himself.
+        # "manual" means the owner asked for the reminder himself.
         return f"Follow-up you asked for{tail}." if tail else "Follow-up you asked for."
     return f"Follow-up raised by {who}{tail}."
 
@@ -987,7 +987,7 @@ def _rejected_check_past_due_rows(
     """Past-due manual bills whose check match was rejected after they came due.
 
     When a check may have paid a bill, the push takes the pay task down and asks
-    about the check instead. If Albert then says that check is NOT this payment,
+    about the check instead. If the owner then says that check is NOT this payment,
     the bill is unpaid, past its due date, and no longer inside the normal window,
     so without this it would have no task at all. Rejecting re-raises it.
 

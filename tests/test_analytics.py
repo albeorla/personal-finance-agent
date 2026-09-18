@@ -96,7 +96,7 @@ def test_categorize_rules():
     assert categorize("Spotify USA") == "Subscriptions"
     assert categorize("WHOLE FOODS MARKET #123") == "Groceries"
     assert categorize("ONLINE PAYMENT THANK YOU") == "Transfers"
-    assert categorize("IntelliBridge Payroll") == "Income"
+    assert categorize("Acme Corp Payroll") == "Income"
     assert categorize("Joe's Random LLC") == "Other"
 
 
@@ -106,7 +106,7 @@ def test_categorize_new_categories():
     assert categorize("Safeco Corporation") == "Insurance"
     assert categorize("OpenAI") == "Software"
     assert categorize("VCA Animal Hospitals") == "Pets"
-    assert categorize("Lottermanpsychologicgreenwich") == "Health"
+    assert categorize("Northsidepsychologicgroup") == "Health"
 
 
 def test_categorize_excludes_checks_and_debt_payments():
@@ -129,7 +129,7 @@ def test_summarize_by_category_excludes_transfers_and_income(tmp_path):
         ("2026-06-05T00:00:00", -10.00, "Spotify"),
         ("2026-06-10T00:00:00", -50.00, "Whole Foods Market"),
         ("2026-06-15T00:00:00", -500.00, "ONLINE PAYMENT THANK YOU"),  # transfer -> excluded
-        ("2026-06-25T00:00:00", 3000.00, "IntelliBridge Payroll"),     # inflow -> ignored (amount>0)
+        ("2026-06-25T00:00:00", 3000.00, "Acme Corp Payroll"),     # inflow -> ignored (amount>0)
     ])
     rep = summarize_spending(conn, start_date="2026-06-01", end_date="2026-06-30", group_by="category")
     assert rep["total_spending"] == 160.00

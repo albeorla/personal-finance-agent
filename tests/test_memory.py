@@ -24,7 +24,7 @@ _FACTS = [
     "Gault Energy heating oil is paid on the Amex Platinum card, not from checking.",
     "Eversource electric is a direct checking utility with summer air conditioning spikes.",
     "Rent check is three thousand dollars on the third of the month.",
-    "Partner payroll from the Town of Greenwich deposits biweekly on Fridays.",
+    "Partner payroll from the City of Springfield deposits biweekly on Fridays.",
     "Cash Magnet card is paid off, at zero, and not being used, so do not seed it.",
 ]
 

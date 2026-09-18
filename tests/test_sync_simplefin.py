@@ -35,7 +35,7 @@ SAMPLE = {
                 {"id": "T1", "posted": 1718000000, "transacted-at": 1717900000, "amount": "-30.30",
                  "payee": "New York Times", "description": "NYTIMES", "pending": False},
                 {"id": "T2", "posted": 1718100000, "transacted-at": 0, "amount": "2011.67",
-                 "payee": "Town of Greenwich Payroll", "description": "PAYROLL", "pending": False},
+                 "payee": "City of Springfield Payroll", "description": "PAYROLL", "pending": False},
             ],
         }
     ],

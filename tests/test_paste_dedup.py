@@ -20,7 +20,7 @@ from financial_agent.sync_simplefin import _upsert_transaction
 CHK = "ACT-chk"
 CSV = """Date,Description,Amount
 06/02/2026,AQUARION WATER,-32.46
-06/03/2026,TOWN OF GREENWICH PAYROLL,1846.88
+06/03/2026,CITY OF SPRINGFIELD PAYROLL,1850.00
 """
 
 
@@ -31,7 +31,7 @@ def _db(path):
     ensure_app_schema(conn)
     conn.execute(
         "INSERT INTO accounts (id, name, org, kind, currency, first_seen_at, last_seen_at) "
-        "VALUES (?, 'TOTAL CHECKING (9939)', 'Chase', 'checking', 'USD', 'x', 'x')",
+        "VALUES (?, 'TOTAL CHECKING (1234)', 'Chase', 'checking', 'USD', 'x', 'x')",
         (CHK,),
     )
     return conn

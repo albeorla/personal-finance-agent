@@ -261,9 +261,9 @@ def test_card_statement_input_instances_are_excluded(tmp_path):
 def test_inflow_matches_positive_transaction(tmp_path):
     conn = _db(
         tmp_path / "r.sqlite",
-        transactions=[("t-pay", "ACT-chk", "2026-07-01T08:00:00", 800.00, "Town of Greenwich Payroll", "PAYROLL")],
+        transactions=[("t-pay", "ACT-chk", "2026-07-01T08:00:00", 800.00, "City of Springfield Payroll", "PAYROLL")],
     )
-    _obligation(conn, "partner_pay", "Town of Greenwich Payroll", "income",
+    _obligation(conn, "partner_pay", "City of Springfield Payroll", "income",
                 [{"id": "partner_pay:2026-07-01", "due_date": "2026-07-01", "amount": 800.0,
                   "direction": "inflow", "source": "seed"}])
 

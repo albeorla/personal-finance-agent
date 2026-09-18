@@ -111,12 +111,12 @@ def test_income_source_generation_creates_dated_instances_with_business_day_rule
     apply_income_source(
         conn,
         {
-            "id": "income_owner_intellibridge",
+            "id": "income_owner_acme",
             "person": "Owner",
-            "employer": "IntelliBridge",
+            "employer": "Acme Corp",
             "display_name": "Owner pay transfer",
             "status": "active",
-            "default_amount": 3781.15,
+            "default_amount": 3500.00,
             "deposit_account_id": "ACT-0d080ab4-5c7c-48af-b20c-35b4a1bf3019",
             "working_account_id": "ACT-073d560e-d421-4718-a9c3-1c88a4b6618f",
             "source": "working_rule",
@@ -126,7 +126,7 @@ def test_income_source_generation_creates_dated_instances_with_business_day_rule
             "review_by": "2026-09-01",
             "notes": "Semi-monthly 10th/25th, working-cash event is transfer into 4321.",
             "schedule": {
-                "id": "schedule_owner_intellibridge_v1",
+                "id": "schedule_owner_acme_v1",
                 "schedule_type": "semi_monthly_days",
                 "rule": {"days": [10, 25], "business_day_adjustment": "previous"},
                 "valid_from": "2026-06-20",
@@ -141,12 +141,12 @@ def test_income_source_generation_creates_dated_instances_with_business_day_rule
     apply_income_source(
         conn,
         {
-            "id": "income_partner_town_greenwich",
+            "id": "income_partner_springfield",
             "person": "Partner",
-            "employer": "Town of Greenwich",
+            "employer": "City of Springfield",
             "display_name": "Partner pay",
             "status": "active",
-            "default_amount": 2011.67,
+            "default_amount": 2000.00,
             "deposit_account_id": "ACT-073d560e-d421-4718-a9c3-1c88a4b6618f",
             "working_account_id": "ACT-073d560e-d421-4718-a9c3-1c88a4b6618f",
             "source": "payroll_pattern",
@@ -156,7 +156,7 @@ def test_income_source_generation_creates_dated_instances_with_business_day_rule
             "review_by": "2026-11-30",
             "notes": "Biweekly Friday payroll, direct deposit into 4321.",
             "schedule": {
-                "id": "schedule_partner_town_greenwich_v1",
+                "id": "schedule_partner_springfield_v1",
                 "schedule_type": "biweekly_weekday",
                 "rule": {
                     "anchor_date": "2026-06-05",
@@ -192,17 +192,17 @@ def test_income_source_generation_creates_dated_instances_with_business_day_rule
     ).fetchall()
 
     assert [(row["obligation_id"], row["due_date"], row["amount"]) for row in rows] == [
-        ("income_partner_town_greenwich", "2026-06-18", 2011.67),
-        ("income_owner_intellibridge", "2026-06-25", 3781.15),
-        ("income_partner_town_greenwich", "2026-07-02", 2011.67),
-        ("income_owner_intellibridge", "2026-07-10", 3781.15),
-        ("income_partner_town_greenwich", "2026-07-17", 2011.67),
-        ("income_owner_intellibridge", "2026-07-24", 3781.15),
+        ("income_partner_springfield", "2026-06-18", 2000.00),
+        ("income_owner_acme", "2026-06-25", 3500.00),
+        ("income_partner_springfield", "2026-07-02", 2000.00),
+        ("income_owner_acme", "2026-07-10", 3500.00),
+        ("income_partner_springfield", "2026-07-17", 2000.00),
+        ("income_owner_acme", "2026-07-24", 3500.00),
     ]
     assert all(row["direction"] == "inflow" for row in rows)
     assert all(row["source"].startswith("income_schedule:") for row in rows)
-    assert rows[1]["generated_from_income_source_id"] == "income_owner_intellibridge"
-    assert rows[1]["generated_from_schedule_version_id"] == "schedule_owner_intellibridge_v1"
+    assert rows[1]["generated_from_income_source_id"] == "income_owner_acme"
+    assert rows[1]["generated_from_schedule_version_id"] == "schedule_owner_acme_v1"
 
 
 def test_list_income_sources_reports_review_and_horizon(tmp_path):
@@ -211,12 +211,12 @@ def test_list_income_sources_reports_review_and_horizon(tmp_path):
     apply_income_source(
         conn,
         {
-            "id": "income_owner_intellibridge",
+            "id": "income_owner_acme",
             "person": "Owner",
-            "employer": "IntelliBridge",
+            "employer": "Acme Corp",
             "display_name": "Owner pay transfer",
             "status": "active",
-            "default_amount": 3781.15,
+            "default_amount": 3500.00,
             "deposit_account_id": "4322",
             "working_account_id": "4321",
             "source": "working_rule",
@@ -226,7 +226,7 @@ def test_list_income_sources_reports_review_and_horizon(tmp_path):
             "review_by": "2026-09-01",
             "notes": None,
             "schedule": {
-                "id": "schedule_owner_intellibridge_v1",
+                "id": "schedule_owner_acme_v1",
                 "schedule_type": "semi_monthly_days",
                 "rule": {"days": [10, 25], "business_day_adjustment": "previous"},
                 "valid_from": "2026-06-20",
@@ -244,12 +244,12 @@ def test_list_income_sources_reports_review_and_horizon(tmp_path):
 
     assert sources == [
         {
-            "id": "income_owner_intellibridge",
+            "id": "income_owner_acme",
             "person": "Owner",
-            "employer": "IntelliBridge",
+            "employer": "Acme Corp",
             "display_name": "Owner pay transfer",
             "status": "active",
-            "default_amount": 3781.15,
+            "default_amount": 3500.00,
             "deposit_account_id": "4322",
             "working_account_id": "4321",
             "source": "working_rule",
@@ -260,7 +260,7 @@ def test_list_income_sources_reports_review_and_horizon(tmp_path):
             "generated_through": "2026-12-24",
             "schedule_versions": [
                 {
-                    "id": "schedule_owner_intellibridge_v1",
+                    "id": "schedule_owner_acme_v1",
                     "schedule_type": "semi_monthly_days",
                     "rule": {"days": [10, 25], "business_day_adjustment": "previous"},
                     "valid_from": "2026-06-20",

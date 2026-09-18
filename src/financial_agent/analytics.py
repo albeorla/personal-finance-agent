@@ -16,7 +16,7 @@ from typing import Any
 
 # First matching rule wins; substrings are matched against lowercased payee+description.
 CATEGORY_RULES: list[tuple[str, list[str]]] = [
-    ("Income", ["payroll", "direct deposit", "intellibridge", "town of greenwich", "salary", "pay transfer"]),
+    ("Income", ["payroll", "direct deposit", "salary", "pay transfer"]),
     # Transfers / debt servicing - NOT discretionary spend. Includes paper checks
     # (usually rent/bills), credit-card payments, and auto-loan payments.
     ("Transfers", ["online payment", "card payment", "autopay", "thank you", "ach", "zelle", "venmo", "transfer",

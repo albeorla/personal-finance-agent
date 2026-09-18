@@ -54,14 +54,14 @@ def test_finance_status_surface_item_is_singleton():
 
 def test_short_title_keeps_clean_note_and_tames_a_paragraph_dump():
     # A short clean note passes through untouched.
-    clean = "Match Caitlyn's $956.66 Safeco charge on the Amex Gold when it posts"
+    clean = "Match the partner's $950.00 Safeco charge on the Amex Gold when it posts"
     assert _short_title(f"{clean}. She paid it 7/6; auto-matches on the daily.") == clean
 
     # The real ugly note: a paragraph with internal ids + a dev bug. The title
     # must collapse to a scannable one-liner, never the whole blob.
     ugly = (
-        "Match the $956.66 Safeco/Liberty Mutual charge on the Amex Gold (5000) "
-        "when it posts (Caitlyn paid it 2026-07-06). Instance "
+        "Match the $950.00 Safeco/Liberty Mutual charge on the Amex Gold (5000) "
+        "when it posts (partner paid it 2026-07-06). Instance "
         "safeco_auto_insurance:2026-07-10 is now card_spend_input -> "
         "amex_statement_payment. ALSO a code gap to fix in financial-agent-mcp."
     )
