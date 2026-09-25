@@ -8,7 +8,7 @@ from statistics import median as _stat_median
 from typing import Any
 
 from .cashflow import PROJECTABLE_STATUSES
-from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
+from .manual_balance import balance_precedence_order_by
 from .schema import ensure_app_schema
 
 
@@ -1557,7 +1557,7 @@ def _account_dormancy(
             SELECT balance, available, recorded_at
             FROM balance_snapshots
             WHERE account_id = ?
-            {BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
+            {balance_precedence_order_by(conn, "balance_snapshots")}
             LIMIT 1
             """,
             (account_id,),

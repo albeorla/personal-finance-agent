@@ -40,7 +40,7 @@ from .config import get_finance_config
 from .follow_ups import list_due_followups
 from .goals import list_goals
 from .guardrails import CASH_FLOOR, evaluate_guardrails
-from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
+from .manual_balance import balance_precedence_order_by
 from .obligations import list_obligation_review_candidates
 from .onboarding import list_charge_onboarding_queue
 from .reconciliation import list_reconciliation_review_items
@@ -1193,7 +1193,7 @@ def _snapshot_refresh_items(conn: sqlite3.Connection, as_of: date) -> list[dict[
         WHERE bs.id = (
             SELECT inner_bs.id FROM balance_snapshots inner_bs
             WHERE inner_bs.account_id = bs.account_id
-            {BALANCE_PRECEDENCE_ORDER_BY.format(alias="inner_bs")} LIMIT 1
+            {balance_precedence_order_by(conn, "inner_bs")} LIMIT 1
         )
         """
     ).fetchall()

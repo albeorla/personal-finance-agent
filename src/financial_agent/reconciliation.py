@@ -396,8 +396,9 @@ def list_post_cancellation_charges(
     Cancelling a bill (``deactivate_obligation``, or an ``active_until`` that has
     passed) drops it out of reconciliation entirely, so a subscription that keeps
     billing afterwards matches nothing and is never mentioned again. This finds
-    those charges by the merchant and amount the obligation actually billed before
-    the cancellation, and skips any transaction already settling another bill.
+    those charges by the merchant, amount and account the obligation actually
+    billed before the cancellation, and skips any transaction already settling
+    another bill or already acknowledged through ``confirm_reconciliation_match``.
     """
 
     ensure_app_schema(conn)
@@ -428,6 +429,13 @@ def list_post_cancellation_charges(
         )
     )
 
+    acknowledged = {
+        (ob_id, txn_id)
+        for ob_id, txn_id in conn.execute(
+            "SELECT obligation_id, transaction_id FROM post_cancellation_acknowledgments"
+        )
+    }
+
     # ponytail: one transaction scan per cancelled obligation. Fine at personal
     # scale; if the cancelled list ever gets long, scan transactions once and
     # bucket them by merchant token instead.
@@ -439,10 +447,16 @@ def list_post_cancellation_charges(
         profile = _last_billed_profile(conn, ob["id"])
         if profile is None:
             continue  # never billed, so nothing to recognize a zombie charge by
-        last_amount, last_date, tokens, last_direction = profile
+        last_amount, last_date, tokens, last_direction, last_account = profile
         tol = max(float(opts["amount_abs_tolerance"]), last_amount * float(opts["amount_pct_tolerance"]))
         params: list[Any] = [cancelled_on]
         window = "substr(COALESCE(posted, transacted_at), 1, 10) > ?"
+        if last_account is not None:
+            # A bill keeps billing the account it billed. Amount, date and a
+            # generic word like "transfer" are not enough: a $500 paycheck split
+            # into savings once matched a cancelled $500 transfer into checking.
+            window += " AND account_id = ?"
+            params.append(last_account)
         if as_of is not None:
             window += " AND substr(COALESCE(posted, transacted_at), 1, 10) <= ?"
             params.append(as_of)
@@ -456,7 +470,7 @@ def list_post_cancellation_charges(
             """,
             params,
         ):
-            if txn["id"] in spoken_for or not txn["charged_on"]:
+            if txn["id"] in spoken_for or not txn["charged_on"] or (ob["id"], txn["id"]) in acknowledged:
                 continue
             amount = float(txn["amount"])
             if ("inflow" if amount > 0 else "outflow") != last_direction:
@@ -504,18 +518,19 @@ def _cancelled_on(ob: sqlite3.Row, as_of: str | None) -> str | None:
 
 def _last_billed_profile(
     conn: sqlite3.Connection, obligation_id: str
-) -> tuple[float, str | None, set[str], str] | None:
-    """(amount, date, merchant tokens, direction) of the last charge this settled.
+) -> tuple[float, str | None, set[str], str, str | None] | None:
+    """(amount, date, merchant tokens, direction, account) of the last charge this settled.
 
     ``direction`` is ``inflow``/``outflow``, the way the money actually moved, so a
-    refund can be told apart from a charge of the same size.
+    refund can be told apart from a charge of the same size. ``account`` is the
+    account that charge hit, None when the bill was never reconciled.
     """
 
     name = conn.execute("SELECT name FROM obligations WHERE id = ?", (obligation_id,)).fetchone()
     tokens = _tokens((name["name"] if name else "") or "")
     row = conn.execute(
         """
-        SELECT t.amount, t.payee, t.description,
+        SELECT t.amount, t.payee, t.description, t.account_id,
                substr(COALESCE(t.posted, t.transacted_at), 1, 10) AS charged_on
         FROM obligation_instances oi
         LEFT JOIN transaction_obligation_matches m ON m.obligation_instance_id = oi.id
@@ -529,7 +544,13 @@ def _last_billed_profile(
     if row is not None:
         tokens |= _tokens(f"{row['payee'] or ''} {row['description'] or ''}")
         billed = float(row["amount"])
-        return round(abs(billed), 2), row["charged_on"], tokens, ("inflow" if billed > 0 else "outflow")
+        return (
+            round(abs(billed), 2),
+            row["charged_on"],
+            tokens,
+            ("inflow" if billed > 0 else "outflow"),
+            row["account_id"],
+        )
 
     # Never reconciled: fall back to the last modeled amount, name tokens only.
     inst = conn.execute(
@@ -540,7 +561,7 @@ def _last_billed_profile(
     if inst is None or not tokens:
         return None
     direction = inst["direction"] or ("inflow" if float(inst["amount"]) > 0 else "outflow")
-    return round(abs(float(inst["amount"])), 2), inst["due_date"], tokens, direction
+    return round(abs(float(inst["amount"])), 2), inst["due_date"], tokens, direction, None
 
 
 def _individually_matchable(conn: sqlite3.Connection, inst: sqlite3.Row, opts: dict[str, Any]) -> bool:
@@ -560,9 +581,16 @@ def confirm_reconciliation_match(
     (recorded in the match ledger as a user-asserted ``manual`` match, then
     confirmed like any other). Use it when the scorer's tolerance rejected the
     real payment.
+
+    A ``post-cancellation:<obligation>:<transaction>`` id (a charge that kept
+    arriving after its bill was cancelled) has no instance to mark paid.
+    Confirming it records that the charge was looked at, and it stops being
+    raised. ``unconfirm_reconciliation_match`` raises it again.
     """
 
     ensure_app_schema(conn)
+    if instance_id.startswith(_POST_CANCELLATION_PREFIX):
+        return _acknowledge_post_cancellation(conn, instance_id, transaction_id)
     inst = conn.execute(
         """
         SELECT oi.id, oi.status, oi.due_date, oi.amount, oi.direction,
@@ -595,6 +623,47 @@ def confirm_reconciliation_match(
     )
     return {"instance_id": instance_id, "status": "paid",
             "matched_transaction_id": match["transaction_id"], "match_confidence": round(float(match["match_score"]), 3)}
+
+
+_POST_CANCELLATION_PREFIX = "post-cancellation:"
+
+
+def _parse_post_cancellation_id(instance_id: str) -> tuple[str, str]:
+    """``post-cancellation:<obligation>:<transaction>`` -> (obligation, transaction).
+
+    Obligation ids never contain a colon; transaction ids can (``checking:...``),
+    so split once.
+    """
+
+    obligation_id, sep, txn_id = instance_id[len(_POST_CANCELLATION_PREFIX):].partition(":")
+    if not sep or not obligation_id or not txn_id:
+        raise ValueError(f"malformed post-cancellation id: {instance_id}")
+    return obligation_id, txn_id
+
+
+def _acknowledge_post_cancellation(
+    conn: sqlite3.Connection, instance_id: str, transaction_id: str | None
+) -> dict[str, Any]:
+    obligation_id, txn_id = _parse_post_cancellation_id(instance_id)
+    if transaction_id is not None and transaction_id != txn_id:
+        raise ValueError(f"{instance_id} is about transaction {txn_id}, not {transaction_id}")
+    if conn.execute("SELECT 1 FROM obligations WHERE id = ?", (obligation_id,)).fetchone() is None:
+        raise ValueError(f"unknown obligation: {obligation_id}")
+    if not _has_transactions_table(conn) or conn.execute(
+        "SELECT 1 FROM transactions WHERE id = ?", (txn_id,)
+    ).fetchone() is None:
+        raise ValueError(f"unknown transaction: {txn_id}")
+    conn.execute(
+        "INSERT OR IGNORE INTO post_cancellation_acknowledgments (obligation_id, transaction_id, acknowledged_at) "
+        "VALUES (?, ?, ?)",
+        (obligation_id, txn_id, _now()),
+    )
+    return {
+        "instance_id": instance_id,
+        "status": "acknowledged",
+        "obligation_id": obligation_id,
+        "transaction_id": txn_id,
+    }
 
 
 def _record_forced_match(conn: sqlite3.Connection, inst: sqlite3.Row, transaction_id: str) -> None:
@@ -667,9 +736,22 @@ def _no_match_reason(conn: sqlite3.Connection, inst: dict[str, Any]) -> str:
 
 
 def unconfirm_reconciliation_match(conn: sqlite3.Connection, instance_id: str) -> dict[str, Any]:
-    """Reverse a confirmation: return the instance to 'expected' and clear evidence."""
+    """Reverse a confirmation: return the instance to 'expected' and clear evidence.
+
+    For a ``post-cancellation:`` id, drop the acknowledgment so the charge is
+    raised again.
+    """
 
     ensure_app_schema(conn)
+    if instance_id.startswith(_POST_CANCELLATION_PREFIX):
+        obligation_id, txn_id = _parse_post_cancellation_id(instance_id)
+        removed = conn.execute(
+            "DELETE FROM post_cancellation_acknowledgments WHERE obligation_id = ? AND transaction_id = ?",
+            (obligation_id, txn_id),
+        ).rowcount
+        if not removed:
+            raise ValueError(f"no acknowledgment recorded for {instance_id}")
+        return {"instance_id": instance_id, "status": "raised"}
     inst = conn.execute("SELECT status FROM obligation_instances WHERE id = ?", (instance_id,)).fetchone()
     if inst is None:
         raise ValueError(f"unknown obligation instance: {instance_id}")

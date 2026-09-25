@@ -37,11 +37,11 @@ def _db(path):
     return conn
 
 
-def _insert(conn, txn_id, source, posted, amount, payee):
+def _insert(conn, txn_id, source, posted, amount, payee, description=None):
     conn.execute(
         "INSERT INTO transactions (id, account_id, posted, transacted_at, amount, payee, description, "
         "pending, source, first_seen_at, last_seen_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'x', 'x', 'x')",
-        (txn_id, CHK, posted, posted, amount, payee, payee, source),
+        (txn_id, CHK, posted, posted, amount, payee, payee if description is None else description, source),
     )
 
 
@@ -127,3 +127,85 @@ def test_cleanup_pairs_one_to_one_repoints_references_and_deletes_paste_rows(tmp
 
     # Idempotent: a second run finds nothing.
     assert dedupe_pasted_transactions_for_db(conn, dry_run=False)["pairs"] == 0
+
+
+# --- cross-date twins: the paste lane dates a card purchase by its transaction
+# date, the feed by its posting date (live 2026-07..09: five newspaper and trash-pickup rows
+# 2-4 days apart survived the exact-date cleanup). ---------------------------
+
+
+def _live_shaped_rows(conn):
+    # Newspaper: two paste copies of one charge (two pastes formatted the payee
+    # differently) against one feed row three days later.
+    _insert(conn, "checking:news-a", "checking_paste", "2026-07-10T00:00:00", -30.30, "POS DEBIT DAILYPLANET 555-010-0199 NY")
+    _insert(conn, "checking:news-b", "checking_paste", "2026-07-10T00:00:00", -30.30, "POS DEBIT                DAILYPLANET*  555-010-0199 NY  0000")
+    _insert(conn, "TRN-news", "simplefin", "2026-07-13T08:00:00", -30.30, "Daily Planet", "DAILYPLANET* 555-010-0199 NY 07/10")
+    # Trash pickup: paste 8/01, feed 8/03.
+    _insert(conn, "checking:trash", "checking_paste", "2026-08-01T00:00:00", -48.00, "POS DEBIT ACME WASTE HAULING 5550100123 CT")
+    _insert(conn, "TRN-trash", "simplefin", "2026-08-03T08:00:00", -48.00, "Acme Waste Hauling", "ACME WASTE HAULING 555-0100 CT 07/31")
+    # Not twins: same amount a few days apart, but only boilerplate or a payment rail in common.
+    _insert(conn, "checking:atm", "checking_paste", "2026-08-31T00:00:00", -200.00, "ATM WITHDRAWAL 000714 08/31")
+    _insert(conn, "TRN-atm", "simplefin", "2026-09-02T08:00:00", -200.00, "ATM Withdrawal", "ATM WITHDRAWAL 000801 09/02")
+    _insert(conn, "checking:venmo", "checking_paste", "2026-08-25T00:00:00", -20.00, "VENMO PAYMENT 1044")
+    _insert(conn, "TRN-venmo", "simplefin", "2026-08-28T08:00:00", -20.00, "Transfer to Venmo", "VENMO PAYMENT 1992")
+
+
+def test_cleanup_removes_cross_date_twins_and_second_paste_copies(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _live_shaped_rows(conn)
+    conn.execute(
+        "INSERT INTO transaction_obligation_matches (obligation_instance_id, transaction_id, match_type, "
+        "match_score, created_at, updated_at) VALUES ('news:2026-07-10', 'checking:news-b', 'auto', 1.0, 'x', 'x')"
+    )
+
+    preview = dedupe_pasted_transactions_for_db(conn, dry_run=True)
+    assert preview["pairs"] == 3
+    assert preview["duplicate_amount_total"] == 108.60
+
+    dedupe_pasted_transactions_for_db(conn, dry_run=False)
+    remaining = _ids(conn)
+    assert not {"checking:news-a", "checking:news-b", "checking:trash"} & set(remaining)
+    assert remaining["checking:atm"] == "checking_paste"
+    assert remaining["checking:venmo"] == "checking_paste"
+    match = conn.execute("SELECT transaction_id FROM transaction_obligation_matches").fetchone()
+    assert match["transaction_id"] == "TRN-news"
+    assert dedupe_pasted_transactions_for_db(conn, dry_run=False)["pairs"] == 0
+
+
+def test_import_skips_a_row_the_feed_delivered_under_a_later_posting_date(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _insert(conn, "TRN-news", "simplefin", "2026-07-13T08:00:00", -30.30, "Daily Planet", "DAILYPLANET* 555-010-0199 NY 07/10")
+    _insert(conn, "TRN-atm", "simplefin", "2026-07-13T08:00:00", -200.00, "ATM Withdrawal", "ATM WITHDRAWAL 000801")
+    csv = """Date,Description,Amount
+07/10/2026,POS DEBIT DAILYPLANET 555-010-0199 NY,-30.30
+07/10/2026,ATM WITHDRAWAL 000714,-200.00
+"""
+
+    applied = import_checking_activity_for_db(
+        conn, text=csv, account_query="TOTAL CHECKING", as_of_date="2026-07-14", dry_run=False
+    )
+
+    assert applied["feed_duplicate"] == 1 and applied["new"] == 1
+    pasted = [r["payee"] for r in conn.execute("SELECT payee FROM transactions WHERE source = 'checking_paste'")]
+    assert len(pasted) == 1 and "ATM" in pasted[0]
+
+
+def test_feed_row_landing_days_later_absorbs_the_paste_copies(tmp_path):
+    conn = _db(tmp_path / "s.sqlite")
+    _insert(conn, "checking:news-a", "checking_paste", "2026-07-10T00:00:00", -30.30, "POS DEBIT DAILYPLANET 555-010-0199 NY")
+    _insert(conn, "checking:news-b", "checking_paste", "2026-07-10T00:00:00", -30.30, "POS DEBIT                DAILYPLANET*  555-010-0199 NY")
+    _insert(conn, "checking:atm", "checking_paste", "2026-07-11T00:00:00", -30.30, "ATM WITHDRAWAL 000714")
+
+    feed_txn = {
+        "id": "TRN-news",
+        "posted": 1783929600,  # 2026-07-13 08:00:00 UTC
+        "transacted_at": 1783929600,
+        "amount": -30.30,
+        "payee": "Daily Planet",
+        "description": "DAILYPLANET* 555-010-0199 NY 07/10",
+        "pending": 0,
+        "fetched_at": "2026-07-13T08:00:00",
+    }
+    assert _upsert_transaction(conn, CHK, feed_txn, "simplefin") == "inserted"
+
+    assert _ids(conn) == {"TRN-news": "simplefin", "checking:atm": "checking_paste"}

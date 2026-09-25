@@ -8,7 +8,7 @@ from pathlib import Path
 # Latest schema version. Kept in lockstep with the max version in _MIGRATIONS;
 # a fresh DB ends at this version after ensure_app_schema runs. When adding a
 # migration, append it to _MIGRATIONS (never reorder/renumber) and bump this.
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 
 def _execute_script(conn: sqlite3.Connection, script: str) -> None:
@@ -661,6 +661,21 @@ def _migrate_to_v6(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v7(conn: sqlite3.Connection) -> None:
+    """Persist acknowledged charge-after-cancellation raises so they stop resurfacing."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS post_cancellation_acknowledgments (
+            obligation_id TEXT NOT NULL,
+            transaction_id TEXT NOT NULL,
+            acknowledged_at TEXT NOT NULL,
+            PRIMARY KEY (obligation_id, transaction_id)
+        )
+        """
+    )
+
+
 # Ordered migration registry: (target version, idempotent apply function).
 # Append-only; never reorder or renumber existing entries.
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
@@ -670,6 +685,7 @@ _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (4, _migrate_to_v4),
     (5, _migrate_to_v5),
     (6, _migrate_to_v6),
+    (7, _migrate_to_v7),
 ]
 
 

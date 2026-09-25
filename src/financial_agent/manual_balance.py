@@ -7,19 +7,19 @@ account through the same insert the sync layer uses, so ``get_finance_status``
 and ``get_daily_digest`` pick it up as the latest balance immediately.
 
 The manual snapshot is written as just another ``balance_snapshots`` row with
-``source='manual'``. Balance resolution (in ``status._latest_balances``) makes a
-manual row STICKY: it prefers ``source='manual'`` over ``source='simplefin'``
-regardless of calendar day, ``recorded_at``, or insert order, so a manual
-correction wins over every feed snapshot -- including a SimpleFIN sync on a later
-day -- until the user records a NEWER manual correction (which replaces the older
-one) or clears it. This is intended for balance-only "Updated Monthly" accounts
-(e.g. the Apple Card) whose feed lags reality for weeks: the user's correction
-must hold until they explicitly change it.
+``source='manual'`` and ``balance_date`` set to the as-of date. Balance
+resolution (``balance_precedence_order_by``) lets the row with the newest as-of
+date win and breaks ties in favour of the manual row. A manual correction
+therefore holds against a balance-only "Updated Monthly" feed (the Apple Card
+keeps reporting the bank's stale date) until the bank reports a newer date, but a
+daily feed (checking) overtakes it the next morning, so a one-off correction on
+an actively synced account cannot shadow fresher bank data.
 
 The manual row is still stamped strictly later than any snapshot already present
 for the account. That out-stamping is now belt-and-suspenders rather than the
-load-bearing mechanism: the source-priority ordering is what guarantees the
-correction wins, so the result no longer depends on a fragile timestamp race.
+load-bearing mechanism: the manual-wins-a-tie rule is what guarantees a same-day
+correction beats a same-day feed row, so the result does not depend on a fragile
+timestamp race.
 
 The caller's sign is preserved verbatim: a liability correction such as the
 Apple Card stays negative (e.g. ``-1200.03``), matching how SimpleFIN stores
@@ -44,13 +44,30 @@ from typing import Any
 
 
 # Canonical precedence for "which balance_snapshots row is the truth for an
-# account": a manual correction wins over any feed snapshot regardless of
-# timestamp, then newest recorded_at, then newest row id. Every code path that
-# reads the latest balance per account must order by this, or a manual correction
-# silently reverts to the stale feed the next time it syncs. ``{alias}`` is the
-# balance_snapshots alias (or the bare table name when unaliased).
-BALANCE_PRECEDENCE_ORDER_BY = """
+# account". Every code path that reads the latest balance per account must order
+# by this, so status, digest, guardrails, goals and grounding always agree.
+#
+# The row with the newest as-of date wins. A feed row's as-of date is the bank's
+# own ``balance_date``, which is what separates the two feed shapes this has to
+# serve: a daily feed (checking) reports today, so it overtakes an older manual
+# correction on its own; a balance-only "Updated Monthly" feed (the Apple Card)
+# keeps reporting the bank's stale date, so a newer manual correction holds until
+# the bank reports something newer. A manual row's as-of date is the date the
+# user said the balance was true (``balance_date``, else its ``recorded_at``
+# day). A feed row with no bank date is of unknown age and never outranks a
+# manual row. On a tie a manual row wins, then newest ``recorded_at``, then
+# newest row id.
+def balance_precedence_order_by(conn: sqlite3.Connection, alias: str) -> str:
+    """ORDER BY clause ranking ``alias`` rows by canonical balance precedence."""
+
+    has_bank_date = any(
+        row[1] == "balance_date" for row in conn.execute("PRAGMA table_info(balance_snapshots)")
+    )
+    manual_day = f"CASE WHEN {alias}.source = 'manual' THEN substr({alias}.recorded_at, 1, 10) END"
+    as_of_key = f"COALESCE({alias}.balance_date, {manual_day})" if has_bank_date else manual_day
+    return f"""
     ORDER BY
+        {as_of_key} DESC,
         CASE WHEN {alias}.source = 'manual' THEN 0 ELSE 1 END,
         {alias}.recorded_at DESC,
         {alias}.id DESC

@@ -13,6 +13,7 @@ from financial_agent.reconciliation import (
     list_reconciliation_review_items,
     list_unmatched_obligation_instances,
     reconcile_obligation_instances,
+    unconfirm_reconciliation_match,
 )
 from financial_agent.schema import ensure_app_schema
 
@@ -505,3 +506,76 @@ def test_charge_before_cancellation_is_not_raised(tmp_path):
 
     items = list_reconciliation_review_items(conn, as_of_date="2026-08-10")
     assert [i for i in items if i["review_type"] == "charge_after_cancellation"] == []
+
+
+def _zombies(conn, as_of):
+    return [
+        i for i in list_reconciliation_review_items(conn, as_of_date=as_of)
+        if i["review_type"] == "charge_after_cancellation"
+    ]
+
+
+def test_charge_on_another_account_is_not_the_cancelled_bill(tmp_path):
+    # Live 2026-09-18: a cancelled $500 transfer INTO joint checking was matched to
+    # a $500 paycheck split into SAVINGS - same amount, same date, and "transfer"
+    # text on both. A bill keeps billing the account it billed.
+    conn = _db(
+        tmp_path / "r.sqlite",
+        transactions=[
+            ("t-aug", "ACT-chk", "2026-08-31T08:00:00", 500.00, "Online Transfer from Checking 1234", "ONLINE TRANSFER FROM CHK"),
+            ("t-sav", "ACT-sav", "2026-09-18T08:00:00", 500.00, "Online Transfer from Checking 1234", "ONLINE TRANSFER FROM CHK"),
+            ("t-chk", "ACT-chk", "2026-09-18T08:00:00", 500.00, "Online Transfer from Checking 1234", "ONLINE TRANSFER FROM CHK"),
+        ],
+    )
+    conn.execute("INSERT INTO accounts (id,name,org,kind,currency) VALUES ('ACT-sav','SAVINGS (5678)','Chase Bank','','USD')")
+    _obligation(conn, "sweep", "Partner $500 sweep to joint", "transfer",
+                [{"id": "sweep:2026-08-31", "due_date": "2026-08-31", "amount": 500.0, "direction": "inflow", "source": "seed"}])
+    reconcile_obligation_instances(conn, as_of_date="2026-09-01")
+    confirm_reconciliation_match(conn, "sweep:2026-08-31", "t-aug")
+    set_obligation_end(conn, "sweep", "2026-09-01")
+
+    assert [z["transaction_id"] for z in _zombies(conn, "2026-09-20")] == ["t-chk"]
+
+
+def test_confirming_a_post_cancellation_raise_acknowledges_it_and_unconfirm_restores_it(tmp_path):
+    # These raises carry a synthetic id with no instance behind it, so confirm used
+    # to reject them with "unknown obligation instance" and they sat on the daily
+    # status task forever.
+    conn = _db(
+        tmp_path / "r.sqlite",
+        transactions=[
+            ("t-jun", "ACT-chk", "2026-06-01T08:00:00", -32.00, "Dearborn Media", "DEARBORN"),
+            ("t-aug", "ACT-chk", "2026-08-01T08:00:00", -32.00, "Dearborn Media", "DEARBORN"),
+        ],
+    )
+    _obligation(conn, "dearborn", "Dearborn Media subscription", "subscription",
+                [{"id": "dearborn:2026-06-01", "due_date": "2026-06-01", "amount": -32.0, "source": "seed"}])
+    reconcile_obligation_instances(conn, as_of_date="2026-06-10")
+    set_obligation_end(conn, "dearborn", "2026-07-01")
+    raised = _zombies(conn, "2026-08-10")
+    assert [z["obligation_instance_id"] for z in raised] == ["post-cancellation:dearborn:t-aug"]
+
+    result = confirm_reconciliation_match(conn, "post-cancellation:dearborn:t-aug")
+    assert result["status"] == "acknowledged" and result["transaction_id"] == "t-aug"
+    assert _zombies(conn, "2026-08-10") == []
+    # Idempotent.
+    assert confirm_reconciliation_match(conn, "post-cancellation:dearborn:t-aug")["status"] == "acknowledged"
+
+    assert unconfirm_reconciliation_match(conn, "post-cancellation:dearborn:t-aug")["status"] == "raised"
+    assert [z["transaction_id"] for z in _zombies(conn, "2026-08-10")] == ["t-aug"]
+
+
+def test_post_cancellation_id_with_colon_in_transaction_id_and_bad_ids(tmp_path):
+    conn = _db(
+        tmp_path / "r.sqlite",
+        transactions=[("checking:abc", "ACT-chk", "2026-08-01T08:00:00", -32.00, "Dearborn Media", "DEARBORN")],
+    )
+    _obligation(conn, "dearborn", "Dearborn Media subscription", "subscription",
+                [{"id": "dearborn:2026-06-01", "due_date": "2026-06-01", "amount": -32.0, "source": "seed"}])
+    assert confirm_reconciliation_match(conn, "post-cancellation:dearborn:checking:abc")["transaction_id"] == "checking:abc"
+    for bad in ("post-cancellation:dearborn", "post-cancellation:nope:checking:abc", "post-cancellation:dearborn:TRN-missing"):
+        try:
+            confirm_reconciliation_match(conn, bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} should be rejected")

@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from .cashflow import build_cash_flow_projections
 from .drift import detect_drift
 from .guardrails import evaluate_guardrails
-from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
+from .manual_balance import balance_precedence_order_by
 
 
 SCHEMA_VERSION = "finance_status.v1"
@@ -177,16 +177,6 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-# Canonical balance-resolution precedence. A manual snapshot is STICKY: if any
-# manual correction exists (within the as_of filter), the latest manual wins over
-# every feed (simplefin) snapshot regardless of calendar day. A manual balance
-# for an "Updated Monthly" account (e.g. Apple Card) stays authoritative until the
-# user records a NEWER manual correction (which replaces the older one) or clears
-# it -- so the next day's feed sync cannot shadow it. When NO manual snapshot
-# exists, the latest feed snapshot wins. Every consumer that needs "the current
-# balance for an account" (status, the debts layer, the avalanche, etc.) MUST
-# order by this so they agree. Defined once in manual_balance and shared here.
-_BALANCE_PRECEDENCE_ORDER_BY = BALANCE_PRECEDENCE_ORDER_BY
 
 
 def resolve_account_balance(
@@ -198,11 +188,10 @@ def resolve_account_balance(
     """Return one account's signed current balance using canonical precedence.
 
     This is the single source of truth for "what is this account's balance".
-    It applies the same ``_BALANCE_PRECEDENCE_ORDER_BY`` that
-    ``_latest_balances`` (and thus ``get_finance_status``) uses: a manual
-    correction is sticky and wins over every feed snapshot regardless of calendar
-    day, until a newer manual replaces it; when no manual exists, the latest feed
-    snapshot wins. When ``as_of`` is given, snapshots recorded after that date are
+    It applies the same ``balance_precedence_order_by`` that
+    ``_latest_balances`` (and thus ``get_finance_status``) uses: the snapshot
+    with the newest as-of date wins, a manual correction wins a tie, and a feed
+    row with no bank date never outranks a manual correction. When ``as_of`` is given, snapshots recorded after that date are
     ignored (end-of-day inclusive), so callers can resolve a balance "as of" a
     projection date. Returns None when no snapshot qualifies.
     """
@@ -217,7 +206,7 @@ def resolve_account_balance(
         SELECT balance
         FROM balance_snapshots
         {where}
-        {_BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
+        {balance_precedence_order_by(conn, "balance_snapshots")}
         LIMIT 1
         """,
         params,
@@ -257,7 +246,7 @@ def _latest_balances(conn: sqlite3.Connection, *, as_of: date | None = None) -> 
             SELECT inner_bs.id
             FROM balance_snapshots inner_bs
             WHERE inner_bs.account_id = bs.account_id
-            {_BALANCE_PRECEDENCE_ORDER_BY.format(alias="inner_bs")}
+            {balance_precedence_order_by(conn, "inner_bs")}
             LIMIT 1
         )
         ORDER BY a.name COLLATE NOCASE

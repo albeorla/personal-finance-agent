@@ -636,8 +636,9 @@ def import_checking_activity(
     as a CSV. This parses date/description/amount rows, fuzzy-matches the account,
     stamps deterministic synthetic ids so a re-paste is idempotent, and upserts the
     new rows as real transactions (source='checking_paste'). When ``balance`` is
-    given, a sticky manual balance snapshot is recorded for the same account, in
-    the same db transaction as the rows.
+    given, a manual balance snapshot is recorded for the same account, in the
+    same db transaction as the rows; the bank feed overtakes it once the bank
+    reports a newer as-of date.
 
     Default dry_run=True: parse + preview only. Re-run with dry_run=false to write.
     as_of_date defaults to today. An ambiguous account match writes nothing and
@@ -2426,6 +2427,10 @@ def confirm_reconciliation_match(
     transactions in the date window vs amount outside tolerance, with the
     nearest candidates listed). Pass transaction_id to force-match a specific
     transaction to the instance; it is recorded as a normal confirmed match.
+
+    A post-cancellation:<obligation>:<transaction> review item (a charge after
+    its bill was cancelled) has no instance to pay: confirming it records that
+    the charge was reviewed, and it stops being raised.
     """
 
     resolved_db_path = db_path or str(default_db_path())
@@ -2437,7 +2442,8 @@ def confirm_reconciliation_match(
 @mcp.tool()
 def unconfirm_reconciliation_match(instance_id: str, db_path: str | None = None) -> dict:
     """Reverse a confirmation: return the obligation instance to 'expected' and
-    clear the matched-transaction evidence.
+    clear the matched-transaction evidence. For a post-cancellation: review
+    item, drop the acknowledgment so the charge is raised again.
     """
 
     resolved_db_path = db_path or str(default_db_path())

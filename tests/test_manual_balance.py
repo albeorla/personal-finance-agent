@@ -31,11 +31,11 @@ def _add_account(conn, account_id, name, org):
     )
 
 
-def _add_snapshot(conn, account_id, balance, recorded_at, source="simplefin", available=None):
+def _add_snapshot(conn, account_id, balance, recorded_at, source="simplefin", available=None, balance_date=None):
     conn.execute(
-        "INSERT INTO balance_snapshots (account_id, balance, available, recorded_at, source) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (account_id, balance, balance if available is None else available, recorded_at, source),
+        "INSERT INTO balance_snapshots (account_id, balance, available, recorded_at, source, balance_date) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (account_id, balance, balance if available is None else available, recorded_at, source, balance_date),
     )
 
 
@@ -328,15 +328,14 @@ def test_same_day_simplefin_before_manual_does_not_override(tmp_path):
     assert _latest_balance(db_path, "chase-1") == 1200.0
 
 
-def test_next_day_simplefin_does_not_supersede_manual(tmp_path):
-    """Sticky manual: a NEXT-day SimpleFIN sync does NOT supersede the manual.
+def test_next_day_feed_with_newer_bank_date_supersedes_manual(tmp_path):
+    """A daily feed overtakes an older manual correction on its own.
 
-    The user has decided manual balances are sticky: a manual correction holds
-    over every feed snapshot -- including one recorded on a later calendar day --
-    until the user records a newer manual or clears it. For balance-only
-    "Updated Monthly" accounts (e.g. the Apple Card) the feed can lag reality for
-    weeks, so a stale next-day feed value must not silently re-shadow the
-    correction.
+    Live bug 2026-09-21..25: a checking balance entered by hand on 9/23 kept
+    winning over the bank's 9/24 and 9/25 readings, so the working balance aged
+    and the cash floor read "unverified" every morning until someone re-typed a
+    number nobody disputed. A feed row whose bank as-of date is newer than the
+    manual correction is fresher evidence and must win.
     """
 
     db_path = tmp_path / "transactions.sqlite"
@@ -348,9 +347,49 @@ def test_next_day_simplefin_does_not_supersede_manual(tmp_path):
     conn.close()
     assert _latest_balance(db_path, "chase-1") == 1200.0
 
-    # A later-day SimpleFIN snapshot must NOT shadow the sticky manual.
     conn = _connect(db_path)
-    _add_snapshot(conn, "chase-1", 6100.0, "2026-06-21T09:00:00+00:00")
+    _add_snapshot(conn, "chase-1", 6100.0, "2026-06-21T09:00:00", balance_date="2026-06-21")
+    conn.commit()
+    conn.close()
+    now = datetime(2026, 6, 21, 18, 0, tzinfo=UTC)
+    assert _latest_balance(db_path, "chase-1", now=now) == 6100.0
+
+
+def test_next_day_feed_with_stale_bank_date_does_not_supersede_manual(tmp_path):
+    """A balance-only "Updated Monthly" feed cannot re-shadow a newer correction.
+
+    The Apple Card feed re-reports the same stale balance every day with the
+    bank's old as-of date (2026-07-08 in the live data while the portal had moved
+    on). A manual correction dated after that holds until the bank reports a
+    newer date.
+    """
+
+    db_path = tmp_path / "transactions.sqlite"
+    _build_db(db_path, accounts=[("apple-1", "Owner", "Apple Card (Updated Monthly)")])
+
+    conn = _connect(db_path)
+    _add_snapshot(conn, "apple-1", -1100.32, "2026-06-19T09:00:00", balance_date="2026-06-01")
+    set_manual_balance(conn, "Apple Card", -1200.03, "2026-06-20")
+    conn.commit()
+    conn.close()
+
+    conn = _connect(db_path)
+    _add_snapshot(conn, "apple-1", -1100.32, "2026-06-21T09:00:00", balance_date="2026-06-01")
+    conn.commit()
+    conn.close()
+    now = datetime(2026, 6, 21, 18, 0, tzinfo=UTC)
+    assert _latest_balance(db_path, "apple-1", now=now) == -1200.03
+
+
+def test_feed_row_without_bank_date_does_not_supersede_manual(tmp_path):
+    """A feed row of unknown age never outranks a manual correction."""
+
+    db_path = tmp_path / "transactions.sqlite"
+    _build_db(db_path, accounts=[("chase-1", "Chase Checking", "Chase")])
+
+    conn = _connect(db_path)
+    set_manual_balance(conn, "chase", 1200.0, "2026-06-20")
+    _add_snapshot(conn, "chase-1", 6100.0, "2026-06-21T09:00:00")
     conn.commit()
     conn.close()
     now = datetime(2026, 6, 21, 18, 0, tzinfo=UTC)

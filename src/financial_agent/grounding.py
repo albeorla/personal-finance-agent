@@ -19,7 +19,7 @@ import sqlite3
 from typing import Any
 
 from .config import get_finance_config
-from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
+from .manual_balance import balance_precedence_order_by
 from .status import default_db_path, get_finance_status
 
 DEFAULT_TOLERANCE = 0.02
@@ -66,13 +66,13 @@ def verify_grounding(
             snap = conn.execute(
                 "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
                 "WHERE a.name LIKE '%' || ? || '%' "
-                f"{BALANCE_PRECEDENCE_ORDER_BY.format(alias='bs')} LIMIT 1",
+                f"{balance_precedence_order_by(conn, 'bs')} LIMIT 1",
                 (hint,),
             ).fetchone()
         else:
             snap = conn.execute(
                 "SELECT bs.available FROM balance_snapshots bs JOIN accounts a ON a.id = bs.account_id "
-                f"WHERE a.kind = 'checking' {BALANCE_PRECEDENCE_ORDER_BY.format(alias='bs')} LIMIT 1"
+                f"WHERE a.kind = 'checking' {balance_precedence_order_by(conn, 'bs')} LIMIT 1"
             ).fetchone()
         if norm["working_cash"] is not None:
             checks.append(_num_check(
@@ -87,7 +87,7 @@ def verify_grounding(
                 "SELECT COALESCE(SUM(bs.balance), 0) FROM balance_snapshots bs "
                 "WHERE bs.id = (SELECT inner_bs.id FROM balance_snapshots inner_bs "
                 f"WHERE inner_bs.account_id = bs.account_id "
-                f"{BALANCE_PRECEDENCE_ORDER_BY.format(alias='inner_bs')} LIMIT 1)"
+                f"{balance_precedence_order_by(conn, 'inner_bs')} LIMIT 1)"
             ).fetchone()
             checks.append(_num_check(
                 "net_across_accounts", norm["net_across_accounts"],
@@ -101,7 +101,7 @@ def verify_grounding(
                 "SELECT COALESCE(SUM(bs.available), 0) FROM balance_snapshots bs "
                 "WHERE bs.balance >= 0 AND bs.id = (SELECT inner_bs.id FROM balance_snapshots inner_bs "
                 f"WHERE inner_bs.account_id = bs.account_id "
-                f"{BALANCE_PRECEDENCE_ORDER_BY.format(alias='inner_bs')} LIMIT 1)"
+                f"{balance_precedence_order_by(conn, 'inner_bs')} LIMIT 1)"
             ).fetchone()
             checks.append(_num_check(
                 "liquid_available", norm["liquid_available"],

@@ -374,7 +374,7 @@ def import_card_statement_for_db(
         exists = conn.execute("SELECT 1 FROM transactions WHERE id = ?", (txn["id"],)).fetchone()
         if exists:
             duplicate += 1
-        elif find_feed_twin(conn, account_id, txn["transacted_date"], txn["amount"]):
+        elif find_feed_twin(conn, account_id, txn["transacted_date"], txn["amount"], f"{txn.get('merchant') or ''} {txn.get('description') or ''}"):
             # The bank feed already delivered this transaction; the feed row wins.
             feed_duplicate += 1
         else:
@@ -479,8 +479,9 @@ def import_checking_activity_for_db(
     a CSV. This reuses the generic CSV parser, resolves the account (fuzzy,
     unambiguous), stamps deterministic synthetic ids (``checking:`` prefix) so a
     re-paste is idempotent, and upserts the new rows as ``transactions``
-    (``source='checking_paste'``). When ``balance`` is given, a sticky manual
-    balance snapshot is recorded for the same account. The caller owns
+    (``source='checking_paste'``). When ``balance`` is given, a manual balance
+    snapshot is recorded for the same account (the feed overtakes it once the
+    bank reports a newer as-of date). The caller owns
     commit/rollback, so the transaction rows and the balance snapshot land in one
     db transaction.
     """
@@ -553,7 +554,7 @@ def import_checking_activity_for_db(
         exists = conn.execute("SELECT 1 FROM transactions WHERE id = ?", (txn["id"],)).fetchone()
         if exists:
             duplicate += 1
-        elif find_feed_twin(conn, account_id, txn["transacted_date"], txn["amount"]):
+        elif find_feed_twin(conn, account_id, txn["transacted_date"], txn["amount"], f"{txn.get('merchant') or ''} {txn.get('description') or ''}"):
             # The bank feed already delivered this transaction; the feed row wins.
             feed_duplicate += 1
         else:

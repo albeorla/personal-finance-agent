@@ -5,7 +5,7 @@ import sqlite3
 from datetime import date, datetime
 from typing import Any
 
-from .manual_balance import BALANCE_PRECEDENCE_ORDER_BY
+from .manual_balance import balance_precedence_order_by
 from .schema import ensure_app_schema
 
 # A goal whose deadline is within this many days is flagged ``due_soon`` so the
@@ -309,7 +309,7 @@ def _live_balance(
         FROM balance_snapshots
         WHERE account_id = ?
           AND recorded_at <= ?
-        {BALANCE_PRECEDENCE_ORDER_BY.format(alias="balance_snapshots")}
+        {balance_precedence_order_by(conn, "balance_snapshots")}
         LIMIT 1
         """,
         (source_account, _as_of_bound(as_of)),
