@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import date, timedelta
 from typing import Any
@@ -23,7 +24,35 @@ NON_PROJECTABLE_OBLIGATION_STATUSES = {"dormant_suppressed"}
 # sweep (a debt paydown the user chooses to make) is capped so it never drives the
 # projected balance below this floor. Single source of truth: guardrails imports it
 # from here (guardrails already imports cashflow, so cashflow cannot import it back).
-CASH_FLOOR = 2500.0
+# The amount is a household choice: ``CASH_FLOOR`` in the finances .env overrides
+# the default. It is read once, at import, so a change needs a server restart.
+DEFAULT_CASH_FLOOR = 2500.0
+
+
+def resolve_cash_floor(raw: Any = None) -> float:
+    """Return the cash floor in dollars: the configured value, else the default.
+
+    ``raw`` is the configured text (``CASH_FLOOR`` from the finances .env); when
+    omitted it is read from config. Unset or blank means the default. A value
+    that is set but is not a positive number raises: a silently ignored floor
+    would let the guardrail pass against the wrong amount.
+    """
+
+    if raw is None:
+        raw = get_finance_config().get("cash_floor")
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        return DEFAULT_CASH_FLOOR
+    try:
+        value = float(text.replace("$", "").replace(",", ""))
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"CASH_FLOOR must be a positive dollar amount, got {text!r}")
+    return value
+
+
+CASH_FLOOR = resolve_cash_floor()
 
 
 def build_cash_flow_projections(

@@ -289,8 +289,9 @@ a session unreviewed regardless of how the work happened:
 - Required package: `mcp`.
 - Optional live sources: SimpleFIN access URL and Todoist API token/project id.
 - Runtime config: `FINANCE_AGENT_ENV`, `FINANCE_AGENT_DB_PATH`,
-  `TODOIST_WRITE_ENABLED`, `WORKING_ACCOUNT_HINT`, and the source credentials in
-  the configured `.env`.
+  `TODOIST_WRITE_ENABLED`, `WORKING_ACCOUNT_HINT`, `CASH_FLOOR` (the minimum
+  working-cash balance in dollars, default 2500; read at server start), and the
+  source credentials in the configured `.env`.
 
 ## Security
 

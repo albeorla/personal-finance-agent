@@ -968,7 +968,7 @@ def _trough_band(projection: dict[str, Any] | None) -> dict[str, Any]:
     Only estimated, low-confidence outflows due on or before the trough date can
     move it, so those are the drivers. ``downside`` is the magnitude that matters;
     the band is symmetric. ``breach_risk`` flags a low estimate that crosses the
-    $2,500 cash floor (or zero) even when the point estimate clears.
+    cash floor (or zero) even when the point estimate clears.
     """
 
     lowest = (projection or {}).get("lowest_balance")
@@ -1258,7 +1258,7 @@ def _status_color(digest: dict[str, Any]) -> tuple[str, str]:
     if "medium" in severities:
         return "YELLOW", _guardrail_reason(dominant("medium"))
     # #7: the point estimate clears the floor, but the estimated outflows before
-    # the trough could drop it below the $2,500 cash floor (or to zero) - cap at
+    # the trough could drop it below the cash floor (or to zero) - cap at
     # YELLOW until those amounts are confirmed.
     ts = digest.get("trough_sensitivity")
     if ts and ts.get("breach_risk"):

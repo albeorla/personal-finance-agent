@@ -2,13 +2,14 @@
 
 These carry forward the legacy ritual's rules-of-thumb as deterministic checks:
 
-- cash_floor    - projected lowest balance must not drop below $2,500.
+- cash_floor    - projected lowest balance must not drop below the cash floor
+                  (default $2,500; ``CASH_FLOOR`` in the finances .env overrides).
 - drift_threshold - total drift cash-flow impact must not exceed $200.
 - window_age    - the data must be fresher than 24h.
 - debt_avalanche - advisory payoff order, highest APR first.
 
-Thresholds are hard-coded from the legacy playbooks for V1 (a per-user config
-table is future work). Evaluation is read-only by default; status calls it that
+The drift and window-age thresholds are hard-coded from the legacy playbooks for
+V1 (a per-user config table is future work); the cash floor is configurable. Evaluation is read-only by default; status calls it that
 way. The thresholds came from ritual.md ($200 drift) and playbooks.md ($2,500
 floor) in ~/dev/areas/finances.
 """
@@ -63,6 +64,13 @@ def apply_guardrail_rules(conn: sqlite3.Connection) -> dict[str, Any]:
             (f"guardrail_rule_{rule_type}", rule_type, value, payload, severity, desc, now),
         )
         seeded += cur.rowcount
+        # The stored threshold is a record of the rule in force. Keep it true when
+        # a configured value (the cash floor) changes after the first seed.
+        if value is not None:
+            conn.execute(
+                "UPDATE guardrail_rules SET threshold_value = ? WHERE rule_type = ? AND threshold_value IS NOT ?",
+                (value, rule_type, value),
+            )
     return {"seeded": seeded, "rules": [r[0] for r in rules]}
 
 

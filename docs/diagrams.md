@@ -628,7 +628,7 @@ flowchart LR
     Cash --> Bills["Recurring bills<br/>utilities, subscriptions, garbage"]
     Cash --> Auto["Auto<br/>lease"]
 
-    Cash -. "guardrail: $2,500 cash floor" .-> Floor["lowest projected balance marker"]
+    Cash -. "guardrail: cash floor (default $2,500)" .-> Floor["lowest projected balance marker"]
 
     classDef inflow fill:#e7eff7,stroke:#1f4e79,color:#17202a
     classDef cash fill:#e8f2ec,stroke:#3d7b65,color:#17202a

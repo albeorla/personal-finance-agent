@@ -91,6 +91,11 @@ def get_finance_config(
     # account (see cashflow._select_working_account and the grounding/validate/
     # parity fallbacks), so the pipeline still runs, just without name-matching.
     working_account_hint = pick("WORKING_ACCOUNT_HINT")
+    # Minimum working-cash balance the projection and guardrails protect, in
+    # dollars. A household choice, so it is config, not source: set CASH_FLOOR in
+    # the finances .env. Unset means cashflow.DEFAULT_CASH_FLOOR. Returned raw;
+    # cashflow.resolve_cash_floor parses it.
+    cash_floor = pick("CASH_FLOOR")
     return {
         "simplefin_access_url": access_url,
         "todoist_api_token": token,
@@ -99,6 +104,7 @@ def get_finance_config(
         "has_todoist": bool(token and project_id),
         "todoist_write_enabled": write_enabled,
         "working_account_hint": working_account_hint,
+        "cash_floor": cash_floor,
     }
 
 
